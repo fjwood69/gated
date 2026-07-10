@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Reuses the shape of the mori CI (sterility + ruff lint), adapted for the
+# ENGINE tree: the load-bearing extra job is `typecheck` — `mypy --strict` is
+# gated's signature quality bar — and `test` runs the zero-dependency
+# unittest suite on a Python matrix. Podman-gated tests (OCI / observed /
+# demo-regression) self-skip when no runtime/image is present, so they are
+# green-by-skip on hosted runners; the boundary mechanism is verified on real
+# podman on the NUC, not here. Dormant until gated is extracted to its own
+# public repo (only root .github/workflows runs in Actions).
+
+jobs:
+  sterility:
+    name: Content sterility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: No internal / homelab / secret markers in tracked content
+        run: |
+          # Signal = homelab identifiers + REAL credential-prefix shapes. The bare words
+          # api_key/password/bearer are deliberately NOT matched: this codebase's job is
+          # GitHub auth, so it legitimately contains "Bearer"/"token"/"password" in comments
+          # and code — bare-word matching there is pure false-positive, not a leak signal. A
+          # real leaked credential has a shape (sk-ant-…, ghp_…, xoxb-…); that we do match.
+          if grep -rniE 'nucadmin|piadmin|jadmin|10\.1\.2\.|uk-smr|ca-gcp|tailscale|dotfiles|get-secret|/home/[a-z]|sk-ant-|ghp_[A-Za-z0-9]{20,}|xoxb-' \
+              --include='*.py' --include='*.md' --include='Makefile' \
+              --exclude-dir=.git . ; then
+            echo "::error::internal/homelab marker or credential shape found in tracked content"; exit 1
+          fi
+          echo "clean"
+
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: pip install "ruff==0.15.15"
+      - run: ruff check .
+
+  typecheck:
+    name: Types (mypy --strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: pip install "mypy==2.1.0"
+      - run: mypy --strict core sandbox engine observe gate cli
+
+  test:
+    name: Unit tests (py ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      # Zero third-party deps: the suite is stdlib-only. Podman-gated tests skip.
+      - name: unittest discover
+        run: python -m unittest discover -s tests -v
