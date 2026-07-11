@@ -176,6 +176,28 @@ class RestoreControllerTests(unittest.TestCase):
         self.assertIs(_controller(s, c, trusted=False).attempt_restore(att).result,
                       RestoreResult.REFUSED_UNTRUSTED)
 
+    def test_restore_succeeds_when_other_policies_exist(self) -> None:
+        # regression (board blocker #4): the policy-head CAS must compare against THIS policy's head,
+        # not the GLOBAL chain head — else a second enabled policy (whose enable is the global head)
+        # spuriously fails the CAS and blocks restoration. This is the normal multi-policy case.
+        c = _cal_store()
+        s = _policy_store_enabled(c.set_head("X"))
+        # a SECOND enabled policy -> its enable record is now the global chain head, not p1's.
+        s.transition("p2", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="p2a"))
+        s.transition("p2", PolicyState.CALIBRATING, approval=_appr("g1", op="p2b"),
+                     pinned_set_version=c.set_head("X"))
+        s.record_calibration_pass("cal-p2", policy_id="p2", pinned_set_version=c.set_head("X"),
+                                  detector_identity=_DET, set_id="X")
+        s.transition("p2", PolicyState.ENABLED, approval=_appr("g1", op="p2c"),
+                     calibration_result_ref="cal-p2", pinned_set_version=c.set_head("X"),
+                     detector_identity=_DET)
+        self.assertNotEqual(s.policy_head("p1"), s.head_hash())  # p1's head != global head
+        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
+                 set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
+        att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3)
+        outcome = _controller(s, c).attempt_restore(att)
+        self.assertIs(outcome.result, RestoreResult.RESTORED)  # p1 restores despite p2 existing
+
     def test_demoted_policy_cannot_auto_restore(self) -> None:
         # asymmetry: a human-demoted (ADVISORY) policy has no re-attest path — must re-ratify.
         c = _cal_store()

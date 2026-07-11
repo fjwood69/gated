@@ -255,9 +255,10 @@ class PolicyStore:
             # re-attest) that moved this policy's head, re-enforcing a policy a human just moved to
             # ADVISORY. A None expectation opts out (direct/test use); the restore controller always
             # passes the head it read.
-            if expect_policy_head is not None and self._head_hash_unlocked() != expect_policy_head:
+            if expect_policy_head is not None and \
+                    self._policy_head_unlocked(policy_id) != expect_policy_head:
                 raise ReAttestConflict(
-                    f"policy-evidence head moved since the restore CAS read it "
+                    f"policy-evidence head for {policy_id} moved since the restore CAS read it "
                     f"(expected {expect_policy_head[:12]}..) — aborting re-attestation, will retry"
                 )
             if not self._pass_exists_unlocked(
@@ -309,11 +310,7 @@ class PolicyStore:
         CAS pins this (not the global chain head) so a re-attest aborts on a concurrent change to THIS
         policy (e.g. a human DEMOTE) WITHOUT needless retries from unrelated policies' appends (board
         amendment 3)."""
-        row = self._conn().execute(
-            "SELECT record_hash FROM tier_transition_chain WHERE policy_id=? ORDER BY seq DESC LIMIT 1",
-            (policy_id,),
-        ).fetchone()
-        return GENESIS_HASH if row is None else str(row["record_hash"])
+        return self._policy_head_unlocked(policy_id)
 
     def record_calibration_pass(
         self,
@@ -380,6 +377,17 @@ class PolicyStore:
     def _head_hash_unlocked(self) -> str:
         row = self._conn().execute(
             "SELECT record_hash FROM tier_transition_chain ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        return GENESIS_HASH if row is None else str(row["record_hash"])
+
+    def _policy_head_unlocked(self, policy_id: str) -> str:
+        """The POLICY-SCOPED evidence head (record_hash of this policy's latest record), or GENESIS.
+        The re-attest CAS must compare against THIS, not the global chain head — else an unrelated
+        policy's append (which moves the global head but not this policy's) would spuriously fail the
+        CAS and block restoration (the normal multi-policy case)."""
+        row = self._conn().execute(
+            "SELECT record_hash FROM tier_transition_chain WHERE policy_id=? ORDER BY seq DESC LIMIT 1",
+            (policy_id,),
         ).fetchone()
         return GENESIS_HASH if row is None else str(row["record_hash"])
 
