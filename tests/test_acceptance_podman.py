@@ -12,10 +12,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import subprocess
+
 from core import Command, Fixtures, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from core.ed25519 import public_key
-import subprocess
+from core.identity import DetectorManifest
 
 from gate.acceptance import (
     BlindHoldoutStore,
@@ -42,9 +44,10 @@ _BAD_HOLD = b"import sys\nsys.exit(2)\n"          # distinct payload, still nonz
 _GOOD_HOLD = b"print('ok')\nraise SystemExit(0)\n"  # distinct payload, still zero
 
 
-def _pinned_image_digest() -> str:
-    """Resolve the mutable tag to an immutable image ID (digest) so the receipt binds a pinned image."""
-    out = subprocess.run(["podman", "image", "inspect", "--format", "{{.Id}}", IMAGE],
+def _pin_image(tag: str) -> str:
+    """Resolve a mutable tag to an immutable image ID (digest) so the receipt binds a pinned image.
+    Passed to the anchor as ``pin_image``; the anchor derives the TAG from the real sandbox."""
+    out = subprocess.run(["podman", "image", "inspect", "--format", "{{.Id}}", tag],
                          capture_output=True, text=True, check=True)
     return "sha256:" + out.stdout.strip().removeprefix("sha256:")
 
@@ -106,15 +109,17 @@ class AcceptanceAnchorOnRealPodmanTests(unittest.TestCase):
         holdout.append(Fixture("hg", FixtureLabel.KNOWN_GOOD, _GOOD_HOLD),
                        holdout_key=_HOLDOUT_KEY, approval=_cal_gov("cg1", "cg2"))
 
-        image_ref = _pinned_image_digest()
+        manifest = DetectorManifest(check_type="exit-code", entrypoint=("python3", "/artifact/main.py"),
+                                    impl_digest="exitcode-detector-build", eval_profile={"trials": 2})
         report = run_acceptance_anchor(
             make_sandbox=lambda: OCISandbox(image=IMAGE),
             honest_detector=_ExitCodeDetector(), fn_deficient_detector=_AlwaysPass(),
-            fp_happy_detector=_AlwaysFail(), detector_identity="det-exitcode-4tuple",
-            visible_set=visible, blind_holdout_store=holdout, holdout_key=_HOLDOUT_KEY,
-            signer_seed=_SIGNER_SEED, signer_principal="cal-gov-1",
-            signer_approval=_cal_gov("cal-gov-1"), image_ref=image_ref,
-            now=100.0, budget=_BUDGET, trials=2)
+            fp_happy_detector=_AlwaysFail(), detector_manifest=manifest,
+            host_closure_digest="host-closure-oci-v1", visible_set=visible,
+            blind_holdout_store=holdout, holdout_key=_HOLDOUT_KEY, signer_seed=_SIGNER_SEED,
+            signer_principal="cal-gov-1", signer_approval=_cal_gov("cal-gov-1"),
+            pin_image=_pin_image, now=100.0, budget=_BUDGET, trials=2)
+        image_digest = _pin_image(IMAGE)
 
         self.assertTrue(report.honest_passes, "honest exit-code detector must pass the visible set")
         self.assertTrue(report.refuses_on_fn, "an always-pass detector must be refused (misses the bad)")
@@ -125,8 +130,9 @@ class AcceptanceAnchorOnRealPodmanTests(unittest.TestCase):
         self.assertEqual(report.visible_coverage, 2)
         self.assertEqual(report.holdout_coverage, 2)
         self.assertTrue(verify_report(report, verify_key=_SIGNER_PUB))
-        # the receipt binds a PINNED image digest + a genuinely-blind holdout + the real sandbox hash.
-        self.assertEqual(report.image_ref, image_ref)
+        # the receipt binds a PINNED image digest (derived from the real sandbox), a genuinely-blind
+        # holdout, and the real sandbox hash — nothing is a caller string.
+        self.assertEqual(report.image_ref, image_digest)
         self.assertTrue(report.image_ref.startswith("sha256:"))
         self.assertNotEqual(report.visible_corpus_digest, report.holdout_corpus_digest)
         self.assertTrue(report.sandbox_config_hash)

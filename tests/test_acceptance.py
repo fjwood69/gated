@@ -16,7 +16,9 @@ from pathlib import Path
 
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
+from core.chain import content_digest
 from core.ed25519 import public_key
+from core.identity import DetectorManifest, identity_for
 from gate.acceptance import (
     AcceptanceError,
     BlindHoldoutError,
@@ -79,16 +81,18 @@ def _holdout() -> BlindHoldoutStore:
     return store
 
 
-_IMAGE_REF = "sha256:" + "e" * 64  # a pinned image digest (not a mutable tag)
+_MANIFEST = DetectorManifest(check_type="egress", entrypoint=("python3", "main.py"),
+                             impl_digest="detector-build-abc", eval_profile={"trials": 3})
+_HOST_CLOSURE = "host-closure-digest-v1"
 
 
 def _run(store: BlindHoldoutStore, *, honest, fn, fp, signer=None):  # type: ignore[no-untyped-def]
     return run_acceptance_anchor(
         make_sandbox=_factory(), honest_detector=honest, fn_deficient_detector=fn,
-        fp_happy_detector=fp, detector_identity="det-honest-4tuple", visible_set=_VISIBLE,
-        blind_holdout_store=store, holdout_key=_HOLDOUT_KEY, signer_seed=_SIGNER_SEED,
-        signer_principal="cal-gov-1", signer_approval=signer or _cal_gov("cal-gov-1"),
-        image_ref=_IMAGE_REF, now=100.0, budget=_BUDGET, trials=3)
+        fp_happy_detector=fp, detector_manifest=_MANIFEST, host_closure_digest=_HOST_CLOSURE,
+        visible_set=_VISIBLE, blind_holdout_store=store, holdout_key=_HOLDOUT_KEY,
+        signer_seed=_SIGNER_SEED, signer_principal="cal-gov-1",
+        signer_approval=signer or _cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3)
 
 
 # honest: reused across BOTH the visible AND the holdout lane (same instance, 12 trials). Each set is
@@ -116,9 +120,11 @@ class AcceptanceAnchorTests(unittest.TestCase):
         self.assertEqual(report.visible_coverage, 2)
         self.assertEqual(report.holdout_coverage, 2)           # no silent skip
         self.assertIn("provisional", report.claim)             # honest claim, not "proven"
-        # board #8: the receipt binds WHAT was tested.
-        self.assertEqual(report.detector_identity, "det-honest-4tuple")
-        self.assertEqual(report.image_ref, _IMAGE_REF)         # pinned image digest
+        # board #3/#8: the receipt binds WHAT was tested, DERIVED from execution (not caller strings).
+        expected_id = identity_for(_MANIFEST, host_closure_digest=_HOST_CLOSURE,
+                                   artifact_image_digest=content_digest({"image": report.image_ref}))
+        self.assertEqual(report.detector_identity, expected_id)  # COMPUTED, not a caller string
+        self.assertEqual(report.image_ref, "<_HermeticNoOp>")    # DERIVED from the real sandbox
         self.assertEqual(report.trials, 3)
         self.assertNotEqual(report.visible_corpus_digest, report.holdout_corpus_digest)  # genuinely blind
         self.assertTrue(report.sandbox_config_hash)            # computed from the real sandbox

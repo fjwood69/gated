@@ -37,6 +37,7 @@ from typing import Callable
 from core import ResourceBudget, RuntimeAssertion, Sandbox, ed25519
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from core.chain import content_digest
+from core.identity import DetectorManifest, identity_for
 from engine.calibration import DEFAULT_CALIBRATION_TRIALS, calibrate
 from gate.authority import AuthorityDomain, GovernanceApproval
 
@@ -223,22 +224,33 @@ def verify_report(report: AcceptanceReport, *, verify_key: bytes) -> bool:
         return False
 
 
+def _sandbox_image_ref(sandbox: Sandbox, pin_image: Callable[[str], str] | None) -> str:
+    """DERIVE the image reference from the ACTUAL sandbox (board #3 — not a caller string). OCI-style
+    sandboxes expose ``.image``; ``pin_image`` (deploy-provided, e.g. ``podman image inspect``) resolves
+    that tag to an immutable digest. A sandbox with no image (NoOp) reports its type."""
+    tag = getattr(sandbox, "image", None)
+    if tag is None:
+        return f"<{type(sandbox).__name__}>"
+    return pin_image(tag) if pin_image is not None else str(tag)
+
+
 def run_acceptance_anchor(
     *,
     make_sandbox: Callable[[], Sandbox],
     honest_detector: RuntimeAssertion,
     fn_deficient_detector: RuntimeAssertion,
     fp_happy_detector: RuntimeAssertion,
-    detector_identity: str,
+    detector_manifest: DetectorManifest,
+    host_closure_digest: str,
     visible_set: CalibrationSet,
     blind_holdout_store: BlindHoldoutStore,
     holdout_key: bytes,
     signer_seed: bytes,
     signer_principal: str,
     signer_approval: GovernanceApproval,
-    image_ref: str,
     now: float,
     budget: ResourceBudget,
+    pin_image: Callable[[str], str] | None = None,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
 ) -> AcceptanceReport:
     """Conduct the two-sided acceptance run against REAL fixtures + a REAL sandbox and return a SIGNED,
@@ -247,12 +259,13 @@ def run_acceptance_anchor(
     (must PASS), FN-deficient (must be REFUSED), FP-happy (must be REFUSED), honest detector on the blind
     holdout (must PASS — generalisation). ``accepted`` iff all four hold.
 
-    The receipt binds WHAT was tested (board blocker #8): the honest detector's 4-tuple
-    ``detector_identity``, the visible + holdout CORPUS DIGESTS, the ``trials`` depth, and the PINNED
-    ``image_ref`` (a digest, not a mutable tag). ``sandbox_config_hash`` is computed HERE from the REAL
-    sandbox isolation level + the pinned image (not caller-supplied), so a mismatched environment cannot
-    be laundered into a green receipt. Also refuses if the visible + holdout corpora are IDENTICAL (a
-    holdout that duplicates the visible set proves memorisation, not generalisation)."""
+    The receipt binds WHAT was tested, DERIVED FROM EXECUTION not caller strings (board #3 + #8): the
+    detector's 4-tuple identity is COMPUTED (``core.identity.identity_for``) from the content-addressed
+    ``detector_manifest`` + ``host_closure_digest`` + the image the sandbox ACTUALLY ran; the ``image_ref``
+    is DERIVED from the real sandbox (``.image``) and pinned to a digest via ``pin_image``; the
+    ``sandbox_config_hash`` is computed HERE from the real sandbox isolation + pinned image. Nothing that
+    describes the run is a free-form caller claim. Also refuses if the visible + holdout corpora are
+    IDENTICAL (a holdout that duplicates the visible set proves memorisation, not generalisation)."""
     if not signer_approval.meets(1, domain=AuthorityDomain.CALIBRATION_GOVERNANCE):
         raise AcceptanceError(
             "the acceptance report must be signed by a CALIBRATION_GOVERNANCE principal — the detector "
@@ -266,9 +279,15 @@ def run_acceptance_anchor(
             "the blind holdout is IDENTICAL to the visible corpus — that proves memorisation, not "
             "generalisation. The holdout must contain fixtures the detector's authors never saw."
         )
-    # sandbox config bound from the REAL sandbox (isolation level) + the pinned image digest.
-    probe_isolation = make_sandbox().isolation_level
-    sandbox_config_hash = sandbox_config_digest(isolation=probe_isolation.value, image=image_ref)
+    # image + isolation DERIVED from the REAL sandbox (not caller strings); identity COMPUTED from the
+    # content-addressed manifest + the image the sandbox actually ran.
+    probe = make_sandbox()
+    image_ref = _sandbox_image_ref(probe, pin_image)
+    sandbox_config_hash = sandbox_config_digest(isolation=probe.isolation_level.value, image=image_ref)
+    detector_identity = identity_for(
+        detector_manifest, host_closure_digest=host_closure_digest,
+        artifact_image_digest=content_digest({"image": image_ref}),
+    )
 
     honest = calibrate(make_sandbox, honest_detector, visible_set, budget, trials=trials)
     fn = calibrate(make_sandbox, fn_deficient_detector, visible_set, budget, trials=trials)
