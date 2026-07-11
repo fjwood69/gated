@@ -33,9 +33,9 @@ from typing import Callable, Mapping
 from gate.attestation import (
     AttestationError,
     MeasurementAttestation,
-    attestation_ref,
     verify_measurement,
 )
+from gate.attestation_store import MeasurementAttestationStore
 from gate.policy_state import PolicyState
 from gate.policy_store import PolicyStore, ReAttestConflict
 
@@ -99,12 +99,14 @@ class RestoreController:
         *,
         issuer_keys: Mapping[str, bytes],
         oracle_head_for: Callable[[str], str | None],
+        attestation_store: MeasurementAttestationStore,
         identity_trusted: Callable[[str], bool] = lambda _identity: True,
         max_cas_retries: int = 3,
     ) -> None:
         self._cap = capability
         self._issuer_keys = dict(issuer_keys)
         self._oracle_head_for = oracle_head_for
+        self._attestations = attestation_store
         self._identity_trusted = identity_trusted
         self._max_cas_retries = max_cas_retries
 
@@ -135,7 +137,10 @@ class RestoreController:
                 f"detector identity {att.detector_identity!r} is no longer trusted",
             )
 
-        ref = attestation_ref(att)
+        # board blocker #3: persist the signed measurement DURABLY + immutably BEFORE re-attesting, so
+        # the RE_ATTESTATION ref binds a stored, signed, re-verifiable attestation (not just a mutable
+        # calibration_pass row). Idempotent by ref.
+        ref = self._attestations.persist(att)
         # 4 + 5: oracle-currency + state + policy-head CAS, retried on head conflict.
         for _attempt in range(self._max_cas_retries + 1):
             current_head = self._oracle_head_for(att.set_id)

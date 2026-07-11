@@ -53,7 +53,9 @@ class MeasurementAttestation:
     set_id: str
     oracle_head: str                # set_head(set_id) at measurement time (the SEALED head)
     coverage_digest: str            # digest of the exact ground-truth fixtures scored (co-sealed w/ head)
-    tier_generation: str            # policy-store tier-chain head at measurement time
+    tier_generation: str            # policy tier-chain head at measurement (AUDIT provenance only —
+                                    # integrity-covered by the MAC; the restore GATE is the oracle-head
+                                    # + policy-evidence-head CAS, not this field)
     issuer: str                     # the CALIBRATION_GOVERNANCE issuer id (checked vs an allowlist)
     run_id: str
     nonce: str

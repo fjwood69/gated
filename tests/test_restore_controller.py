@@ -15,6 +15,7 @@ from pathlib import Path
 
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import FixtureLabel
+from gate.attestation_store import MeasurementAttestationStore
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
 from gate.gatekeeper import resolve_disposition
@@ -83,10 +84,16 @@ def _policy_store_enabled(head: str) -> PolicyStore:
     return s
 
 
-def _controller(s: PolicyStore, c: CalibrationStore, *, trusted: bool = True) -> RestoreController:
+def _att_store() -> MeasurementAttestationStore:
+    return MeasurementAttestationStore(Path(tempfile.mkdtemp(prefix="mv-rc-att-")) / "a.db")
+
+
+def _controller(s: PolicyStore, c: CalibrationStore, *, trusted: bool = True,
+                att_store: MeasurementAttestationStore | None = None) -> RestoreController:
     return RestoreController(
         ReAttestCapability(s), issuer_keys={_ISSUER: _MEAS_KEY},
-        oracle_head_for=c.set_head, identity_trusted=lambda _i: trusted)
+        oracle_head_for=c.set_head, attestation_store=att_store or _att_store(),
+        identity_trusted=lambda _i: trusted)
 
 
 def _run(c: CalibrationStore, verdicts: list[Verdict], *, tier_gen: str = "tg", nonce: str = "n1"):  # type: ignore[no-untyped-def]
@@ -149,7 +156,7 @@ class RestoreControllerTests(unittest.TestCase):
         s = _policy_store_enabled(c.set_head("X"))
         att = _run(c, [_FAIL] * 3 + [_PASS] * 3)
         ctrl = RestoreController(ReAttestCapability(s), issuer_keys={"other": _MEAS_KEY},
-                                 oracle_head_for=c.set_head)
+                                 oracle_head_for=c.set_head, attestation_store=_att_store())
         self.assertIs(ctrl.attempt_restore(att).result, RestoreResult.REFUSED_UNTRUSTED)
 
     def test_wrong_key_refused(self) -> None:
@@ -157,7 +164,7 @@ class RestoreControllerTests(unittest.TestCase):
         s = _policy_store_enabled(c.set_head("X"))
         att = _run(c, [_FAIL] * 3 + [_PASS] * 3)
         ctrl = RestoreController(ReAttestCapability(s), issuer_keys={_ISSUER: b"WRONG-KEY"},
-                                 oracle_head_for=c.set_head)
+                                 oracle_head_for=c.set_head, attestation_store=_att_store())
         self.assertIs(ctrl.attempt_restore(att).result, RestoreResult.REFUSED_UNTRUSTED)
 
     def test_stale_oracle_head_refused(self) -> None:
@@ -175,6 +182,24 @@ class RestoreControllerTests(unittest.TestCase):
         att = _run(c, [_FAIL] * 3 + [_PASS] * 3)
         self.assertIs(_controller(s, c, trusted=False).attempt_restore(att).result,
                       RestoreResult.REFUSED_UNTRUSTED)
+
+    def test_restore_persists_the_signed_attestation(self) -> None:
+        # board blocker #3: the re-attest ref must bind a DURABLE, immutable, signed attestation.
+        c = _cal_store()
+        s = _policy_store_enabled(c.set_head("X"))
+        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
+                 set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
+        att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3)
+        store = _att_store()
+        outcome = _controller(s, c, att_store=store).attempt_restore(att)
+        self.assertIs(outcome.result, RestoreResult.RESTORED)
+        from gate.attestation import attestation_ref, verify_measurement
+        ref = attestation_ref(att)
+        self.assertTrue(store.exists(ref))                       # durably persisted
+        stored = store.get(ref)
+        assert stored is not None
+        verify_measurement(stored, measurement_key=_MEAS_KEY)    # the stored copy is the signed one
+        self.assertEqual(stored.oracle_head, att.oracle_head)
 
     def test_restore_succeeds_when_other_policies_exist(self) -> None:
         # regression (board blocker #4): the policy-head CAS must compare against THIS policy's head,

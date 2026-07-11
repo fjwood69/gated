@@ -14,6 +14,7 @@ from pathlib import Path
 
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import FixtureLabel
+from gate.attestation_store import MeasurementAttestationStore
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
 from gate.gatekeeper import resolve_disposition
@@ -185,8 +186,10 @@ class FullLoopTests(unittest.TestCase):
         job = q.lease(lease_token="w1", visibility_timeout=60.0, now=20.0)
         assert job is not None
         att = self._run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3)  # catches b1+b2, passes g1
+        att_store = MeasurementAttestationStore(Path(tempfile.mkdtemp(prefix="mv-orch-att-")) / "a.db")
         outcome = RestoreController(
             ReAttestCapability(s), issuer_keys={_ISSUER: _MEAS_KEY}, oracle_head_for=ohf,
+            attestation_store=att_store,
         ).attempt_restore(att)
         self.assertIs(outcome.result, RestoreResult.RESTORED)
         self.assertTrue(q.complete(job.job_id, lease_token="w1", now=30.0))
