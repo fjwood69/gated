@@ -36,6 +36,7 @@ from core.calibration import FixtureLabel
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
 from gate.candidate_store import Candidate, CandidateKind, CandidateSource, CandidateStore
+from gate.snapshot_refresh import commit_fixture_append
 
 # The distinct-principal count admitting a fixture requires. Admitting is high-stakes (a known-bad
 # can block merges; a known-good can mask a true positive) — dual control, not a low-friction add.
@@ -79,18 +80,35 @@ def _is_canonical_tree_hash(h: str | None) -> bool:
     return len(h) == 64 and all(c in "0123456789abcdef" for c in h.lower())
 
 
+# revoke_fallback(set_id) -> None: SYNCHRONOUSLY revoke the fallback snapshot's attestations for the
+# set BEFORE the fixture lands (close-4). Production wires ``invalidate_fallback_for_set(path, set_id,
+# key)``; it is a no-op when no snapshot exists yet. REQUIRED — the safe append is not optional.
+FallbackRevoker = Callable[[str], None]
+
+
 def admit(
     candidate: Candidate,
     *,
     approval: GovernanceApproval,
     validator: Validator,
     calibration_store: CalibrationStore,
+    revoke_fallback: FallbackRevoker,
+    set_id: str = "default",
 ) -> int:
-    """Promote a candidate to a FIXTURE — the one, dual-controlled, validated path. Raises
+    """Promote a candidate to a FIXTURE — the one, dual-controlled, validated, SAFE path. Raises
     ``AdmissionError`` unless: the approval carries two distinct principals; the candidate executes
     cleanly (deterministic PASS/FAIL, not ERROR/crash); a known-good carries a canonical
-    system-computed merged-tree hash. On success, appends to the calibration store with provenance
-    and returns the fixture seq.
+    system-computed merged-tree hash. On success, lands the fixture via the MANDATORY safe append and
+    returns the fixture seq.
+
+    Board blocker #5 (safe append is mandatory, not optional): admission is the normal path a fixture
+    enters the oracle, so it MUST carry the close-4 orchestration — the fixture append is committed
+    through ``commit_fixture_append``: the fallback snapshot for ``set_id`` is durably REVOKED first,
+    then the fixture lands ATOMICALLY with its re-calibration outbox trigger (``outbox_set_id``). Without
+    this, admitting a known-bad would move the oracle head while (a) a stale fallback snapshot could
+    still enforce the pre-append head during an outage, and (b) no re-calibration is ever enqueued, so
+    every bound policy is wedged UNATTESTABLE forever. ``revoke_fallback`` is REQUIRED so the caller
+    cannot silently skip the revocation.
 
     The dry-run checks EXECUTABILITY only — it does NOT gate on the detector's verdict-vs-label,
     because a known-bad that the current detector PASSES is normally the discovered evasion, and the
@@ -122,15 +140,22 @@ def admit(
         + (f", c3_override={candidate.c3_override_ref}" if candidate.c3_override_ref else "")
         + ")"
     )
-    return calibration_store.append(
-        _CHANGE_OP[candidate.kind],
-        approval=approval,
-        fixture_id=candidate.candidate_id,
-        label=_LABEL[candidate.kind],
-        payload=candidate.payload,
-        evasion_class=candidate.evasion_class,
-        reason=provenance,
-    )
+
+    def _append() -> int:
+        return calibration_store.append(
+            _CHANGE_OP[candidate.kind],
+            approval=approval,
+            fixture_id=candidate.candidate_id,
+            label=_LABEL[candidate.kind],
+            payload=candidate.payload,
+            evasion_class=candidate.evasion_class,
+            reason=provenance,
+            set_id=set_id,
+            outbox_set_id=set_id,  # atomic re-calibration trigger for the policies bound to this set
+        )
+
+    # revoke-and-fsync the fallback FIRST, then the atomic {append + outbox} — board amendment 4.
+    return commit_fixture_append(invalidate=lambda: revoke_fallback(set_id), append=_append)
 
 
 def emit_c3_triage_candidate(

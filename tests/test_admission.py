@@ -67,12 +67,12 @@ class DualControlTests(unittest.TestCase):
         one = GovernanceApproval(("gov1",), purpose="admit", rationale="r", operation_id="o")
         with self.assertRaises(AdmissionError):
             admit(_bad_candidate(), approval=one, validator=_validator(VerdictType.FAIL),
-                  calibration_store=cal)
+                  calibration_store=cal, revoke_fallback=lambda _s: None)
 
     def test_dual_admits_and_records_provenance(self) -> None:
         cal = _cal()
         admit(_bad_candidate("b1"), approval=_dual(), validator=_validator(VerdictType.FAIL),
-              calibration_store=cal)
+              calibration_store=cal, revoke_fallback=lambda _s: None)
         cset = cal.load_current_set()
         self.assertEqual({f.fixture_id for f in cset.known_bad}, {"b1"})
 
@@ -82,7 +82,7 @@ class ValidationTests(unittest.TestCase):
         cal = _cal()
         with self.assertRaises(AdmissionError):
             admit(_bad_candidate(), approval=_dual(),
-                  validator=_validator(VerdictType.ERROR, clean=False), calibration_store=cal)
+                  validator=_validator(VerdictType.ERROR, clean=False), calibration_store=cal, revoke_fallback=lambda _s: None)
 
     def test_known_bad_that_passes_baseline_is_admitted_not_refused(self) -> None:
         # a known-bad the CURRENT detector PASSES is normally the DISCOVERED EVASION — exactly what
@@ -90,19 +90,19 @@ class ValidationTests(unittest.TestCase):
         # admission does NOT gate on the detector-verdict-vs-label; it only checks executability.
         cal = _cal()
         admit(_bad_candidate("b1"), approval=_dual(), validator=_validator(VerdictType.PASS),
-              calibration_store=cal)
+              calibration_store=cal, revoke_fallback=lambda _s: None)
         self.assertEqual({f.fixture_id for f in cal.load_current_set().known_bad}, {"b1"})
 
     def test_known_good_requires_canonical_merged_tree_hash(self) -> None:
         cal = _cal()
         with self.assertRaises(AdmissionError):  # missing
             admit(_good_candidate(tree=None), approval=_dual(), validator=_validator(VerdictType.PASS),
-                  calibration_store=cal)
+                  calibration_store=cal, revoke_fallback=lambda _s: None)
         with self.assertRaises(AdmissionError):  # non-canonical (PR-tree-ish short hash)
             admit(_good_candidate(tree="deadbeef"), approval=_dual(),
-                  validator=_validator(VerdictType.PASS), calibration_store=cal)
+                  validator=_validator(VerdictType.PASS), calibration_store=cal, revoke_fallback=lambda _s: None)
         admit(_good_candidate(), approval=_dual(), validator=_validator(VerdictType.PASS),
-              calibration_store=cal)
+              calibration_store=cal, revoke_fallback=lambda _s: None)
         self.assertEqual({f.fixture_id for f in cal.load_current_set().known_good}, {"g1"})
 
 
@@ -126,6 +126,43 @@ class NoAutoPromoteTests(unittest.TestCase):
         import gate.admission as adm
         for name in ("admit_all", "batch_admit", "auto_admit", "promote_all", "admit_pending"):
             self.assertFalse(hasattr(adm, name), f"admission must not expose {name}")
+
+
+class SafeAppendMandatoryTests(unittest.TestCase):
+    """Board blocker #5: admission must land the fixture through the SAFE append — revoke the fallback
+    for the set FIRST, then commit the fixture ATOMICALLY with its re-calibration outbox trigger."""
+
+    def test_admit_revokes_fallback_then_enqueues_outbox(self) -> None:
+        cal = _cal()
+        revoked: list[str] = []
+        seq = admit(_bad_candidate("b1"), approval=_dual(), validator=_validator(VerdictType.FAIL),
+                    calibration_store=cal, set_id="X", revoke_fallback=lambda sid: revoked.append(sid))
+        self.assertGreater(seq, 0)
+        self.assertEqual(revoked, ["X"])                     # fallback revoked, for the right set
+        self.assertEqual({f.fixture_id for f in cal.load_current_set().known_bad}, {"b1"})
+        outbox = cal.undrained_outbox()                      # re-calibration trigger enqueued atomically
+        self.assertEqual(len(outbox), 1)
+        self.assertEqual(outbox[0].set_id, "X")
+        self.assertEqual(outbox[0].oracle_head_after, cal.set_head("X"))
+
+    def test_admit_requires_a_revoke_fallback_hook(self) -> None:
+        # the safe append is MANDATORY, not optional — revoke_fallback is a required keyword.
+        params = inspect.signature(admit).parameters
+        self.assertIn("revoke_fallback", params)
+        self.assertIs(params["revoke_fallback"].default, inspect.Parameter.empty)  # required
+
+    def test_revocation_failure_aborts_admission(self) -> None:
+        # if the fallback revocation fails, the fixture must NOT land (over-block, fail-closed).
+        cal = _cal()
+
+        def boom(_sid: str) -> None:
+            raise OSError("cannot revoke fallback")
+
+        with self.assertRaises(OSError):
+            admit(_bad_candidate("b1"), approval=_dual(), validator=_validator(VerdictType.FAIL),
+                  calibration_store=cal, set_id="X", revoke_fallback=boom)
+        self.assertEqual(cal.record_count(), 0)              # nothing landed
+        self.assertEqual(cal.undrained_outbox(), ())
 
 
 if __name__ == "__main__":

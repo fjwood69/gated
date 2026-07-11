@@ -157,6 +157,25 @@ class SynchronousInvalidationTests(unittest.TestCase):
         d = Path(tempfile.mkdtemp(prefix="mv-inval2-"))
         invalidate_fallback_for_set(str(d / "absent.json"), set_id="X", key=_KEY)  # no raise
 
+    def test_tampered_snapshot_is_refused_before_resign(self) -> None:
+        # board blocker #6: a tampered on-disk snapshot must NOT be re-signed by the revocation path
+        # (that would launder it into a validly-signed one). The MAC is checked first -> raise ->
+        # commit_fixture_append aborts the append (over-block, fail-closed).
+        from gate.snapshot import SnapshotError
+
+        d = Path(tempfile.mkdtemp(prefix="mv-inval3-"))
+        path = str(d / "snapshot.json")
+        self._persist(path, {"P": _rec("P")})
+        # tamper: flip the persisted JSON without re-MACing (an FS-level attacker).
+        tampered = Path(path).read_text().replace('"P"', '"P_EVIL"')
+        Path(path).write_text(tampered)
+        appended: list[str] = []
+        with self.assertRaises(SnapshotError):
+            commit_fixture_append(
+                invalidate=lambda: invalidate_fallback_for_set(path, set_id="X", key=_KEY),
+                append=lambda: appended.append("bx2"))
+        self.assertEqual(appended, [])  # append aborted — the fixture never landed
+
 
 def _rec_set(pid: str, set_id: str, oracle_head: str) -> AttestationRecord:
     return AttestationRecord(

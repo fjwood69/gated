@@ -101,10 +101,10 @@ class C3RouterTests(unittest.TestCase):
         assert cand is not None
         with self.assertRaises(AdmissionError):  # one principal is not enough — the stamp adds nothing
             admit(cand, approval=_human("only-alice", op="o1"), validator=_clean_validator,
-                  calibration_store=cal)
+                  calibration_store=cal, revoke_fallback=lambda _s: None)
         # two DISTINCT humans (+ the canonical merged-tree hash the router carried) -> admitted.
         seq = admit(cand, approval=_human("alice", "bob", op="o2"), validator=_clean_validator,
-                    calibration_store=cal)
+                    calibration_store=cal, revoke_fallback=lambda _s: None)
         self.assertGreater(seq, 0)
         self.assertEqual(cal.record_count(), 1)  # NOW it is a fixture — by human dual control, not the stamp
 
@@ -120,7 +120,7 @@ class C3RouterTests(unittest.TestCase):
         cal_gov = GovernanceApproval(principals=("a", "b"), purpose="p", rationale="r",
                                      operation_id="o", domain=AuthorityDomain.CALIBRATION_GOVERNANCE)
         with self.assertRaises(AdmissionError):
-            admit(cand, approval=cal_gov, validator=_clean_validator, calibration_store=cal)
+            admit(cand, approval=cal_gov, validator=_clean_validator, calibration_store=cal, revoke_fallback=lambda _s: None)
 
 
 if __name__ == "__main__":

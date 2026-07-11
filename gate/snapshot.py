@@ -145,14 +145,22 @@ def prune_and_resign(
     )
 
 
-def verify_snapshot(snapshot: CalibrationSnapshot, *, key: bytes, now: float) -> None:
-    """Raise ``SnapshotError`` unless the snapshot is HMAC-valid under ``key`` AND within its
-    freshness horizon. Constant-time MAC compare. A tampered payload changes the canonical bytes ->
-    MAC mismatch; a stale snapshot (now >= valid_until) is refused regardless of MAC validity."""
+def assert_snapshot_integrity(snapshot: CalibrationSnapshot, *, key: bytes) -> None:
+    """Raise ``SnapshotError`` unless the snapshot's HMAC is valid under ``key`` (constant-time) —
+    INTEGRITY only, no freshness check. Used before RE-SIGNING an existing snapshot (revocation):
+    re-signing a payload whose MAC we never verified would launder a tampered snapshot into a validly
+    signed one, so integrity must be confirmed FIRST."""
     if not key:
         raise SnapshotError("no signing key available to verify snapshot")
     if not hmac.compare_digest(_sign(snapshot._payload(), key), snapshot.mac):
         raise SnapshotError("snapshot HMAC mismatch — payload tampered or wrong key")
+
+
+def verify_snapshot(snapshot: CalibrationSnapshot, *, key: bytes, now: float) -> None:
+    """Raise ``SnapshotError`` unless the snapshot is HMAC-valid under ``key`` AND within its
+    freshness horizon. Constant-time MAC compare. A tampered payload changes the canonical bytes ->
+    MAC mismatch; a stale snapshot (now >= valid_until) is refused regardless of MAC validity."""
+    assert_snapshot_integrity(snapshot, key=key)
     if now >= snapshot.valid_until:
         raise SnapshotError(
             f"snapshot past freshness horizon (now={now} >= valid_until={snapshot.valid_until})"
@@ -200,6 +208,7 @@ __all__ = [
     "SnapshotError",
     "issue_snapshot",
     "verify_snapshot",
+    "assert_snapshot_integrity",
     "attested_record",
     "to_json",
     "from_json",

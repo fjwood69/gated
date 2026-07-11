@@ -29,6 +29,7 @@ from typing import Callable, Mapping, TypeVar
 from gate.snapshot import (
     AttestationRecord,
     CalibrationSnapshot,
+    assert_snapshot_integrity,
     from_json,
     issue_snapshot,
     prune_and_resign,
@@ -111,6 +112,11 @@ def invalidate_fallback_for_set(snapshot_path: str, *, set_id: str, key: bytes) 
     if not os.path.exists(snapshot_path):
         return
     snapshot = from_json(Path(snapshot_path).read_text(encoding="utf-8"))
+    # board blocker #6: verify the on-disk snapshot's MAC BEFORE re-signing it. Re-signing an
+    # unverified payload would launder a tampered snapshot into a validly-signed one. A tampered
+    # snapshot raises (SnapshotError propagates), so ``commit_fixture_append`` ABORTS the append —
+    # fail-closed / over-block, the safe direction (board amendment 4).
+    assert_snapshot_integrity(snapshot, key=key)
     pruned = prune_and_resign(snapshot, drop_set_id=set_id, key=key)
     _atomic_write(snapshot_path, to_json(pruned))  # temp -> fsync -> os.replace -> fsync parent dir
 
