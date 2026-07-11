@@ -82,7 +82,8 @@ CREATE TABLE IF NOT EXISTS tier_transition_chain (
 CREATE TABLE IF NOT EXISTS calibration_pass (
     calibration_result_ref TEXT PRIMARY KEY,
     policy_id              TEXT NOT NULL,
-    pinned_set_version     TEXT NOT NULL,
+    set_id                 TEXT NOT NULL DEFAULT 'default',  -- 3.4: the SET this policy calibrated against
+    pinned_set_version     TEXT NOT NULL,   -- the set_head(set_id) AT calibration time (the oracle head)
     detector_identity      TEXT NOT NULL,
     passed_at              REAL NOT NULL
 );
@@ -215,19 +216,43 @@ class PolicyStore:
         policy_id: str,
         pinned_set_version: str,
         detector_identity: str,
+        set_id: str = "default",
     ) -> None:
         """Persist the FACTUAL attestation that a calibration ran and PASSED for this
-        (policy, fixture-set version, detector identity). Written by the calibration flow AFTER a
-        real ``calibrate()`` returned passed=True — never on a FAIL. ``ratify_enable`` -> ENABLED is
-        gated on a matching row existing here (gap-1). Idempotent by ref (INSERT OR IGNORE)."""
+        (policy, SET, set-head/oracle-version, detector identity). Written by the calibration flow
+        AFTER a real ``calibrate()`` returned passed=True — never on a FAIL. ``ratify_enable`` ->
+        ENABLED is gated on a matching row (gap-1). ``pinned_set_version`` is the ``set_head(set_id)``
+        at calibration time — the SCOPED oracle head enforcement later compares against (close-3).
+        Idempotent by ref (INSERT OR IGNORE)."""
         with self._lock:
             self._conn().execute(
                 "INSERT OR IGNORE INTO calibration_pass "
-                "(calibration_result_ref, policy_id, pinned_set_version, detector_identity, passed_at)"
-                " VALUES (?,?,?,?,?)",
-                (calibration_result_ref, policy_id, pinned_set_version, detector_identity,
+                "(calibration_result_ref, policy_id, set_id, pinned_set_version, detector_identity,"
+                " passed_at) VALUES (?,?,?,?,?,?)",
+                (calibration_result_ref, policy_id, set_id, pinned_set_version, detector_identity,
                  self._clock()),
             )
+
+    def current_attestation(self, policy_id: str) -> tuple[str, str] | None:
+        """The ``(set_id, oracle_head)`` the policy's CURRENT calibration was bound to — or None if
+        the policy is not ENABLED (only an ENABLED policy enforces). Fails CLOSED on a broken chain.
+        The gatekeeper compares ``oracle_head`` to the live ``set_head(set_id)``; a mismatch means
+        the set's membership changed since calibration -> transient UNATTESTABLE (close-3, scoped)."""
+        if not self.verify_chain():
+            raise ChainIntegrityError("tier-transition chain failed verification — refusing to read")
+        row = self._conn().execute(
+            "SELECT new_state, calibration_result_ref FROM tier_transition_chain WHERE policy_id=? "
+            "ORDER BY seq DESC LIMIT 1", (policy_id,)
+        ).fetchone()
+        if row is None or row["new_state"] != PolicyState.ENABLED.value:
+            return None
+        prow = self._conn().execute(
+            "SELECT set_id, pinned_set_version FROM calibration_pass WHERE calibration_result_ref=? "
+            "AND policy_id=? LIMIT 1", (row["calibration_result_ref"], policy_id)
+        ).fetchone()
+        if prow is None:
+            return None
+        return (str(prow["set_id"]), str(prow["pinned_set_version"]))
 
     def _pass_exists_unlocked(
         self, calibration_result_ref: str, policy_id: str, pinned_set_version: str,
