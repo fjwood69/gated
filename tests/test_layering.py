@@ -55,7 +55,11 @@ class LayeringTests(unittest.TestCase):
         # engine-free while the calibrate CALL lives engine-side.
         engine_free = ("policy_state.py", "policy_store.py", "snapshot.py", "snapshot_refresh.py",
                        "authority.py", "calibration_store.py", "candidate_store.py", "admission.py",
-                       "closure_audit.py")
+                       "closure_audit.py",
+                       # 3.5: the measurement/governance primitives + operational state hold no engine
+                       # reach either — only the runner (recalibration.py) + relay bridge to engine.
+                       "attestation.py", "restore_controller.py", "recal_queue.py",
+                       "recal_metrics.py", "c3_router.py")
         gate_dir = _ROOT / "gate"
         hits = [
             f"{name}: {line}"
