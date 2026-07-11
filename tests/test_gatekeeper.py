@@ -97,10 +97,11 @@ class _UnreachableStore(PolicyStore):
         raise sqlite3.OperationalError("database is locked")
 
 
-def _snap(pid: str, detector: str):  # type: ignore[no-untyped-def]
+def _snap(pid: str, detector: str, *, set_id: str = "default", oracle_head: str = "fx-head"):  # type: ignore[no-untyped-def]
     rec = AttestationRecord(
         policy_id=pid, detector_identity=detector, calibration_result_ref="cal-1",
         fixture_set_version="fx-head", tier_chain_head="tier-head", backend="podman",
+        set_id=set_id, oracle_head=oracle_head,
     )
     return issue_snapshot({pid: rec}, key=_KEY, now=1000.0, valid_for_seconds=300)
 
@@ -137,6 +138,22 @@ class Done1_UnattestableBlocksTests(unittest.TestCase):
         u = _UnreachableStore(Path(tempfile.mkdtemp(prefix="mv-gk-u3-")) / "t.db")
         d = _resolve(u, "p1", snapshot=_snap("p1", "det-1"), now=1000.0 + 300.0)  # stale
         self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
+
+    def test_store_unreachable_oracle_drift_on_fallback_blocks(self) -> None:
+        # close-4: tier store down (fallback), but the calibration store is reachable and reports a
+        # DRIFTED head for the policy's set -> UNATTESTABLE, mirroring the live path (completes close 3).
+        u = _UnreachableStore(Path(tempfile.mkdtemp(prefix="mv-gk-u6-")) / "t.db")
+        d = _resolve(u, "p1", detector="det-1", snapshot=_snap("p1", "det-1", oracle_head="h1"),
+                     now=1100.0, oracle_head_for=lambda _s: "h2")  # set grew since mint
+        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
+        self.assertEqual(d.source, "unattestable")
+
+    def test_store_unreachable_calibration_also_down_trusts_fresh_snapshot(self) -> None:
+        # both stores down -> cannot check the head -> trust the fresh (horizon-bounded) snapshot.
+        u = _UnreachableStore(Path(tempfile.mkdtemp(prefix="mv-gk-u7-")) / "t.db")
+        d = _resolve(u, "p1", detector="det-1", snapshot=_snap("p1", "det-1", oracle_head="h1"),
+                     now=1100.0, oracle_head_for=lambda _s: None)
+        self.assertIs(d.disposition, Disposition.RUN_ENFORCING)
 
     def test_store_unreachable_policy_absent_blocks(self) -> None:
         # gap-2: absence from a valid snapshot is indistinguishable from an incomplete mint ->
