@@ -245,10 +245,11 @@ class WebhookReceiver:
 
         gating_event = GatingEvent(
             delivery_id=delivery_id or "",
-            repo_full_name=repo_full_name,
+            repo_full_name=repo_full_name,          # ALWAYS the base repo (check + ledger)
             head_sha=head_sha,
             action=action,
             installation_id=installation_id,
+            head_repo_full_name=self._head_repo_full_name(payload),  # fork repo (C2 fetch hint)
         )
         try:
             self._gating_sink.enqueue(gating_event)
@@ -361,6 +362,21 @@ class WebhookReceiver:
             sha = run.get("head_sha")
             if isinstance(sha, str) and sha:
                 return sha
+        return None
+
+    @staticmethod
+    def _head_repo_full_name(payload: dict[str, object]) -> str | None:
+        """The FORK's repo (`pull_request.head.repo.full_name`) — differs from the base for
+        a cross-repo PR; a fetch hint only. None for same-repo PRs / non-PR events."""
+        pr = payload.get("pull_request")
+        if isinstance(pr, dict):
+            head = pr.get("head")
+            if isinstance(head, dict):
+                repo = head.get("repo")
+                if isinstance(repo, dict):
+                    name = repo.get("full_name")
+                    if isinstance(name, str) and name:
+                        return name
         return None
 
     @staticmethod

@@ -24,13 +24,19 @@ class SinkFull(RuntimeError):
 @dataclass(frozen=True)
 class GatingEvent:
     """A PR head that needs gating — the unit handed to the executor. Bound to the
-    exact head SHA the eventual verdict must match at merge."""
+    exact head SHA the eventual verdict must match at merge.
+
+    ``repo_full_name`` is ALWAYS the BASE repo — the Check Run posts there (that is where
+    branch protection blocks) and the override ledger keys on it. ``head_repo_full_name``
+    is the FORK's repo for a cross-repo PR (else None / == base); it is ONLY a fetch hint
+    for the C2 fork-fetch contingency, and must never displace the base for check/ledger."""
 
     delivery_id: str
     repo_full_name: str
     head_sha: str
     action: str
     installation_id: int
+    head_repo_full_name: str | None = None
 
 
 class GatingSink(Protocol):

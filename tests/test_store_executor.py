@@ -27,13 +27,17 @@ class _Clock:
         return self.t
 
 
-def _event(delivery_id: str, *, sha: str = "a" * 40, repo: str = "acme/widgets") -> GatingEvent:
+def _event(
+    delivery_id: str, *, sha: str = "a" * 40, repo: str = "acme/widgets",
+    head_repo: str | None = None,
+) -> GatingEvent:
     return GatingEvent(
         delivery_id=delivery_id,
         repo_full_name=repo,
         head_sha=sha,
         action="opened",
         installation_id=9001,
+        head_repo_full_name=head_repo,
     )
 
 
@@ -51,6 +55,22 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(self.store.enqueue(_event("d1")))
         self.assertFalse(self.store.enqueue(_event("d1")))  # re-delivery -> idempotent
         self.assertEqual(self.store.queued_count(), 1)
+
+    def test_fork_repo_survives_durable_round_trip(self) -> None:
+        # C2: the executor CLAIMS the event from the store, so a fork-fetch hint lost in the
+        # round-trip would silently revert the contingency to a base fetch. The base repo
+        # (check + ledger key) must be untouched.
+        self.store.enqueue(_event("dfork", sha="f" * 40, head_repo="forkuser/widgets"))
+        claimed = self.store.claim_next()
+        assert claimed is not None
+        self.assertEqual(claimed.head_repo_full_name, "forkuser/widgets")
+        self.assertEqual(claimed.repo_full_name, "acme/widgets")
+
+    def test_same_repo_event_has_null_head_repo(self) -> None:
+        self.store.enqueue(_event("dsame"))
+        claimed = self.store.claim_next()
+        assert claimed is not None
+        self.assertIsNone(claimed.head_repo_full_name)
 
     def test_claim_moves_to_processing_then_empty(self) -> None:
         self.store.enqueue(_event("d1", sha="a" * 40))

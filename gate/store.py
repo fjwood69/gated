@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS gating (
     check_run_id    TEXT,
     verdict         TEXT,
     reason          TEXT,
+    head_repo_full_name TEXT,               -- C2: fork repo (fetch hint); NULL for same-repo
     enqueued_at     REAL NOT NULL,
     claimed_at      REAL,
     updated_at      REAL NOT NULL
@@ -56,6 +57,7 @@ def _to_event(row: sqlite3.Row) -> GatingEvent:
         head_sha=row["head_sha"],
         action=row["action"],
         installation_id=row["installation_id"],
+        head_repo_full_name=row["head_repo_full_name"],
     )
 
 
@@ -69,6 +71,11 @@ class GatingStore:
         # initialise schema + WAL on a bootstrap connection
         conn = self._conn()
         conn.executescript(_SCHEMA)
+        # C2 migration: add head_repo_full_name to a pre-existing table (SQLite has no
+        # ADD COLUMN IF NOT EXISTS; guard on the column set). Nullable — old rows read NULL.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(gating)")}
+        if "head_repo_full_name" not in cols:
+            conn.execute("ALTER TABLE gating ADD COLUMN head_repo_full_name TEXT")
         conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
@@ -101,7 +108,7 @@ class GatingStore:
         cur = self._conn().execute(
             "INSERT INTO gating "
             "(delivery_id, repo_full_name, head_sha, installation_id, action, status,"
-            " enqueued_at, updated_at) VALUES (?,?,?,?,?, 'queued', ?, ?) "
+            " head_repo_full_name, enqueued_at, updated_at) VALUES (?,?,?,?,?, 'queued', ?, ?, ?) "
             "ON CONFLICT(delivery_id) DO UPDATE SET "
             "  status='queued', enqueued_at=excluded.enqueued_at,"
             "  updated_at=excluded.updated_at, claimed_at=NULL,"
@@ -113,6 +120,7 @@ class GatingStore:
                 event.head_sha,
                 event.installation_id,
                 event.action,
+                event.head_repo_full_name,
                 now,
                 now,
             ),

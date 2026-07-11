@@ -86,8 +86,11 @@ documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 ## Status
 
 Reference implementation. The boundary-observation mechanism is verified end-to-end on real
-podman; the gate has blocked a real merge on real GitHub. Fork-PR support and calibration
-mode are on the roadmap.
+podman, and the gate has **blocked real merges on real GitHub** — including a **pull request
+from a fork** (untrusted cross-repo code): the gate fetches the fork's code by its immutable
+commit SHA, runs it under observation, and blocks the merge on a violation. It also records
+an **admin override** of a failing gate in a tamper-evident audit ledger. Calibration mode
+(baseline gathering across full trial distributions) is on the roadmap.
 
 ## Licence
 

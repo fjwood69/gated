@@ -53,6 +53,13 @@ SHORT_CIRCUIT = os.environ.get("GATED_SHORT_CIRCUIT", "1") not in ("0", "false",
 # is out-of-band (NFR4): its own DB file, never the repo under test.
 POLICY_VERSION = os.environ.get("GATED_POLICY_VERSION")  # nullable
 LEDGER_DB = os.environ.get("GATED_LEDGER_DB")            # default: alongside the gate db
+# C2 fork-fetch contingency. Default OFF: fetch the fork's code from the BASE repo by SHA
+# (GET /repos/{base}/tarball/{fork_head_sha}) — the base commit-store mirrors the fork head
+# via refs/pull/N/head, and by-SHA is TOCTOU-proof (a fork force-push can't change what we
+# run). Flip ON only if that 404s live: then fetch from the FORK repo by the same SHA (still
+# SHA-bound; works for PUBLIC forks with the base token; a private fork needs an App install
+# on the fork). repo_full_name stays BASE regardless — only the fetch source changes.
+FORK_FETCH = os.environ.get("GATED_FORK_FETCH", "0") not in ("0", "false", "no", "")
 
 
 class _LoggingTrialReportSink:
@@ -113,7 +120,13 @@ def build(
 
     def artifact_source(event: GatingEvent, ws: Path) -> ArtifactSpec:
         token = provider.get_valid_token(event.installation_id)
-        download_tarball(event.repo_full_name, event.head_sha, str(ws / "head.tar"), token)
+        # PRIMARY: base repo by SHA (TOCTOU-proof; the base store mirrors the fork head).
+        # CONTINGENCY (GATED_FORK_FETCH=1): same SHA, fetched from the fork repo — only
+        # if base-by-SHA 404s live. The SHA (what we attest) is identical either way.
+        fetch_repo = event.repo_full_name
+        if FORK_FETCH and event.head_repo_full_name:
+            fetch_repo = event.head_repo_full_name
+        download_tarball(fetch_repo, event.head_sha, str(ws / "head.tar"), token)
         return extract_to_spec(ws / "head.tar", ws)
 
     report_sink = _LoggingTrialReportSink()

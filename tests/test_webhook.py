@@ -145,6 +145,28 @@ class WebhookReceiverTests(unittest.TestCase):
         self.assertIs(r.outcome, ReceiverOutcome.ACCEPTED)
         self.assertEqual(self.sink.events[0].action, "synchronize")
 
+    def test_fork_pr_captures_head_repo_but_keeps_base(self) -> None:
+        # C2/H2: a PR from a fork carries pull_request.head.repo.full_name = the FORK. The
+        # event must capture it as a fetch hint while repo_full_name stays the BASE (so the
+        # Check Run + override ledger still key on the base repo).
+        payload = {
+            "action": "opened",
+            "installation": {"id": _INSTALL_OK},
+            "repository": {"full_name": "acme/widgets"},              # base
+            "pull_request": {"head": {"sha": "f" * 40, "repo": {"full_name": "bob/widgets"}}},
+        }
+        body = json.dumps(payload).encode("utf-8")
+        r = self.receiver.handle(_headers(body, delivery="d-fork"), body)
+        self.assertIs(r.outcome, ReceiverOutcome.ACCEPTED)
+        ev = self.sink.events[0]
+        self.assertEqual(ev.repo_full_name, "acme/widgets")          # base — check + ledger
+        self.assertEqual(ev.head_repo_full_name, "bob/widgets")      # fork — fetch hint
+
+    def test_same_repo_pr_has_no_head_repo_hint(self) -> None:
+        body = _body(action="opened", head_sha="c" * 40)  # _body sets no head.repo
+        self.receiver.handle(_headers(body, delivery="d-same"), body)
+        self.assertIsNone(self.sink.events[0].head_repo_full_name)
+
     # ---- rejected: authentication ----------------------------------------
 
     def test_forged_signature_rejected_and_audited(self) -> None:
