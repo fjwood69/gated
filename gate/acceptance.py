@@ -207,6 +207,12 @@ def _corpus_digest(cset: CalibrationSet) -> str:
     return content_digest({"corpus": items})
 
 
+def _content_hashes(cset: CalibrationSet) -> set[str]:
+    """The set of fixture PAYLOAD hashes in a corpus — for the holdout disjointness check (overlap is
+    by content, not id: a renamed duplicate is still a duplicate)."""
+    return {hashlib.sha256(f.payload).hexdigest() for f in (*cset.known_bad, *cset.known_good)}
+
+
 def _sign_report(unsigned: AcceptanceReport, signing_seed: bytes) -> AcceptanceReport:
     from dataclasses import replace
 
@@ -274,10 +280,19 @@ def run_acceptance_anchor(
     holdout = blind_holdout_store.load(holdout_key=holdout_key)
     visible_corpus_digest = _corpus_digest(visible_set)
     holdout_corpus_digest = _corpus_digest(holdout)
-    if holdout_corpus_digest == visible_corpus_digest:
+    # board #4: DISJOINTNESS proven, not just "identical refused" — NO holdout fixture may share content
+    # with the visible corpus (a single shared fixture is memorisation leaking into the holdout).
+    overlap = _content_hashes(visible_set) & _content_hashes(holdout)
+    if overlap:
         raise AcceptanceError(
-            "the blind holdout is IDENTICAL to the visible corpus — that proves memorisation, not "
-            "generalisation. The holdout must contain fixtures the detector's authors never saw."
+            f"the blind holdout shares {len(overlap)} fixture(s) with the visible corpus — the holdout "
+            "is not disjoint, so a PASS could be memorisation. The holdout must be fixtures the "
+            "detector's authors never saw."
+        )
+    if not holdout.known_bad or not holdout.known_good:
+        raise AcceptanceError(
+            "the blind holdout must be two-sided (>=1 known-bad AND >=1 known-good) to prove "
+            "generalisation on both sides"
         )
     # image + isolation DERIVED from the REAL sandbox (not caller strings); identity COMPUTED from the
     # content-addressed manifest + the image the sandbox actually ran.

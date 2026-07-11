@@ -166,6 +166,18 @@ class AcceptanceAnchorTests(unittest.TestCase):
             _run(store, honest=_honest(),
                  fn=_ScriptedDetector([_PASS] * 6), fp=_ScriptedDetector([_FAIL] * 6))
 
+    def test_holdout_partial_overlap_refused(self) -> None:
+        # board #4: DISJOINTNESS, not just identical-corpus. A holdout sharing even ONE fixture (by
+        # content) with the visible set is refused — a single leaked fixture is memorisation.
+        store = BlindHoldoutStore(Path(tempfile.mkdtemp(prefix="mv-ov-")) / "h.db")
+        store.append(Fixture("hb", FixtureLabel.KNOWN_BAD, b"bad-visible"),   # SAME payload as vb
+                     holdout_key=_HOLDOUT_KEY, approval=_cal_gov("cg1", "cg2"))
+        store.append(Fixture("hg", FixtureLabel.KNOWN_GOOD, b"good-holdout"),  # distinct
+                     holdout_key=_HOLDOUT_KEY, approval=_cal_gov("cg1", "cg2"))
+        with self.assertRaises(AcceptanceError):
+            _run(store, honest=_honest(),
+                 fn=_ScriptedDetector([_PASS] * 6), fp=_ScriptedDetector([_FAIL] * 6))
+
     def test_self_grading_closure_requires_calibration_governance_signer(self) -> None:
         store = _holdout()
         gov_signer = GovernanceApproval(principals=("author",), purpose="p", rationale="r",
@@ -210,6 +222,49 @@ class BlindHoldoutTests(unittest.TestCase):
         self.assertEqual({f.fixture_id for f in cs.known_bad}, {"hb"})
         self.assertEqual({f.fixture_id for f in cs.known_good}, {"hg"})
         self.assertEqual(cs.known_bad[0].payload, b"bad-holdout")  # in-memory plaintext, key-gated
+
+
+class OperationalSeparationTests(unittest.TestCase):
+    """Board #4: the author/key separation is OPERATIONALLY real — a detector author (who holds only the
+    detector + visible set) is powerless over the holdout and the receipt. Modelled as two disjoint
+    key-holders: the AUTHOR (no holdout key, no CALIBRATION_GOVERNANCE approval, no signer seed) and
+    CALIBRATION_GOVERNANCE (holds all three)."""
+
+    # what the DETECTOR AUTHOR has: nothing calibration-governance. Distinct from _HOLDOUT_KEY/_SIGNER_SEED.
+    _AUTHOR_GOVERNANCE = GovernanceApproval(("author",), purpose="p", rationale="r", operation_id="o",
+                                            domain=AuthorityDomain.GOVERNANCE)
+
+    def test_author_cannot_read_the_holdout(self) -> None:
+        store = _holdout()
+        with self.assertRaises(BlindHoldoutError):
+            store.load(holdout_key=b"an-author-guessed-key")  # author lacks the cal-gov holdout key
+
+    def test_author_cannot_inject_into_the_holdout(self) -> None:
+        store = _holdout()
+        with self.assertRaises(BlindHoldoutError):  # author holds only a GOVERNANCE approval
+            store.append(Fixture("evil", FixtureLabel.KNOWN_GOOD, b"poison"),
+                         holdout_key=_HOLDOUT_KEY, approval=self._AUTHOR_GOVERNANCE)
+
+    def test_author_cannot_sign_the_acceptance_report(self) -> None:
+        store = _holdout()
+        with self.assertRaises(AcceptanceError):  # author cannot own the grader (self-grading closure)
+            _run(store, honest=_honest(),
+                 fn=_ScriptedDetector([_PASS] * 6), fp=_ScriptedDetector([_FAIL] * 6),
+                 signer=self._AUTHOR_GOVERNANCE)
+
+    def test_production_module_holds_no_baked_in_key_material(self) -> None:
+        # the original failure was keys/plaintext committed alongside code. The production anchor holds
+        # NO key: every key is an injected parameter. Assert no long byte-literal (a baked key) exists.
+        import re
+        src = (Path(__file__).resolve().parent.parent / "gate" / "acceptance.py").read_text()
+        long_byte_literals = re.findall(r"b\"[^\"]{8,}\"|b'[^']{8,}'", src)
+        self.assertEqual(long_byte_literals, [], f"acceptance.py must bake in no keys: {long_byte_literals}")
+        # and the anchor's keys are required parameters (no defaults), so they must be supplied out-of-band.
+        import inspect
+        from gate.acceptance import run_acceptance_anchor
+        params = inspect.signature(run_acceptance_anchor).parameters
+        for k in ("holdout_key", "signer_seed"):
+            self.assertIs(params[k].default, inspect.Parameter.empty)
 
 
 if __name__ == "__main__":
