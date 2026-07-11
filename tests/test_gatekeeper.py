@@ -1,0 +1,236 @@
+"""3.3 — the tier-gatekeeper: resolution + enable path. The non-negotiable done-tests. Run:
+python3 -m unittest discover -s tests
+
+Done-tests:
+  #1 a formerly-ENABLED policy that can't be attested BLOCKS (action_required) — never silent
+     neutral, never stale-enforce; a fresh identity-MATCHING snapshot survives a store blip; an
+     identity-MISMATCH snapshot blocks (addition #1).
+  #2 refuse-enable NAMES the breaking fixture (legible).
+  #3 per-policy calibration isolation — one policy's calibration failure doesn't touch another.
+  #4 (survivability) folded into #1.
+  #5 structural: no C3-event -> tier-write path (gatekeeper + store never import gate.ledger).
+Plus: tampered chain blocks; the full shadow-first human-gated enable path enables.
+"""
+from __future__ import annotations
+
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+from core import (
+    Command,
+    Fixtures,
+    IsolationLevel,
+    Reason,
+    ResourceBudget,
+    Verdict,
+    VerdictType,
+)
+from core.calibration import CalibrationSet, Fixture, FixtureLabel
+from gate.authority import GovernanceApproval
+from gate.gatekeeper import ratify_enable, resolve_disposition, run_calibration
+from gate.policy_state import Disposition, PolicyState
+from gate.policy_store import PolicyStore
+from gate.snapshot import AttestationRecord, issue_snapshot
+from sandbox.noop import NoOpSandbox
+
+_BUDGET = ResourceBudget(wall_clock_seconds=1.0)
+_KEY = b"gate-governance-key"
+_FAIL = Verdict(VerdictType.FAIL, Reason.EGRESS_ONE)
+_PASS = Verdict(VerdictType.PASS, Reason.EGRESS_GE_2)
+
+
+class _HermeticNoOp(NoOpSandbox):
+    isolation_level: IsolationLevel = IsolationLevel.HERMETIC
+
+
+def _hermetic_factory():  # type: ignore[no-untyped-def]
+    def make() -> _HermeticNoOp:
+        return _HermeticNoOp()
+    return make
+
+
+class _ScriptedDetector:
+    def __init__(self, verdicts: list[Verdict]) -> None:
+        self.fixtures = Fixtures()
+        self._verdicts = verdicts
+        self._i = 0
+
+    def entrypoint(self) -> Command:
+        return Command(argv=("true",))
+
+    def assert_invariant(self, result: object) -> Verdict:
+        v = self._verdicts[self._i]
+        self._i += 1
+        return v
+
+
+def _appr(*principals: str, op: str) -> GovernanceApproval:
+    return GovernanceApproval(principals=principals, purpose="test", rationale="because", operation_id=op)
+
+
+def _store() -> PolicyStore:
+    d = Path(tempfile.mkdtemp(prefix="mv-gk-"))
+    return PolicyStore(d / "tier.db")
+
+
+def _enable(store: PolicyStore, pid: str, *, detector: str = "det-1") -> None:
+    store.transition(pid, PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op=f"{pid}-1"))
+    store.transition(pid, PolicyState.CALIBRATING, approval=_appr("gov1", op=f"{pid}-2"),
+                     pinned_set_version="fx-head")
+    store.record_calibration_pass("cal-1", policy_id=pid, pinned_set_version="fx-head",
+                                  detector_identity=detector)
+    store.transition(pid, PolicyState.ENABLED, approval=_appr("gov1", op=f"{pid}-3"),
+                     calibration_result_ref="cal-1", pinned_set_version="fx-head",
+                     detector_identity=detector)
+
+
+class _UnreachableStore(PolicyStore):
+    """Models an availability failure — reads raise OperationalError (the gatekeeper falls to the
+    snapshot)."""
+
+    def current_state(self, policy_id: str) -> PolicyState | None:  # type: ignore[override]
+        raise sqlite3.OperationalError("database is locked")
+
+
+def _snap(pid: str, detector: str):  # type: ignore[no-untyped-def]
+    rec = AttestationRecord(
+        policy_id=pid, detector_identity=detector, calibration_result_ref="cal-1",
+        fixture_set_version="fx-head", tier_chain_head="tier-head", backend="podman",
+    )
+    return issue_snapshot({pid: rec}, key=_KEY, now=1000.0, valid_for_seconds=300)
+
+
+def _resolve(store, pid, *, detector="det-1", snapshot=None, now=1100.0):  # type: ignore[no-untyped-def]
+    return resolve_disposition(
+        pid, expected_detector_identity=detector, store=store, snapshot=snapshot,
+        snapshot_key=_KEY, now=now,
+    )
+
+
+class Done1_UnattestableBlocksTests(unittest.TestCase):
+    def test_live_enabled_runs_enforcing(self) -> None:
+        s = _store()
+        _enable(s, "p1")
+        self.assertIs(_resolve(s, "p1").disposition, Disposition.RUN_ENFORCING)
+
+    def test_store_unreachable_no_snapshot_blocks(self) -> None:
+        u = _UnreachableStore(Path(tempfile.mkdtemp(prefix="mv-gk-u-")) / "t.db")
+        d = _resolve(u, "p1", snapshot=None)
+        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
+        self.assertEqual(d.source, "unattestable")
+
+    def test_store_unreachable_fresh_matching_snapshot_survives(self) -> None:
+        u = _UnreachableStore(Path(tempfile.mkdtemp(prefix="mv-gk-u2-")) / "t.db")
+        d = _resolve(u, "p1", detector="det-1", snapshot=_snap("p1", "det-1"), now=1100.0)
+        self.assertIs(d.disposition, Disposition.RUN_ENFORCING)  # blip survived
+        self.assertEqual(d.source, "snapshot")
+
+    def test_store_unreachable_stale_snapshot_blocks(self) -> None:
+        u = _UnreachableStore(Path(tempfile.mkdtemp(prefix="mv-gk-u3-")) / "t.db")
+        d = _resolve(u, "p1", snapshot=_snap("p1", "det-1"), now=1000.0 + 300.0)  # stale
+        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
+
+    def test_store_unreachable_policy_absent_blocks(self) -> None:
+        # gap-2: absence from a valid snapshot is indistinguishable from an incomplete mint ->
+        # fail CLOSED (action_required), NOT skip-neutral. Snapshot lists p1; we ask about pX.
+        u = _UnreachableStore(Path(tempfile.mkdtemp(prefix="mv-gk-u5-")) / "t.db")
+        d = _resolve(u, "pX", detector="det-1", snapshot=_snap("p1", "det-1"), now=1100.0)
+        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
+        self.assertEqual(d.source, "unattestable")
+
+    def test_store_unreachable_identity_mismatch_blocks(self) -> None:
+        # addition #1: the snapshot attests det-1 but det-EVIL is about to run -> refuse to enforce
+        # an un-calibrated detector.
+        u = _UnreachableStore(Path(tempfile.mkdtemp(prefix="mv-gk-u4-")) / "t.db")
+        d = _resolve(u, "p1", detector="det-EVIL", snapshot=_snap("p1", "det-1"), now=1100.0)
+        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
+        self.assertEqual(d.source, "unattestable")
+
+    def test_tampered_chain_blocks(self) -> None:
+        s = _store()
+        _enable(s, "p1")
+        s._conn().execute("UPDATE tier_transition_chain SET new_state=? WHERE seq=1",
+                          (PolicyState.ENABLED.value,))
+        self.assertIs(_resolve(s, "p1").disposition, Disposition.BLOCK_ACTION_REQUIRED)
+
+
+class Done2_LegibleRefuseTests(unittest.TestCase):
+    def test_refuse_enable_names_the_breaking_fixture(self) -> None:
+        s = _store()
+        s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op="p1-1"))
+        b1 = Fixture("b1", FixtureLabel.KNOWN_BAD, b"x")
+        b2 = Fixture("b2", FixtureLabel.KNOWN_BAD, b"y")
+        g1 = Fixture("g1", FixtureLabel.KNOWN_GOOD, b"z")
+        cset = CalibrationSet(known_good=(g1,), known_bad=(b1, b2))
+        # detector catches b1 [FAIL]*3, MISSES b2 [PASS]*3, passes g1 [PASS]*3.
+        det = _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3 + [_PASS] * 3)
+        outcome = run_calibration(
+            "p1", store=s, make_sandbox=_hermetic_factory(), detector=det, calibration_set=cset,
+            budget=_BUDGET, calibration_chain_head="fx-head", detector_identity="det-1",
+            approval=_appr("gov1", op="p1-cal"), trials=3,
+        )
+        self.assertFalse(outcome.passed)
+        self.assertIsNone(outcome.calibration_result_ref)  # no PASS -> no ref -> cannot enable
+        self.assertIn("b2", outcome.breaking_fixtures)
+        self.assertIn("b2", outcome.report)
+        self.assertIs(s.current_state("p1"), PolicyState.REJECTED)
+
+
+class Done3_PerPolicyIsolationTests(unittest.TestCase):
+    def test_one_policy_calibration_failure_does_not_touch_another(self) -> None:
+        s = _store()
+        _enable(s, "pB")  # pB independently ENABLED
+        # pA calibration fails -> REJECTED.
+        s.transition("pA", PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op="pA-1"))
+        cset = CalibrationSet(
+            known_good=(Fixture("g", FixtureLabel.KNOWN_GOOD, b"z"),),
+            known_bad=(Fixture("bad", FixtureLabel.KNOWN_BAD, b"y"),),
+        )
+        det = _ScriptedDetector([_PASS] * 3 + [_PASS] * 3)  # MISSES the known-bad
+        run_calibration("pA", store=s, make_sandbox=_hermetic_factory(), detector=det,
+                        calibration_set=cset, budget=_BUDGET, calibration_chain_head="fx",
+                        detector_identity="det-A", approval=_appr("gov1", op="pA-cal"), trials=3)
+        self.assertIs(s.current_state("pA"), PolicyState.REJECTED)
+        self.assertIs(_resolve(s, "pA").disposition, Disposition.SKIP_NEUTRAL)
+        # pB untouched by pA's failure.
+        self.assertIs(s.current_state("pB"), PolicyState.ENABLED)
+        self.assertIs(_resolve(s, "pB").disposition, Disposition.RUN_ENFORCING)
+
+
+class EnablePathTests(unittest.TestCase):
+    def test_shadow_first_then_human_ratify_enables(self) -> None:
+        s = _store()
+        s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op="p1-1"))
+        cset = CalibrationSet(
+            known_good=(Fixture("g1", FixtureLabel.KNOWN_GOOD, b"z"),),
+            known_bad=(Fixture("b1", FixtureLabel.KNOWN_BAD, b"y"),),
+        )
+        det = _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3)  # catches b1, passes g1
+        outcome = run_calibration("p1", store=s, make_sandbox=_hermetic_factory(), detector=det,
+                                  calibration_set=cset, budget=_BUDGET, calibration_chain_head="fx",
+                                  detector_identity="det-1", approval=_appr("gov1", op="p1-cal"),
+                                  trials=3)
+        self.assertTrue(outcome.passed)
+        self.assertIsNotNone(outcome.calibration_result_ref)  # PASS -> a ref to bind ENABLED to
+        self.assertIs(s.current_state("p1"), PolicyState.CALIBRATING)  # NOT auto-enabled
+        # human ratify with the ref the PASS produced (mechanically bound — gap-1).
+        ratify_enable("p1", store=s, approval=_appr("gov1", op="p1-ratify"),
+                      calibration_result_ref=outcome.calibration_result_ref, pinned_set_version="fx",
+                      detector_identity="det-1")
+        self.assertIs(s.current_state("p1"), PolicyState.ENABLED)
+
+
+class Done5_NoC3PathTests(unittest.TestCase):
+    def test_gatekeeper_and_store_never_import_c3_ledger(self) -> None:
+        root = Path(__file__).resolve().parent.parent / "gate"
+        for mod in ("gatekeeper.py", "policy_store.py"):
+            src = (root / mod).read_text()
+            self.assertNotIn("from gate.ledger", src, f"{mod} must not import the C3 ledger")
+            self.assertNotIn("import gate.ledger", src)
+            self.assertNotIn("from .ledger", src)
+
+
+if __name__ == "__main__":
+    unittest.main()

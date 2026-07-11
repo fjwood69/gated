@@ -54,6 +54,18 @@ builder bifurcates code (`HEAD`) from policy (base ref); no later increment read
 policy / checks / fixtures / calibration from `HEAD`. (Promoted from a 2.3 redline to
 a standing invariant — board seal condition on 2.1, 2026-07.)
 
+## The load-bearing invariant — the engine needs no tier store at enforce time
+
+**Enforcing a check (running the sandbox on the PR head and computing the `Verdict`)
+requires only the image + artifact + entrypoint — NEVER the tier store.** The tier /
+calibration stores are consulted at ENABLE time (calibration) and at DISPATCH time (the
+gatekeeper's tier decision), not inside `run_engine_check`. This is what makes the 3.3
+survivable-DEGRADED safe: when the tier store is momentarily unreachable, an already-ENABLED
+check attested by a fresh signed snapshot can keep enforcing, because the enforcement path
+has no dependency on the store that just blipped. If enforcement ever grows a tier-store
+dependency, snapshot-survivability becomes unsound — so this separation is a standing
+invariant, not an accident. (3.3, 2026-07.)
+
 ## The rule to hold — Apache-core purity
 
 Everything in `core/`, `sandbox/`, `engine/`, `observe/`, `cli/` is the open

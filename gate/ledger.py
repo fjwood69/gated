@@ -30,8 +30,6 @@ The append is serialised (a lock) so the hash chain stays linear.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import sqlite3
 import threading
@@ -41,12 +39,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Sequence
 
+from core.chain import GENESIS_HASH, chain_hash, content_digest
+
 from .queue import OverrideCaptureEvent
 
 _log = logging.getLogger("gated.gate.ledger")
-
-# The chain root — the prev_hash of the first record. A fixed, public constant.
-GENESIS_HASH = "0" * 64
 
 
 class OverrideKind(Enum):
@@ -163,21 +160,17 @@ def _content_digest(
     policy_version: str | None,
     captured_at: float,
 ) -> str:
-    """Canonical content hash of a record's semantic fields (excludes seq + prev_hash)."""
-    canonical = json.dumps(
+    """Canonical content hash of a record's semantic fields (excludes seq + prev_hash).
+    Delegates to the shared ``core.chain`` primitive — hash-preserving (the field set + the
+    canonicalisation are identical to the pre-extraction version; golden-tested)."""
+    return content_digest(
         {
             "delivery_id": delivery_id, "kind": kind, "repo_full_name": repo_full_name,
             "pr": pr, "sha": sha, "verdict": verdict, "reason": reason,
             "sub_reason": sub_reason, "merged_by": merged_by, "merged_at": merged_at,
             "policy_version": policy_version, "captured_at": captured_at,
-        },
-        sort_keys=True, separators=(",", ":"),
+        }
     )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _chain_hash(prev_hash: str, content_digest: str) -> str:
-    return hashlib.sha256((prev_hash + content_digest).encode("utf-8")).hexdigest()
 
 
 _LEDGER_SCHEMA = """
@@ -263,7 +256,7 @@ class OverrideLedger:
                 merged_by=merged_by, merged_at=merged_at, policy_version=policy_version,
                 captured_at=captured_at,
             )
-            record_hash = _chain_hash(prev_hash, content)
+            record_hash = chain_hash(prev_hash, content)
             cur = self._conn().execute(
                 "INSERT INTO override_ledger "
                 "(delivery_id, kind, repo_full_name, pr, sha, verdict, reason, sub_reason,"
@@ -300,7 +293,7 @@ class OverrideLedger:
         return GENESIS_HASH if row is None else str(row["record_hash"])
 
     def head_anchor(self) -> tuple[int, str]:
-        """(seq, head_hash) — the checkpoint to publish out-of-band (an append-only object store) so the
+        """(seq, head_hash) — the checkpoint to publish out-of-band (mori-state) so the
         chain's tail cannot be silently truncated. seq==0 => empty ledger."""
         row = self._conn().execute(
             "SELECT seq, record_hash FROM override_ledger ORDER BY seq DESC LIMIT 1"
@@ -321,7 +314,7 @@ class OverrideLedger:
             )
             if row["prev_hash"] != prev:
                 return False
-            if row["record_hash"] != _chain_hash(prev, content):
+            if row["record_hash"] != chain_hash(prev, content):
                 return False
             prev = str(row["record_hash"])
         return True

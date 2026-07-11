@@ -38,8 +38,17 @@ from engine.runner import TrialReportSink, run_check
 from sandbox.observed import ObservedOCISandbox
 
 from .artifact import build_artifact_spec, extraction_workspace, safe_extract_tarball
-from .checkrun import CheckRunLifecycle, GitHubCheckClient
+from .checkrun import (
+    CheckConclusion,
+    CheckOutput,
+    CheckRunLifecycle,
+    CheckStatus,
+    GitHubCheckClient,
+    upsert_check_run,
+)
 from .executor import CheckUpdater, JobRunner
+from .gatekeeper import GateDecision
+from .policy_state import Disposition, nonrun_conclusion_for
 from .queue import GatingEvent
 from .summary import render_check_summary
 
@@ -163,12 +172,62 @@ def make_check_updater(client: GitHubCheckClient, *, name: str) -> CheckUpdater:
     return update
 
 
+# static_poster(event, conclusion, summary): post a terminal Check Run WITHOUT running the engine
+# — used for non-ENABLED policies (neutral) and DEGRADED (action_required). Kept separate from the
+# engine path so a non-enforcing disposition CANNOT accidentally run the sandbox.
+StaticPoster = Callable[[GatingEvent, CheckConclusion, str], None]
+
+
+def make_static_poster(client: GitHubCheckClient, *, name: str) -> StaticPoster:
+    """Build a poster that drives queued->completed with a STATIC conclusion (no engine, no
+    Verdict). Idempotent via upsert (find-then-PATCH by sha,name), same as the enforcing path."""
+
+    def post(event: GatingEvent, conclusion: CheckConclusion, summary: str) -> None:
+        upsert_check_run(
+            client, repo_full_name=event.repo_full_name, head_sha=event.head_sha,
+            name=name, status=CheckStatus.QUEUED,
+        )
+        upsert_check_run(
+            client, repo_full_name=event.repo_full_name, head_sha=event.head_sha,
+            name=name, status=CheckStatus.COMPLETED, conclusion=conclusion,
+            output=CheckOutput(title=name, summary=summary),
+        )
+
+    return post
+
+
+def dispatch_gated(
+    event: GatingEvent,
+    decision: GateDecision,
+    *,
+    job_runner: JobRunner,
+    updater: CheckUpdater,
+    static_poster: StaticPoster,
+) -> None:
+    """The 3.3 dispatch seam: consult the tier decision BEFORE the engine. Only RUN_ENFORCING
+    (a live/attested ENABLED policy) runs the sandbox and posts the real Verdict. Every other
+    disposition posts a static conclusion and NEVER touches the engine:
+      * SKIP_NEUTRAL          -> neutral (non-blocking; not-yet-enabled / advisory / rejected);
+      * BLOCK_ACTION_REQUIRED -> action_required (BLOCKING; DEGRADED — un-attestable, fail-closed).
+    A DEGRADED policy therefore blocks the merge WITHOUT running the engine and WITHOUT a silent
+    fall-open to neutral (#1)."""
+    if decision.disposition is Disposition.RUN_ENFORCING:
+        verdict = job_runner(event)
+        updater(event, verdict)
+        return
+    conclusion = nonrun_conclusion_for(decision.disposition)
+    static_poster(event, conclusion, f"Policy not enforced ({decision.disposition.value}): {decision.reason}")
+
+
 __all__ = [
     "ArtifactSource",
     "extract_to_spec",
     "run_engine_check",
     "make_job_runner",
     "make_check_updater",
+    "make_static_poster",
+    "dispatch_gated",
+    "StaticPoster",
     "DEFAULT_ENGINE_BUDGET",
     "DEFAULT_TRIALS",
     "DEFAULT_ENTRYPOINT",
