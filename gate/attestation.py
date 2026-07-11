@@ -16,26 +16,26 @@ replayed to restore a detector because the restore controller re-checks every on
 CURRENT world (identity / oracle-head / tier-generation) and refuses on any drift; the nonce + run_id
 make each measurement a distinct, non-reusable instance.
 
-Signed with HMAC-SHA256 under the MEASUREMENT key (mirrors ``gate/snapshot.py``'s trust model: integrity
-against artifact / runtime-token writes, not separation from a compromised gate process). Gate-side;
-``core`` never imports this. Deterministic (NFR6): run_id / nonce / issued_at are INPUTS, not generated
-here, so an attestation is reproducible from its inputs and unit-testable without a clock or RNG.
+Signed with ASYMMETRIC Ed25519 (merge-ready #2): the runner signs with a PRIVATE seed; the restore
+controller holds ONLY the PUBLIC key, so a compromised controller cannot forge a PASS attestation — the
+measurement≠governance separation is cryptographically real, not a symmetric key the verifier could
+re-sign with. A deployment binds a KMS/HSM behind the same seam. Gate-side; ``core`` never imports this.
+Deterministic (NFR6): run_id / nonce / issued_at are INPUTS, not generated here, so an attestation is
+reproducible from its inputs and unit-testable without a clock or RNG.
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Mapping
 
-from core import VerdictType
+from core import VerdictType, ed25519
 from core.chain import content_digest
 
 
 class AttestationError(RuntimeError):
-    """A measurement attestation could not be trusted — HMAC-invalid (payload tampered or wrong key),
-    or malformed. The consumer (restore controller / governance) fails CLOSED: an unverifiable
+    """A measurement attestation could not be trusted — signature-invalid (payload tampered or wrong
+    key), or malformed. The consumer (restore controller / governance) fails CLOSED: an unverifiable
     measurement is no measurement, so no state moves."""
 
 
@@ -66,10 +66,10 @@ class MeasurementAttestation:
     fp_failures: tuple[str, ...] = ()
     flaky: tuple[str, ...] = ()
     harness_errors: tuple[str, ...] = ()
-    mac: str = field(default="")
+    signature: str = field(default="")   # Ed25519 signature (hex) over the canonical payload
 
     def _payload(self) -> dict[str, object]:
-        """Signed content — EXCLUDES ``mac``. Sorted/fully-specified so the bytes are stable and
+        """Signed content — EXCLUDES ``signature``. Sorted/fully-specified so the bytes are stable and
         cross-language reproducible (NFR6)."""
         return {
             "outcome": self.outcome.value, "policy_id": self.policy_id,
@@ -94,44 +94,39 @@ class MeasurementAttestation:
         )
 
 
-def _canonical(payload: Mapping[str, object]) -> str:
-    return json.dumps(dict(payload), sort_keys=True, separators=(",", ":"))
+def _canonical(payload: Mapping[str, object]) -> bytes:
+    return json.dumps(dict(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _sign(payload: Mapping[str, object], key: bytes) -> str:
-    return hmac.new(key, _canonical(payload).encode("utf-8"), hashlib.sha256).hexdigest()
+def sign_measurement(unsigned: MeasurementAttestation, *, signing_seed: bytes) -> MeasurementAttestation:
+    """Return a signed copy of ``unsigned`` (Ed25519 signature recomputed). ``signing_seed`` is the
+    runner's 32-byte PRIVATE measurement seed — held by the measurement side only. The restore
+    controller never sees it (it holds the matching public key), so a measurement signature confers no
+    power to mutate a tier AND cannot be forged by the verifier (measurement ≠ governance, cryptographic)."""
+    return replace(unsigned, signature=ed25519.sign(_canonical(unsigned._payload()), signing_seed).hex())
 
 
-def sign_measurement(unsigned: MeasurementAttestation, *, measurement_key: bytes) -> MeasurementAttestation:
-    """Return a signed copy of ``unsigned`` (its ``mac`` recomputed). ``measurement_key`` is the
-    MEASUREMENT signing secret — deliberately NOT the tier-write / snapshot key, so a measurement
-    signature confers no power to mutate a tier (measurement ≠ governance at the key layer)."""
-    if not measurement_key:
-        raise AttestationError("refusing to sign a measurement with an empty key")
-    from dataclasses import replace
-
-    return replace(unsigned, mac=_sign(unsigned._payload(), measurement_key))
-
-
-def verify_measurement(attestation: MeasurementAttestation, *, measurement_key: bytes) -> None:
-    """Raise ``AttestationError`` unless the HMAC is valid under ``measurement_key`` (constant-time).
-    Integrity only — freshness is NOT a horizon here but the restore controller's value-currency CAS
-    (a PASS whose identity / oracle-head / tier-generation still match the world is still true, no
-    matter its age; one whose values drifted is refused there)."""
-    if not measurement_key:
-        raise AttestationError("no measurement key available to verify the attestation")
-    if not hmac.compare_digest(_sign(attestation._payload(), measurement_key), attestation.mac):
-        raise AttestationError("measurement HMAC mismatch — payload tampered or wrong key")
+def verify_measurement(attestation: MeasurementAttestation, *, verify_key: bytes) -> None:
+    """Raise ``AttestationError`` unless the Ed25519 signature is valid under ``verify_key`` (the
+    issuer's 32-byte PUBLIC key). Integrity/authenticity only — freshness is the restore controller's
+    value-currency CAS (a PASS whose identity / oracle-head still match the world is still true, no
+    matter its age; one whose values drifted is refused there). The verifier cannot forge: it has no seed."""
+    try:
+        sig = bytes.fromhex(attestation.signature)
+    except ValueError:
+        raise AttestationError("measurement signature is not valid hex") from None
+    if not ed25519.verify(_canonical(attestation._payload()), sig, verify_key):
+        raise AttestationError("measurement signature invalid — payload tampered or wrong key")
 
 
 def attestation_ref(attestation: MeasurementAttestation) -> str:
     """A deterministic, content-derived handle binding a ``calibration_pass`` / RE_ATTESTATION record
-    to the EXACT immutable signed measurement (its full payload + ``mac``). Because the mac is a
-    function of the payload under the measurement key, a ref that resolves to a real signed PASS cannot
-    be fabricated without a valid signature — the restore controller's ref binds an immutable signed
-    attestation, not a bare mutable row (board amendment 2). Replay of an OLD signed attestation is
-    caught separately by the restore CAS (its ``oracle_head`` is no longer current)."""
-    return content_digest({"payload": attestation._payload(), "mac": attestation.mac})
+    to the EXACT immutable signed measurement (its full payload + Ed25519 ``signature``). Because the
+    signature can only be produced by the private-seed holder, a ref that resolves to a real signed PASS
+    cannot be fabricated without a valid signature — the restore controller's ref binds an immutable
+    signed attestation, not a bare mutable row (board amendment 2). Replay of an OLD signed attestation
+    is caught separately by the restore CAS (its ``oracle_head`` is no longer current)."""
+    return content_digest({"payload": attestation._payload(), "signature": attestation.signature})
 
 
 __all__ = [

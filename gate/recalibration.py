@@ -69,7 +69,7 @@ def run_recalibration(
     issuer: str,
     nonce: str,
     now: float,
-    measurement_key: bytes,
+    signing_seed: bytes,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
 ) -> MeasurementAttestation:
     """Seal the set (snapshot-isolated), run the batch calibrator against the frozen fixtures, and
@@ -96,7 +96,7 @@ def run_recalibration(
         fn_failures=result.fn_failures, fp_failures=result.fp_failures, flaky=result.flaky,
         harness_errors=result.harness_errors,
     )
-    return sign_measurement(unsigned, measurement_key=measurement_key)
+    return sign_measurement(unsigned, signing_seed=signing_seed)
 
 
 __all__ = ["deterministic_job_id", "run_recalibration"]

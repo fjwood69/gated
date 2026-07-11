@@ -15,6 +15,7 @@ from pathlib import Path
 
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import FixtureLabel
+from core.ed25519 import public_key
 from gate.attestation_store import MeasurementAttestationStore
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
@@ -30,7 +31,8 @@ from gate.restore_controller import (
 from sandbox.noop import NoOpSandbox
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
-_MEAS_KEY = b"measurement-key-epoch-1"
+_SEED = bytes(range(32))
+_PUB = public_key(_SEED)
 _ISSUER = "cal-gov-1"
 _DET = "det-1"
 _FAIL = Verdict(VerdictType.FAIL, Reason.EGRESS_ONE)
@@ -91,7 +93,7 @@ def _att_store() -> MeasurementAttestationStore:
 def _controller(s: PolicyStore, c: CalibrationStore, *, trusted: bool = True,
                 att_store: MeasurementAttestationStore | None = None) -> RestoreController:
     return RestoreController(
-        ReAttestCapability(s), issuer_keys={_ISSUER: _MEAS_KEY},
+        ReAttestCapability(s), issuer_public_keys={_ISSUER: _PUB},
         oracle_head_for=c.set_head, attestation_store=att_store or _att_store(),
         identity_trusted=lambda _i: trusted)
 
@@ -100,7 +102,7 @@ def _run(c: CalibrationStore, verdicts: list[Verdict], *, tier_gen: str = "tg", 
     return run_recalibration(
         policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(),
         detector=_ScriptedDetector(verdicts), detector_identity=_DET, tier_generation=tier_gen,
-        budget=_BUDGET, issuer=_ISSUER, nonce=nonce, now=100.0, measurement_key=_MEAS_KEY, trials=3)
+        budget=_BUDGET, issuer=_ISSUER, nonce=nonce, now=100.0, signing_seed=_SEED, trials=3)
 
 
 class RestoreControllerTests(unittest.TestCase):
@@ -155,7 +157,7 @@ class RestoreControllerTests(unittest.TestCase):
         c = _cal_store()
         s = _policy_store_enabled(c.set_head("X"))
         att = _run(c, [_FAIL] * 3 + [_PASS] * 3)
-        ctrl = RestoreController(ReAttestCapability(s), issuer_keys={"other": _MEAS_KEY},
+        ctrl = RestoreController(ReAttestCapability(s), issuer_public_keys={"other": _PUB},
                                  oracle_head_for=c.set_head, attestation_store=_att_store())
         self.assertIs(ctrl.attempt_restore(att).result, RestoreResult.REFUSED_UNTRUSTED)
 
@@ -163,7 +165,7 @@ class RestoreControllerTests(unittest.TestCase):
         c = _cal_store()
         s = _policy_store_enabled(c.set_head("X"))
         att = _run(c, [_FAIL] * 3 + [_PASS] * 3)
-        ctrl = RestoreController(ReAttestCapability(s), issuer_keys={_ISSUER: b"WRONG-KEY"},
+        ctrl = RestoreController(ReAttestCapability(s), issuer_public_keys={_ISSUER: public_key(bytes(range(1, 33)))},
                                  oracle_head_for=c.set_head, attestation_store=_att_store())
         self.assertIs(ctrl.attempt_restore(att).result, RestoreResult.REFUSED_UNTRUSTED)
 
@@ -198,7 +200,7 @@ class RestoreControllerTests(unittest.TestCase):
         self.assertTrue(store.exists(ref))                       # durably persisted
         stored = store.get(ref)
         assert stored is not None
-        verify_measurement(stored, measurement_key=_MEAS_KEY)    # the stored copy is the signed one
+        verify_measurement(stored, verify_key=_PUB)    # the stored copy is the signed one
         self.assertEqual(stored.oracle_head, att.oracle_head)
 
     def test_restore_succeeds_when_other_policies_exist(self) -> None:

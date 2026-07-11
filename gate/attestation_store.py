@@ -3,8 +3,8 @@
 Board amendment 2 required the re-attestation to bind an IMMUTABLE, SIGNED attestation — not merely a
 mutable ``calibration_pass`` row. The restore controller persists each verified signed measurement here
 (keyed by its content-derived ``attestation_ref``) before it re-attests, so the ref a RE_ATTESTATION
-record carries provably resolves to a durably-stored, signed, immutable measurement whose MAC can be
-re-checked at audit time. The ``calibration_pass`` row is then just a lookup index; this store is the
+record carries provably resolves to a durably-stored, signed, immutable measurement whose Ed25519
+signature can be re-checked at audit time. The ``calibration_pass`` row is then just a lookup index; this store is the
 source of truth. Append-only, idempotent by ref — a re-persist of the same signed attestation is a no-op.
 """
 from __future__ import annotations
@@ -23,13 +23,13 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS measurement_attestation (
     ref          TEXT PRIMARY KEY,   -- attestation_ref (content digest of the signed payload)
     payload_json TEXT NOT NULL,      -- the canonical signed payload
-    mac          TEXT NOT NULL,      -- the HMAC over that payload
+    signature    TEXT NOT NULL,      -- the Ed25519 signature over that payload
     persisted_at REAL NOT NULL
 );
 """
 
 
-def _reconstruct(payload: dict[str, object], mac: str) -> MeasurementAttestation:
+def _reconstruct(payload: dict[str, object], signature: str) -> MeasurementAttestation:
     return MeasurementAttestation(
         outcome=VerdictType(payload["outcome"]), policy_id=str(payload["policy_id"]),
         detector_identity=str(payload["detector_identity"]), set_id=str(payload["set_id"]),
@@ -43,7 +43,7 @@ def _reconstruct(payload: dict[str, object], mac: str) -> MeasurementAttestation
         fp_failures=tuple(payload["fp_failures"]),  # type: ignore[arg-type]
         flaky=tuple(payload["flaky"]),  # type: ignore[arg-type]
         harness_errors=tuple(payload["harness_errors"]),  # type: ignore[arg-type]
-        mac=mac,
+        signature=signature,
     )
 
 
@@ -75,10 +75,10 @@ class MeasurementAttestationStore:
         ref = attestation_ref(attestation)
         with self._lock:
             self._conn().execute(
-                "INSERT OR IGNORE INTO measurement_attestation (ref, payload_json, mac, persisted_at)"
+                "INSERT OR IGNORE INTO measurement_attestation (ref, payload_json, signature, persisted_at)"
                 " VALUES (?,?,?,?)",
                 (ref, json.dumps(attestation._payload(), sort_keys=True, separators=(",", ":")),
-                 attestation.mac, self._clock()),
+                 attestation.signature, self._clock()),
             )
         return ref
 
@@ -89,11 +89,11 @@ class MeasurementAttestationStore:
 
     def get(self, ref: str) -> MeasurementAttestation | None:
         row = self._conn().execute(
-            "SELECT payload_json, mac FROM measurement_attestation WHERE ref=?", (ref,)
+            "SELECT payload_json, signature FROM measurement_attestation WHERE ref=?", (ref,)
         ).fetchone()
         if row is None:
             return None
-        return _reconstruct(json.loads(row["payload_json"]), row["mac"])
+        return _reconstruct(json.loads(row["payload_json"]), row["signature"])
 
     def count(self) -> int:
         return int(self._conn().execute(

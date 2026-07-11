@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from core import ResourceBudget, RuntimeAssertion, Sandbox
+from core import ResourceBudget, RuntimeAssertion, Sandbox, ed25519
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from core.chain import content_digest
 from engine.calibration import DEFAULT_CALIBRATION_TRIALS, calibrate
@@ -176,7 +176,7 @@ class AcceptanceReport:
     signer_principal: str
     claim: str
     issued_at: float
-    mac: str = ""
+    signature: str = ""
 
     def _payload(self) -> dict[str, object]:
         return {
@@ -206,18 +206,21 @@ def _corpus_digest(cset: CalibrationSet) -> str:
     return content_digest({"corpus": items})
 
 
-def _sign_report(unsigned: AcceptanceReport, key: bytes) -> AcceptanceReport:
+def _sign_report(unsigned: AcceptanceReport, signing_seed: bytes) -> AcceptanceReport:
     from dataclasses import replace
 
-    canonical = json.dumps(unsigned._payload(), sort_keys=True, separators=(",", ":"))
-    mac = hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
-    return replace(unsigned, mac=mac)
+    canonical = json.dumps(unsigned._payload(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return replace(unsigned, signature=ed25519.sign(canonical, signing_seed).hex())
 
 
-def verify_report(report: AcceptanceReport, *, signer_key: bytes) -> bool:
-    canonical = json.dumps(report._payload(), sort_keys=True, separators=(",", ":"))
-    return hmac.compare_digest(
-        hmac.new(signer_key, canonical.encode("utf-8"), hashlib.sha256).hexdigest(), report.mac)
+def verify_report(report: AcceptanceReport, *, verify_key: bytes) -> bool:
+    """True iff the report's Ed25519 signature is valid under the CALIBRATION_GOVERNANCE PUBLIC key.
+    A verifier holds only the public key, so it cannot forge a receipt."""
+    canonical = json.dumps(report._payload(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    try:
+        return ed25519.verify(canonical, bytes.fromhex(report.signature), verify_key)
+    except ValueError:
+        return False
 
 
 def run_acceptance_anchor(
@@ -230,7 +233,7 @@ def run_acceptance_anchor(
     visible_set: CalibrationSet,
     blind_holdout_store: BlindHoldoutStore,
     holdout_key: bytes,
-    signer_key: bytes,
+    signer_seed: bytes,
     signer_principal: str,
     signer_approval: GovernanceApproval,
     image_ref: str,
@@ -288,7 +291,7 @@ def run_acceptance_anchor(
         holdout_coverage=len(holdout.known_good) + len(holdout.known_bad),
         signer_principal=signer_principal, claim=_HONEST_CLAIM, issued_at=now,
     )
-    return _sign_report(unsigned, signer_key)
+    return _sign_report(unsigned, signer_seed)
 
 
 def sandbox_config_digest(**config: object) -> str:

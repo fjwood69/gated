@@ -16,6 +16,7 @@ from pathlib import Path
 
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
+from core.ed25519 import public_key
 from gate.acceptance import (
     AcceptanceError,
     BlindHoldoutError,
@@ -28,7 +29,8 @@ from sandbox.noop import NoOpSandbox
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
 _HOLDOUT_KEY = b"calibration-governance-holdout-key"
-_SIGNER_KEY = b"calibration-governance-report-key"
+_SIGNER_SEED = bytes(range(32, 64))
+_SIGNER_PUB = public_key(_SIGNER_SEED)
 _FAIL = Verdict(VerdictType.FAIL, Reason.EGRESS_ONE)
 _PASS = Verdict(VerdictType.PASS, Reason.EGRESS_GE_2)
 
@@ -84,7 +86,7 @@ def _run(store: BlindHoldoutStore, *, honest, fn, fp, signer=None):  # type: ign
     return run_acceptance_anchor(
         make_sandbox=_factory(), honest_detector=honest, fn_deficient_detector=fn,
         fp_happy_detector=fp, detector_identity="det-honest-4tuple", visible_set=_VISIBLE,
-        blind_holdout_store=store, holdout_key=_HOLDOUT_KEY, signer_key=_SIGNER_KEY,
+        blind_holdout_store=store, holdout_key=_HOLDOUT_KEY, signer_seed=_SIGNER_SEED,
         signer_principal="cal-gov-1", signer_approval=signer or _cal_gov("cal-gov-1"),
         image_ref=_IMAGE_REF, now=100.0, budget=_BUDGET, trials=3)
 
@@ -120,8 +122,8 @@ class AcceptanceAnchorTests(unittest.TestCase):
         self.assertEqual(report.trials, 3)
         self.assertNotEqual(report.visible_corpus_digest, report.holdout_corpus_digest)  # genuinely blind
         self.assertTrue(report.sandbox_config_hash)            # computed from the real sandbox
-        self.assertTrue(verify_report(report, signer_key=_SIGNER_KEY))
-        self.assertFalse(verify_report(report, signer_key=b"forged"))
+        self.assertTrue(verify_report(report, verify_key=_SIGNER_PUB))
+        self.assertFalse(verify_report(report, verify_key=public_key(bytes(range(2, 34)))))
 
     def test_report_leaks_no_fixture_ids_or_content(self) -> None:
         store = _holdout()

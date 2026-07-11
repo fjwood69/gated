@@ -14,6 +14,7 @@ from pathlib import Path
 
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import FixtureLabel
+from core.ed25519 import public_key
 from gate.attestation_store import MeasurementAttestationStore
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
@@ -29,7 +30,8 @@ from gate.snapshot_refresh import commit_fixture_append
 from sandbox.noop import NoOpSandbox
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
-_MEAS_KEY = b"measurement-key"
+_SEED = bytes(range(32))
+_PUB = public_key(_SEED)
 _ISSUER = "cal-gov-1"
 _DET = "det-1"
 _FAIL = Verdict(VerdictType.FAIL, Reason.EGRESS_ONE)
@@ -160,7 +162,7 @@ class FullLoopTests(unittest.TestCase):
             policy_id="p1", set_id="X", calibration_store=c,
             make_sandbox=lambda: _HermeticNoOp(), detector=_ScriptedDetector(verdicts),
             detector_identity=_DET, tier_generation="tg", budget=_BUDGET, issuer=_ISSUER,
-            nonce="n1", now=100.0, measurement_key=_MEAS_KEY, trials=3)
+            nonce="n1", now=100.0, signing_seed=_SEED, trials=3)
 
     def test_proactive_trigger_to_restore_end_to_end(self) -> None:
         c = _cal()
@@ -188,7 +190,7 @@ class FullLoopTests(unittest.TestCase):
         att = self._run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3)  # catches b1+b2, passes g1
         att_store = MeasurementAttestationStore(Path(tempfile.mkdtemp(prefix="mv-orch-att-")) / "a.db")
         outcome = RestoreController(
-            ReAttestCapability(s), issuer_keys={_ISSUER: _MEAS_KEY}, oracle_head_for=ohf,
+            ReAttestCapability(s), issuer_public_keys={_ISSUER: _PUB}, oracle_head_for=ohf,
             attestation_store=att_store,
         ).attempt_restore(att)
         self.assertIs(outcome.result, RestoreResult.RESTORED)

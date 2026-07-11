@@ -14,6 +14,7 @@ from pathlib import Path
 
 from core import Command, Fixtures, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
+from core.ed25519 import public_key
 import subprocess
 
 from gate.acceptance import (
@@ -28,7 +29,8 @@ IMAGE = "localhost/mori:local"
 _HAVE_OCI = OCISandbox.available(IMAGE)
 
 _HOLDOUT_KEY = b"cal-gov-holdout-key"
-_SIGNER_KEY = b"cal-gov-report-key"
+_SIGNER_SEED = bytes(range(32, 64))
+_SIGNER_PUB = public_key(_SIGNER_SEED)
 _BUDGET = ResourceBudget(wall_clock_seconds=30.0)
 
 # Real fixtures that EXECUTE in the container, with DISTINCT visible vs holdout payloads (board #8:
@@ -110,7 +112,7 @@ class AcceptanceAnchorOnRealPodmanTests(unittest.TestCase):
             honest_detector=_ExitCodeDetector(), fn_deficient_detector=_AlwaysPass(),
             fp_happy_detector=_AlwaysFail(), detector_identity="det-exitcode-4tuple",
             visible_set=visible, blind_holdout_store=holdout, holdout_key=_HOLDOUT_KEY,
-            signer_key=_SIGNER_KEY, signer_principal="cal-gov-1",
+            signer_seed=_SIGNER_SEED, signer_principal="cal-gov-1",
             signer_approval=_cal_gov("cal-gov-1"), image_ref=image_ref,
             now=100.0, budget=_BUDGET, trials=2)
 
@@ -122,7 +124,7 @@ class AcceptanceAnchorOnRealPodmanTests(unittest.TestCase):
         self.assertFalse(report.short_circuit)
         self.assertEqual(report.visible_coverage, 2)
         self.assertEqual(report.holdout_coverage, 2)
-        self.assertTrue(verify_report(report, signer_key=_SIGNER_KEY))
+        self.assertTrue(verify_report(report, verify_key=_SIGNER_PUB))
         # the receipt binds a PINNED image digest + a genuinely-blind holdout + the real sandbox hash.
         self.assertEqual(report.image_ref, image_ref)
         self.assertTrue(report.image_ref.startswith("sha256:"))

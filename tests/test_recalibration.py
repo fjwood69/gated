@@ -14,6 +14,7 @@ from pathlib import Path
 
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import FixtureLabel
+from core.ed25519 import public_key
 from gate.attestation import verify_measurement
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
@@ -21,7 +22,8 @@ from gate.recalibration import deterministic_job_id, run_recalibration
 from sandbox.noop import NoOpSandbox
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
-_KEY = b"measurement-key"
+_SEED = bytes(range(32))
+_PUB = public_key(_SEED)
 _FAIL = Verdict(VerdictType.FAIL, Reason.EGRESS_ONE)
 _PASS = Verdict(VerdictType.PASS, Reason.EGRESS_GE_2)
 
@@ -66,7 +68,7 @@ def _run(c: CalibrationStore, det: _ScriptedDetector, *, nonce: str = "n1"):  # 
     return run_recalibration(
         policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(), detector=det,
         detector_identity="det-1", tier_generation="tier-h", budget=_BUDGET, issuer="cal-gov-1",
-        nonce=nonce, now=100.0, measurement_key=_KEY, trials=3,
+        nonce=nonce, now=100.0, signing_seed=_SEED, trials=3,
     )
 
 
@@ -74,7 +76,7 @@ class RunnerOutcomeTests(unittest.TestCase):
     def test_clean_two_sided_pass(self) -> None:
         c = _store_with_set()
         att = _run(c, _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3))  # catches b1, passes g1
-        verify_measurement(att, measurement_key=_KEY)
+        verify_measurement(att, verify_key=_PUB)
         self.assertIs(att.outcome, VerdictType.PASS)
         self.assertTrue(att.is_clean_pass)
         self.assertFalse(att.short_circuit)

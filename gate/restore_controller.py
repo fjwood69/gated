@@ -88,8 +88,9 @@ class RestoreOutcome:
 
 class RestoreController:
     """Consumes signed measurements and, ONLY for a clean current PASS on an ENABLED policy, appends a
-    RE_ATTESTATION advancing the evidence. ``issuer_keys`` maps an allowed issuer id -> its measurement
-    key (allowlist + per-issuer key epoch in one). ``oracle_head_for`` returns the live ``set_head`` for
+    RE_ATTESTATION advancing the evidence. ``issuer_public_keys`` maps an allowed issuer id -> its
+    Ed25519 PUBLIC key (allowlist + per-issuer key epoch in one); the controller holds NO signing seed,
+    so it can verify a measurement but never forge one (measurement ≠ governance, cryptographic). ``oracle_head_for`` returns the live ``set_head`` for
     a set (None if the calibration store is unreachable -> cannot verify currency -> refuse).
     ``identity_trusted`` gates on the detector's 4-tuple identity still being trusted."""
 
@@ -97,26 +98,26 @@ class RestoreController:
         self,
         capability: ReAttestCapability,
         *,
-        issuer_keys: Mapping[str, bytes],
+        issuer_public_keys: Mapping[str, bytes],
         oracle_head_for: Callable[[str], str | None],
         attestation_store: MeasurementAttestationStore,
         identity_trusted: Callable[[str], bool] = lambda _identity: True,
         max_cas_retries: int = 3,
     ) -> None:
         self._cap = capability
-        self._issuer_keys = dict(issuer_keys)
+        self._issuer_keys = dict(issuer_public_keys)
         self._oracle_head_for = oracle_head_for
         self._attestations = attestation_store
         self._identity_trusted = identity_trusted
         self._max_cas_retries = max_cas_retries
 
     def attempt_restore(self, att: MeasurementAttestation) -> RestoreOutcome:
-        # 1. AUTHENTICITY — issuer allowlist + HMAC under that issuer's key.
+        # 1. AUTHENTICITY — issuer allowlist + Ed25519 signature under that issuer's PUBLIC key.
         key = self._issuer_keys.get(att.issuer)
         if key is None:
             return RestoreOutcome(RestoreResult.REFUSED_UNTRUSTED, f"issuer {att.issuer!r} not allowed")
         try:
-            verify_measurement(att, measurement_key=key)
+            verify_measurement(att, verify_key=key)
         except AttestationError as exc:
             return RestoreOutcome(RestoreResult.REFUSED_UNTRUSTED, f"measurement not verifiable: {exc}")
 
