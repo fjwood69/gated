@@ -11,8 +11,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from gate.snapshot import AttestationRecord, from_json, verify_snapshot
-from gate.snapshot_refresh import RefreshContention, refresh_snapshot
+from gate.snapshot import AttestationRecord, from_json, issue_snapshot, to_json, verify_snapshot
+from gate.snapshot_refresh import (
+    RefreshContention,
+    commit_fixture_append,
+    invalidate_fallback_for_set,
+    refresh_snapshot,
+)
 
 _KEY = b"gate-governance-key"
 
@@ -108,6 +113,57 @@ class RefreshTests(unittest.TestCase):
         )
         self.assertEqual(dict(snap.records), {})
         verify_snapshot(from_json(Path(path).read_text()), key=_KEY, now=1100.0)
+
+
+class SynchronousInvalidationTests(unittest.TestCase):
+    """close-4 completion — the both-stores-down counterexample. Optimistic refresh cannot fix it;
+    the append must SYNCHRONOUSLY revoke the affected fallback attestations BEFORE it commits."""
+
+    def _persist(self, path: str, records: dict[str, AttestationRecord]) -> None:
+        snap = issue_snapshot(records, key=_KEY, now=1000.0, valid_for_seconds=300)
+        Path(path).write_text(to_json(snap))
+
+    def test_append_synchronously_removes_fallback_attestation_before_commit(self) -> None:
+        # 1. snapshot S attests P (set X @ h0) and Q (set Y), fresh + persisted.
+        d = Path(tempfile.mkdtemp(prefix="mv-inval-"))
+        path = str(d / "snapshot.json")
+        self._persist(path, {"P": _rec("P"), "Q": _rec_set("Q", "Y", "hy")})
+        appended: list[str] = []
+        # 2. commit an oracle append to set X: invalidate-then-append. The append runs ONLY after
+        #    the fallback attestation for X is durably revoked.
+        commit_fixture_append(
+            invalidate=lambda: invalidate_fallback_for_set(path, set_id="X", key=_KEY),
+            append=lambda: appended.append("bx2"),
+        )
+        self.assertEqual(appended, ["bx2"])  # append happened (after invalidation)
+        # 3. reload the persisted snapshot -> P (set X) is GONE; Q (set Y) remains; still HMAC-valid.
+        reloaded = from_json(Path(path).read_text())
+        self.assertNotIn("P", reloaded.records)   # the both-down window is now fail-closed for P
+        self.assertIn("Q", reloaded.records)       # scoped: set Y untouched
+        verify_snapshot(reloaded, key=_KEY, now=1100.0)
+
+    def test_invalidation_failure_aborts_the_append(self) -> None:
+        # if the durable revocation fails, the append MUST NOT commit.
+        appended: list[str] = []
+
+        def boom() -> None:
+            raise OSError("disk full — cannot revoke fallback attestation")
+
+        with self.assertRaises(OSError):
+            commit_fixture_append(invalidate=boom, append=lambda: appended.append("x"))
+        self.assertEqual(appended, [])  # aborted — never committed the oracle change
+
+    def test_invalidate_is_noop_when_no_snapshot_yet(self) -> None:
+        d = Path(tempfile.mkdtemp(prefix="mv-inval2-"))
+        invalidate_fallback_for_set(str(d / "absent.json"), set_id="X", key=_KEY)  # no raise
+
+
+def _rec_set(pid: str, set_id: str, oracle_head: str) -> AttestationRecord:
+    return AttestationRecord(
+        policy_id=pid, detector_identity="det-1", calibration_result_ref="cal-1",
+        fixture_set_version="fx", tier_chain_head="th", backend="podman",
+        set_id=set_id, oracle_head=oracle_head,
+    )
 
 
 if __name__ == "__main__":

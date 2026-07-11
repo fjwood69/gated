@@ -23,9 +23,19 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Callable, Mapping
+from pathlib import Path
+from typing import Callable, Mapping, TypeVar
 
-from gate.snapshot import AttestationRecord, CalibrationSnapshot, issue_snapshot, to_json
+from gate.snapshot import (
+    AttestationRecord,
+    CalibrationSnapshot,
+    from_json,
+    issue_snapshot,
+    prune_and_resign,
+    to_json,
+)
+
+_T = TypeVar("_T")
 
 # read_epoch() -> an opaque, comparable epoch (e.g. (tier_head, calibration_head)). Changes on any
 # tier transition or fixture append.
@@ -90,4 +100,35 @@ def refresh_snapshot(
     )
 
 
-__all__ = ["RefreshContention", "refresh_snapshot", "EpochReader", "AttestationBuilder"]
+def invalidate_fallback_for_set(snapshot_path: str, *, set_id: str, key: bytes) -> None:
+    """SYNCHRONOUSLY revoke the fallback attestations for ``set_id`` — durably, in place. Called
+    BEFORE an oracle append commits (via ``commit_fixture_append``): after this returns, the
+    persisted snapshot no longer attests any policy bound to ``set_id``, so during a TOTAL outage
+    (both stores down) a drifted policy is absent -> fails closed, instead of stale-enforcing the
+    pre-append head. Optimistic refresh cannot provide this — only synchronous invalidation closes
+    the both-stores-down window. Raises (propagating) on any I/O failure so the caller ABORTS the
+    append. No-op if no snapshot exists yet."""
+    if not os.path.exists(snapshot_path):
+        return
+    snapshot = from_json(Path(snapshot_path).read_text(encoding="utf-8"))
+    pruned = prune_and_resign(snapshot, drop_set_id=set_id, key=key)
+    _atomic_write(snapshot_path, to_json(pruned))  # temp -> fsync -> os.replace -> fsync parent dir
+
+
+def commit_fixture_append(*, invalidate: Callable[[], None], append: Callable[[], _T]) -> _T:
+    """Enforce the ordering the fallback correctness depends on: durably REVOKE the affected fallback
+    attestations FIRST, and only then commit the oracle append. If ``invalidate`` raises, ``append``
+    NEVER runs — the oracle change is aborted rather than committed while a stale fallback
+    attestation for its set still stands. (invalidate-then-append; failure aborts.)"""
+    invalidate()
+    return append()
+
+
+__all__ = [
+    "RefreshContention",
+    "refresh_snapshot",
+    "invalidate_fallback_for_set",
+    "commit_fixture_append",
+    "EpochReader",
+    "AttestationBuilder",
+]

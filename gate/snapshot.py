@@ -128,6 +128,23 @@ def issue_snapshot(
     )
 
 
+def prune_and_resign(
+    snapshot: CalibrationSnapshot, *, drop_set_id: str, key: bytes
+) -> CalibrationSnapshot:
+    """Return a re-signed snapshot with every attestation for ``drop_set_id`` REMOVED — preserving
+    the original ``issued_at``/``valid_until`` (this is a revocation, not a fresh mint). Used to
+    SYNCHRONOUSLY invalidate the fallback for a set BEFORE an oracle append commits (close-4): after
+    this, a policy bound to ``drop_set_id`` is absent from the snapshot, so during a total outage it
+    fails closed instead of stale-enforcing the pre-append head."""
+    remaining = {pid: r for pid, r in snapshot.records.items() if r.set_id != drop_set_id}
+    unsigned = CalibrationSnapshot(records=dict(remaining), issued_at=snapshot.issued_at,
+                                   valid_until=snapshot.valid_until, mac="")
+    return CalibrationSnapshot(
+        records=dict(remaining), issued_at=snapshot.issued_at, valid_until=snapshot.valid_until,
+        mac=_sign(unsigned._payload(), key),
+    )
+
+
 def verify_snapshot(snapshot: CalibrationSnapshot, *, key: bytes, now: float) -> None:
     """Raise ``SnapshotError`` unless the snapshot is HMAC-valid under ``key`` AND within its
     freshness horizon. Constant-time MAC compare. A tampered payload changes the canonical bytes ->
@@ -186,4 +203,5 @@ __all__ = [
     "attested_record",
     "to_json",
     "from_json",
+    "prune_and_resign",
 ]
