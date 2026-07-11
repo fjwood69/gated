@@ -53,6 +53,13 @@ class ChainIntegrityError(RuntimeError):
     per-policy prior-state continuity / legal-edge invariant was violated."""
 
 
+class ReAttestConflict(RuntimeError):
+    """The restore CAS lost: the policy-evidence head moved between the controller's read and the
+    atomic re-attest append (a concurrent human transition or another re-attest). The restore
+    controller re-reads and retries; it NEVER forces the append (that would re-enforce a policy a
+    human may have just demoted)."""
+
+
 def _required_principals(src: PolicyState, dst: PolicyState) -> int:
     """Distinct governance principals a transition demands: 2 for weakening (dual control), else 1."""
     return 2 if is_weakening(src, dst) else 1
@@ -209,6 +216,91 @@ class PolicyStore:
             )
             return int(cur.lastrowid or 0)
 
+    def reattest(
+        self,
+        policy_id: str,
+        *,
+        calibration_result_ref: str,
+        pinned_set_version: str,
+        detector_identity: str,
+        job_id: str,
+        nonce: str,
+        expect_policy_head: str | None = None,
+    ) -> int:
+        """3.5 job-1: append a RE_ATTESTATION record — an EVIDENCE refresh, NOT a state transition.
+
+        Represented with zero schema/digest change as a ``prior_state == new_state == ENABLED`` record
+        (ENABLED->ENABLED is not a legal ``_TRANSITIONS`` edge, so the shape is unambiguous). It advances
+        which persisted ``calibration_pass`` justifies the UNCHANGED ENABLED tier — the policy was
+        ENABLED, is ENABLED, stays ENABLED; only the evidence backing that disposition moves forward to a
+        pass bound to the CURRENT oracle head. Because it is not in ``_TRANSITIONS``/``is_weakening``, the
+        closed-enum fail-closed disposition proof is untouched (board D1). This is the ONLY method that
+        appends an ENABLED->ENABLED record; ``transition`` still refuses it (a re-attest cannot be smuggled
+        through the general governance path). The restore controller is handed a capability restricted to
+        THIS method (measurement->governance separation at the capability layer, board amendment 1).
+
+        Carries NO governance principal (principals=[]) — a re-attest is measurement-driven evidence, not a
+        governance act; ``job_id``/``nonce`` record the signed measurement's provenance + idempotency.
+        gap-1 still holds: the ref must resolve to a persisted matching ``calibration_pass`` (a fabricated
+        ref cannot re-attest, exactly as it cannot enable). Requires the policy to currently be ENABLED."""
+        with self._lock:
+            prior = self._current_state_unlocked(policy_id)
+            if prior is not PolicyState.ENABLED:
+                raise IllegalTransitionError(
+                    f"re-attestation requires the policy to be ENABLED; {policy_id} is "
+                    f"{prior.value if prior else 'absent'}"
+                )
+            # board D2: the policy-evidence-head CAS must be ATOMIC with the append (both under the
+            # lock) — else a re-attest could land AFTER a concurrent human DEMOTE (or another
+            # re-attest) that moved this policy's head, re-enforcing a policy a human just moved to
+            # ADVISORY. A None expectation opts out (direct/test use); the restore controller always
+            # passes the head it read.
+            if expect_policy_head is not None and self._head_hash_unlocked() != expect_policy_head:
+                raise ReAttestConflict(
+                    f"policy-evidence head moved since the restore CAS read it "
+                    f"(expected {expect_policy_head[:12]}..) — aborting re-attestation, will retry"
+                )
+            if not self._pass_exists_unlocked(
+                calibration_result_ref, policy_id, pinned_set_version, detector_identity
+            ):
+                raise PrivilegedOperationError(
+                    f"no recorded passing calibration matches ref={calibration_result_ref!r} for "
+                    f"({policy_id}, set={pinned_set_version}, detector={detector_identity}) — "
+                    "a re-attestation must bind to a persisted PASS, not an opaque reference"
+                )
+            prev_hash = self._head_hash_unlocked()
+            fields = {
+                "policy_id": policy_id, "prior_state": PolicyState.ENABLED.value,
+                "new_state": PolicyState.ENABLED.value,
+                "calibration_result_ref": calibration_result_ref,
+                "pinned_set_version": pinned_set_version, "detector_identity": detector_identity,
+                "principals": "[]", "purpose": "re-attestation", "rationale": job_id,
+                "operation_id": nonce, "added_at": self._clock(),
+            }
+            record_hash = chain_hash(prev_hash, _digest_fields(fields))
+            cur = self._conn().execute(
+                "INSERT INTO tier_transition_chain "
+                "(policy_id, prior_state, new_state, calibration_result_ref, pinned_set_version,"
+                " detector_identity, principals, purpose, rationale, operation_id, added_at,"
+                " prev_hash, record_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (policy_id, PolicyState.ENABLED.value, PolicyState.ENABLED.value,
+                 calibration_result_ref, pinned_set_version, detector_identity, "[]",
+                 "re-attestation", job_id, nonce, fields["added_at"], prev_hash, record_hash),
+            )
+            return int(cur.lastrowid or 0)
+
+    def policy_head(self, policy_id: str) -> str:
+        """3.5 job-1: the POLICY-SPECIFIC evidence head — the record_hash of this policy's latest
+        record (enable / transition / re-attest), or GENESIS if it has none. The restore controller's
+        CAS pins this (not the global chain head) so a re-attest aborts on a concurrent change to THIS
+        policy (e.g. a human DEMOTE) WITHOUT needless retries from unrelated policies' appends (board
+        amendment 3)."""
+        row = self._conn().execute(
+            "SELECT record_hash FROM tier_transition_chain WHERE policy_id=? ORDER BY seq DESC LIMIT 1",
+            (policy_id,),
+        ).fetchone()
+        return GENESIS_HASH if row is None else str(row["record_hash"])
+
     def record_calibration_pass(
         self,
         calibration_result_ref: str,
@@ -311,9 +403,22 @@ class PolicyStore:
                 return False
             src = prior if prior is not None else PolicyState.PROPOSED
             dst = PolicyState(row["new_state"])
-            if not is_legal_transition(src, dst):
+            if src is PolicyState.ENABLED and dst is PolicyState.ENABLED:
+                # 3.5 job-1: a RE_ATTESTATION record (evidence refresh, not a transition). NOT gated on
+                # is_legal_transition (ENABLED->ENABLED is deliberately not a legal edge). Replay guard
+                # (board): the referenced calibration_pass must still match the record's own
+                # pinned_set_version + detector_identity, so a replayed/forged re-attest pointing at a
+                # stale or mismatched pass is rejected. State is unchanged.
+                if not self._pass_exists_unlocked(
+                    str(row["calibration_result_ref"]), pid, str(row["pinned_set_version"]),
+                    str(row["detector_identity"]),
+                ):
+                    return False
+                # last_state[pid] stays ENABLED (no state change).
+            elif not is_legal_transition(src, dst):
                 return False
-            last_state[pid] = dst
+            else:
+                last_state[pid] = dst
             prev = str(row["record_hash"])
         return True
 
@@ -340,4 +445,5 @@ __all__ = [
     "PrivilegedOperationError",
     "IllegalTransitionError",
     "ChainIntegrityError",
+    "ReAttestConflict",
 ]

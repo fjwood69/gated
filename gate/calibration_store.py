@@ -30,6 +30,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 from typing import Callable, Mapping
@@ -37,6 +38,23 @@ from typing import Callable, Mapping
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from core.chain import GENESIS_HASH, chain_hash, content_digest
 from gate.authority import Authority, GovernanceApproval  # re-exported below for API stability
+
+
+@dataclass(frozen=True)
+class SealedSet:
+    """3.5 job-1: a SNAPSHOT-CONSISTENT seal of a calibration set (the fourth-hole fix). The
+    ``calibration_set``, the ``oracle_head`` (== ``set_head(set_id)`` at the seal instant), and the
+    ``coverage_digest`` are ALL derived from a SINGLE consistent read of the chain, so they provably
+    describe the SAME membership instant. Without this, a runner could read the head at T1 and the
+    fixtures at T2 and sign a PASS attesting a coverage that never co-existed with that head — a
+    cryptographically valid signature over an epistemologically false claim. The runner seals ONCE,
+    releases the read transaction, THEN runs the (expensive) calibration against this frozen set."""
+
+    set_id: str
+    calibration_set: CalibrationSet
+    oracle_head: str
+    coverage_digest: str
+    fixture_ids: tuple[str, ...]
 
 
 class ChangeOp(IntEnum):
@@ -257,6 +275,60 @@ class CalibrationStore:
         # changes on any add/supersede/deprecate that alters THIS set.
         return content_digest({"set_id": set_id, "members": sorted(members.items())})
 
+    def seal_set(self, set_id: str) -> SealedSet:
+        """3.5 job-1: SNAPSHOT-CONSISTENT seal of ``set_id`` — the fourth-hole fix. Reads the chain
+        under a SINGLE consistent snapshot (an explicit deferred transaction; WAL gives a stable
+        read-view for its duration) and derives the ``CalibrationSet``, the ``oracle_head``, and the
+        ``coverage_digest`` from the SAME pass over the SAME rows, so they cannot describe different
+        membership instants. verify_chain runs INSIDE the snapshot (fail-closed on a broken chain).
+        The caller RELEASES this (returns) before the expensive calibration run; the restore CAS later
+        rechecks that ``oracle_head`` is still current, so a set change mid-run simply forces a re-run.
+
+        ``oracle_head`` is byte-identical to ``set_head(set_id)`` (same membership formula), so a seal
+        and the live enforcement path agree on the head. ``coverage_digest`` binds the exact ground-truth
+        fixtures scored (sorted id+label+payload-hash)."""
+        conn = self._conn()
+        conn.execute("BEGIN DEFERRED")
+        try:
+            if not self.verify_chain():
+                raise ChainIntegrityError("calibration chain failed verification — refusing to seal")
+            rows = conn.execute("SELECT * FROM calibration_chain ORDER BY seq ASC").fetchall()
+        finally:
+            conn.execute("COMMIT")
+        # Single pass over the frozen snapshot. Mirrors set_head's per-set membership (incl. a
+        # DEPRECATE that may target this set regardless of the row's set_id) AND keeps the Fixture.
+        members: dict[str, tuple[str, Fixture]] = {}  # fid -> (payload_hash, Fixture)
+        for row in rows:
+            op = ChangeOp[row["op"]]
+            if row["set_id"] != set_id and op is not ChangeOp.DEPRECATE_KNOWN_BAD:
+                continue
+            fid = str(row["fixture_id"])
+            payload = row["payload"]
+            ph = content_digest({"b": bytes(payload).hex()}) if payload is not None else ""
+            if op is ChangeOp.ADD_KNOWN_BAD:
+                members[fid] = (ph, Fixture(fid, FixtureLabel.KNOWN_BAD, bytes(payload), row["evasion_class"]))
+            elif op is ChangeOp.ADD_KNOWN_GOOD:
+                members[fid] = (ph, Fixture(fid, FixtureLabel.KNOWN_GOOD, bytes(payload), row["evasion_class"]))
+            elif op is ChangeOp.SUPERSEDE_KNOWN_GOOD:
+                members.pop(str(row["supersedes"]), None)
+                members[fid] = (ph, Fixture(fid, FixtureLabel.KNOWN_GOOD, bytes(payload), row["evasion_class"]))
+            elif op is ChangeOp.DEPRECATE_KNOWN_BAD:
+                members.pop(fid, None)
+        oracle_head = content_digest(
+            {"set_id": set_id, "members": sorted((fid, ph) for fid, (ph, _f) in members.items())}
+        )
+        good = tuple(f for _ph, f in members.values() if f.label is FixtureLabel.KNOWN_GOOD)
+        bad = tuple(f for _ph, f in members.values() if f.label is FixtureLabel.KNOWN_BAD)
+        coverage_digest = content_digest({
+            "set_id": set_id,
+            "coverage": sorted((fid, f.label.value, ph) for fid, (ph, f) in members.items()),
+        })
+        return SealedSet(
+            set_id=set_id, calibration_set=CalibrationSet(known_good=good, known_bad=bad),
+            oracle_head=oracle_head, coverage_digest=coverage_digest,
+            fixture_ids=tuple(sorted(members.keys())),
+        )
+
     def head(self) -> str:
         """The chain head (record_hash of the last append) — an opaque epoch that changes on ANY
         fixture append. The snapshot-refresh CAS pairs this with the policy-store tier head; if
@@ -271,6 +343,7 @@ __all__ = [
     "Authority",
     "ChangeOp",
     "CalibrationStore",
+    "SealedSet",
     "PrivilegedOperationError",
     "ChainIntegrityError",
 ]
