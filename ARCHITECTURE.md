@@ -66,6 +66,25 @@ has no dependency on the store that just blipped. If enforcement ever grows a ti
 dependency, snapshot-survivability becomes unsound — so this separation is a standing
 invariant, not an accident. (3.3, 2026-07.)
 
+## The load-bearing invariant — measurement authority ≠ governance authority
+
+**The component that MEASURES a detector's fitness holds NO authority to change
+enforcement state. A tier change requires a SEPARATE governance authority acting on a
+SIGNED measurement.** The re-calibration runner emits a signed attestation (PASS / FAIL /
+ERROR) bound to the 4-tuple identity + oracle head — and its key is *not* in the
+tier-write authorised set. A FAIL never demotes and a PASS never enables *by itself*; a
+separate authority (`GOVERNANCE` for enable/demote, `CALIBRATION_GOVERNANCE` for
+holdout injection / acceptance-report signing / triggering re-calibration) must act on
+that attestation, and the two roles cannot do each other's job (`GovernanceApproval`
+carries an `AuthorityDomain`; `meets()` checks it). This is the deepest form of the
+system's separation-of-powers — *the judged cannot control the judging* (out-of-band
+verdict), *the author cannot control the grader* (policy from base ref, not `HEAD`), and
+now *the meter cannot move the tier* (measurement ≠ governance). Violate it anywhere —
+let the thing that measures also enforce — and the calibration loop becomes a
+convincingly-instrumented bypass: a self-grading detector that promotes itself on a
+measurement it authored. It is a standing rule across every calibration-mode increment
+(3.5, 2026-07), not a local note.
+
 ## The rule to hold — Apache-core purity
 
 Everything in `core/`, `sandbox/`, `engine/`, `observe/`, `cli/` is the open
