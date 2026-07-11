@@ -233,11 +233,16 @@ class PolicyStore:
                  self._clock()),
             )
 
-    def current_attestation(self, policy_id: str) -> tuple[str, str] | None:
-        """The ``(set_id, oracle_head)`` the policy's CURRENT calibration was bound to — or None if
-        the policy is not ENABLED (only an ENABLED policy enforces). Fails CLOSED on a broken chain.
-        The gatekeeper compares ``oracle_head`` to the live ``set_head(set_id)``; a mismatch means
-        the set's membership changed since calibration -> transient UNATTESTABLE (close-3, scoped)."""
+    def current_attestation(self, policy_id: str) -> tuple[str, str, str] | None:
+        """The ``(set_id, oracle_head, detector_identity)`` the policy's CURRENT calibration was
+        bound to — or None if the policy is not ENABLED (only an ENABLED policy enforces). Fails
+        CLOSED on a broken chain. The gatekeeper compares ``oracle_head`` to the live
+        ``set_head(set_id)`` (a mismatch means the set's membership changed since calibration ->
+        transient UNATTESTABLE; close-3, scoped) AND compares ``detector_identity`` to the 4-tuple
+        identity of the detector about to run (a mismatch means the detector's build / host closure /
+        image / eval profile drifted since calibration -> the transitive-spoof close, on the LIVE
+        path; close-2). Returning the identity is what lets the live path honour the identity.py
+        invariant symmetrically with the signed-snapshot fallback."""
         if not self.verify_chain():
             raise ChainIntegrityError("tier-transition chain failed verification — refusing to read")
         row = self._conn().execute(
@@ -247,12 +252,13 @@ class PolicyStore:
         if row is None or row["new_state"] != PolicyState.ENABLED.value:
             return None
         prow = self._conn().execute(
-            "SELECT set_id, pinned_set_version FROM calibration_pass WHERE calibration_result_ref=? "
-            "AND policy_id=? LIMIT 1", (row["calibration_result_ref"], policy_id)
+            "SELECT set_id, pinned_set_version, detector_identity FROM calibration_pass "
+            "WHERE calibration_result_ref=? AND policy_id=? LIMIT 1",
+            (row["calibration_result_ref"], policy_id)
         ).fetchone()
         if prow is None:
             return None
-        return (str(prow["set_id"]), str(prow["pinned_set_version"]))
+        return (str(prow["set_id"]), str(prow["pinned_set_version"]), str(prow["detector_identity"]))
 
     def _pass_exists_unlocked(
         self, calibration_result_ref: str, policy_id: str, pinned_set_version: str,

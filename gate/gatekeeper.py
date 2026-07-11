@@ -102,7 +102,10 @@ def resolve_disposition(
             Disposition.SKIP_NEUTRAL, None, "no policy configured for this check", "live"
         )
     if state is PolicyState.ENABLED:
-        return _enforce_if_oracle_current(policy_id, store=store, oracle_head_for=oracle_head_for)
+        return _enforce_if_oracle_current(
+            policy_id, store=store, oracle_head_for=oracle_head_for,
+            expected_detector_identity=expected_detector_identity,
+        )
     return GateDecision(disposition_for(state), state, f"live state {state.value}", "live")
 
 
@@ -111,13 +114,26 @@ def _enforce_if_oracle_current(
     *,
     store: PolicyStore,
     oracle_head_for: Callable[[str], str | None],
+    expected_detector_identity: str,
 ) -> GateDecision:
-    """A live ENABLED policy enforces only if its bound set-head equals the current set-head. Scoped
-    invalidation: an append to the policy's set moves the head -> UNATTESTABLE until re-calibration."""
+    """A live ENABLED policy enforces only if BOTH bindings still hold: (a) its calibration's bound
+    set-head equals the current set-head (scoped oracle invalidation — an append to the policy's set
+    moves the head -> UNATTESTABLE; close-3); AND (b) the detector about to run has the SAME 4-tuple
+    identity the calibration was bound to (close-2 — a build / host-closure / image / eval drift
+    yields a new identity, and enforcing a stale calibration for a drifted detector is the very
+    transitive-spoof the identity binding exists to refuse). The identity check is symmetric with the
+    signed-snapshot fallback (``_from_snapshot``); without it, the identity invariant held only during
+    a store outage and fell open on the primary path."""
     attestation = store.current_attestation(policy_id)
     if attestation is None:
         return _unattestable("ENABLED policy has no calibration attestation to check the oracle head")
-    set_id, bound_head = attestation
+    set_id, bound_head, bound_identity = attestation
+    if bound_identity != expected_detector_identity:
+        return _unattestable(
+            f"live ENABLED calibration attests detector {bound_identity!r} but "
+            f"{expected_detector_identity!r} is about to run — the detector drifted since "
+            "calibration; refusing to enforce an un-calibrated detector"
+        )
     current_head = oracle_head_for(set_id)
     if current_head is None:
         return _unattestable(f"unknown calibration set membership for {set_id!r} — failing closed")

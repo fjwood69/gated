@@ -28,6 +28,7 @@ from core import (
     VerdictType,
 )
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
+from core.identity import DetectorManifest, identity_for
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
 from gate.gatekeeper import ratify_enable, resolve_disposition, run_calibration
@@ -287,6 +288,50 @@ class Close3ScopedOracleTests(unittest.TestCase):
         s = _store()
         _enable(s, "P", set_id="Z", head="hz")
         d = _resolve(s, "P", oracle_head_for=lambda _sid: None)  # set can't be resolved
+        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
+        self.assertEqual(d.source, "unattestable")
+
+
+class TransitiveSpoofIntegrationTests(unittest.TestCase):
+    """close-2 integration (UAT Phase 1): the 4-tuple execution identity, threaded end-to-end through
+    the gate, refuses a detector whose TRANSITIVE (host-side) dependency drifted — on BOTH the live
+    path and the signed-snapshot fallback. Uses the real ``core.identity.bind_identity`` (not string
+    placeholders): the only coordinate that moves is ``host_closure_digest`` (the detector's own build
+    artifact, the sandbox image, and the eval profile are byte-identical), which is exactly the
+    transitive-dependency spoof the 2-tuple missed and the 4-tuple closes.
+
+    Regression guard: before the live-path identity fix, the live assertions here returned
+    RUN_ENFORCING — the identity invariant held only during a store outage and fell open on the
+    primary path."""
+
+    def _identity(self, *, host_closure: str) -> str:
+        # same detector build + same artifact image + same eval profile; ONLY the host closure moves.
+        m = DetectorManifest(check_type="egress", entrypoint=("python3", "main.py"),
+                             impl_digest="detector-build-v1", eval_profile={"trials": 3, "budget": 1.0})
+        return identity_for(m, host_closure_digest=host_closure, artifact_image_digest="img-sha-v1")
+
+    def test_live_path_refuses_host_closure_drift(self) -> None:
+        id_v1 = self._identity(host_closure="closure-v1")
+        id_v2 = self._identity(host_closure="closure-v2")  # a host-side helper changed
+        self.assertNotEqual(id_v1, id_v2)  # the drift produced a new identity
+        s = _store()
+        _enable(s, "p1", detector=id_v1)  # calibrated + ENABLED for the v1 closure
+        # the detector about to run is bound to the v1 closure -> enforce.
+        self.assertIs(_resolve(s, "p1", detector=id_v1).disposition, Disposition.RUN_ENFORCING)
+        # the detector about to run has the DRIFTED (v2) closure -> refuse (un-calibrated), on the
+        # LIVE path with the store fully reachable.
+        d = _resolve(s, "p1", detector=id_v2)
+        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
+        self.assertEqual(d.source, "unattestable")
+
+    def test_snapshot_path_refuses_host_closure_drift(self) -> None:
+        id_v1 = self._identity(host_closure="closure-v1")
+        id_v2 = self._identity(host_closure="closure-v2")
+        u = _UnreachableStore(Path(tempfile.mkdtemp(prefix="mv-gk-spoof-")) / "t.db")
+        snap = _snap("p1", id_v1)  # the survivable snapshot attests the v1 identity
+        self.assertIs(_resolve(u, "p1", detector=id_v1, snapshot=snap).disposition,
+                      Disposition.RUN_ENFORCING)  # store blip, matching identity -> survives
+        d = _resolve(u, "p1", detector=id_v2, snapshot=snap)  # drifted closure during the outage
         self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
         self.assertEqual(d.source, "unattestable")
 
