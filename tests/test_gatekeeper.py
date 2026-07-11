@@ -29,6 +29,7 @@ from core import (
 )
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from gate.authority import GovernanceApproval
+from gate.calibration_store import CalibrationStore, ChangeOp
 from gate.gatekeeper import ratify_enable, resolve_disposition, run_calibration
 from gate.policy_state import Disposition, PolicyState
 from gate.policy_store import PolicyStore
@@ -75,14 +76,16 @@ def _store() -> PolicyStore:
     return PolicyStore(d / "tier.db")
 
 
-def _enable(store: PolicyStore, pid: str, *, detector: str = "det-1") -> None:
+def _enable(store: PolicyStore, pid: str, *, detector: str = "det-1", set_id: str = "default",
+            head: str = "fx-head") -> None:
+    ref = f"cal-{pid}"  # unique per policy so current_attestation resolves the right pass
     store.transition(pid, PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op=f"{pid}-1"))
     store.transition(pid, PolicyState.CALIBRATING, approval=_appr("gov1", op=f"{pid}-2"),
-                     pinned_set_version="fx-head")
-    store.record_calibration_pass("cal-1", policy_id=pid, pinned_set_version="fx-head",
-                                  detector_identity=detector)
+                     pinned_set_version=head)
+    store.record_calibration_pass(ref, policy_id=pid, pinned_set_version=head,
+                                  detector_identity=detector, set_id=set_id)
     store.transition(pid, PolicyState.ENABLED, approval=_appr("gov1", op=f"{pid}-3"),
-                     calibration_result_ref="cal-1", pinned_set_version="fx-head",
+                     calibration_result_ref=ref, pinned_set_version=head,
                      detector_identity=detector)
 
 
@@ -102,10 +105,13 @@ def _snap(pid: str, detector: str):  # type: ignore[no-untyped-def]
     return issue_snapshot({pid: rec}, key=_KEY, now=1000.0, valid_for_seconds=300)
 
 
-def _resolve(store, pid, *, detector="det-1", snapshot=None, now=1100.0):  # type: ignore[no-untyped-def]
+def _resolve(store, pid, *, detector="det-1", snapshot=None, now=1100.0,  # type: ignore[no-untyped-def]
+             oracle_head_for=None):
+    if oracle_head_for is None:
+        oracle_head_for = lambda s: "fx-head"  # noqa: E731 — default: bound head matches -> enforce
     return resolve_disposition(
         pid, expected_detector_identity=detector, store=store, snapshot=snapshot,
-        snapshot_key=_KEY, now=now,
+        snapshot_key=_KEY, now=now, oracle_head_for=oracle_head_for,
     )
 
 
@@ -220,6 +226,52 @@ class EnablePathTests(unittest.TestCase):
                       calibration_result_ref=outcome.calibration_result_ref, pinned_set_version="fx",
                       detector_identity="det-1")
         self.assertIs(s.current_state("p1"), PolicyState.ENABLED)
+
+
+class Close3ScopedOracleTests(unittest.TestCase):
+    """close-3: fixture append to a SET invalidates ONLY the policies calibrated against THAT set.
+    The board's required regression: append to shared set X -> every policy bound to X blocks
+    (live path); unrelated set Y remains enforcing; unknown set membership fails closed."""
+
+    def _cal(self) -> CalibrationStore:
+        d = Path(tempfile.mkdtemp(prefix="mv-gk-cal-"))
+        return CalibrationStore(d / "cal.db")
+
+    def _add(self, cal: CalibrationStore, fid: str, set_id: str, bad: bool = True) -> None:
+        appr = GovernanceApproval(principals=("g1", "g2"), purpose="admit", rationale="r",
+                                  operation_id=f"op-{fid}")
+        op = ChangeOp.ADD_KNOWN_BAD if bad else ChangeOp.ADD_KNOWN_GOOD
+        label = FixtureLabel.KNOWN_BAD if bad else FixtureLabel.KNOWN_GOOD
+        cal.append(op, approval=appr, fixture_id=fid, set_id=set_id, label=label,
+                   payload=fid.encode())
+
+    def test_append_to_set_X_blocks_bound_policies_set_Y_unaffected(self) -> None:
+        cal = self._cal()
+        self._add(cal, "bx1", "X")
+        self._add(cal, "gy1", "Y", bad=False)
+        hX1, hY = cal.set_head("X"), cal.set_head("Y")
+        s = _store()
+        _enable(s, "P", set_id="X", head=hX1)
+        _enable(s, "Q", set_id="Y", head=hY)
+        ohf = cal.set_head  # oracle_head_for = the REAL scoped head
+        self.assertIs(_resolve(s, "P", oracle_head_for=ohf).disposition, Disposition.RUN_ENFORCING)
+        self.assertIs(_resolve(s, "Q", oracle_head_for=ohf).disposition, Disposition.RUN_ENFORCING)
+        # append to set X -> set_head(X) moves; set_head(Y) unchanged.
+        self._add(cal, "bx2", "X")
+        self.assertNotEqual(cal.set_head("X"), hX1)
+        self.assertEqual(cal.set_head("Y"), hY)
+        pd = _resolve(s, "P", oracle_head_for=ohf)
+        self.assertIs(pd.disposition, Disposition.BLOCK_ACTION_REQUIRED)  # X grew -> P unattestable
+        self.assertEqual(pd.source, "unattestable")
+        self.assertIs(_resolve(s, "Q", oracle_head_for=ohf).disposition,
+                      Disposition.RUN_ENFORCING)  # Y untouched -> Q still enforces (scoped)
+
+    def test_unknown_set_membership_fails_closed(self) -> None:
+        s = _store()
+        _enable(s, "P", set_id="Z", head="hz")
+        d = _resolve(s, "P", oracle_head_for=lambda _sid: None)  # set can't be resolved
+        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
+        self.assertEqual(d.source, "unattestable")
 
 
 class Done5_NoC3PathTests(unittest.TestCase):

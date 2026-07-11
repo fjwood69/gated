@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS calibration_chain (
     seq            INTEGER PRIMARY KEY AUTOINCREMENT,
     op             TEXT NOT NULL,
     fixture_id     TEXT NOT NULL,
+    set_id         TEXT NOT NULL DEFAULT 'default',  -- 3.4: the calibration SET this fixture belongs to
     label          TEXT,               -- known_good | known_bad (ADD ops)
     payload        BLOB,               -- fixture bytes (ADD / SUPERSEDE)
     evasion_class  TEXT,
@@ -92,10 +93,10 @@ def _digest_fields(row: Mapping[str, object]) -> str:
     core.chain primitive — same tamper-evidence math as the C3 override ledger."""
     return content_digest(
         {
-            "op": row["op"], "fixture_id": row["fixture_id"], "label": row["label"],
-            "payload_hash": row["payload_hash"], "evasion_class": row["evasion_class"],
-            "supersedes": row["supersedes"], "reason": row["reason"],
-            "added_by": row["added_by"], "added_at": row["added_at"],
+            "op": row["op"], "fixture_id": row["fixture_id"], "set_id": row["set_id"],
+            "label": row["label"], "payload_hash": row["payload_hash"],
+            "evasion_class": row["evasion_class"], "supersedes": row["supersedes"],
+            "reason": row["reason"], "added_by": row["added_by"], "added_at": row["added_at"],
         }
     )
 
@@ -131,6 +132,7 @@ class CalibrationStore:
         authority: Authority = Authority.RUNTIME,
         approval: GovernanceApproval | None = None,
         fixture_id: str,
+        set_id: str = "default",
         label: FixtureLabel | None = None,
         payload: bytes | None = None,
         evasion_class: str | None = None,
@@ -165,7 +167,7 @@ class CalibrationStore:
         with self._lock:
             prev_hash = self._head_hash()
             fields = {
-                "op": op.name, "fixture_id": fixture_id,
+                "op": op.name, "fixture_id": fixture_id, "set_id": set_id,
                 "label": label.value if label is not None else None,
                 "payload_hash": payload_hash, "evasion_class": evasion_class,
                 "supersedes": supersedes, "reason": reason, "added_by": added_by,
@@ -174,10 +176,10 @@ class CalibrationStore:
             record_hash = chain_hash(prev_hash, _digest_fields(fields))
             cur = self._conn().execute(
                 "INSERT INTO calibration_chain "
-                "(op, fixture_id, label, payload, evasion_class, supersedes, reason, added_by,"
-                " added_at, prev_hash, record_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (fields["op"], fixture_id, fields["label"], payload, evasion_class, supersedes,
-                 reason, added_by, fields["added_at"], prev_hash, record_hash),
+                "(op, fixture_id, set_id, label, payload, evasion_class, supersedes, reason,"
+                " added_by, added_at, prev_hash, record_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (fields["op"], fixture_id, set_id, fields["label"], payload, evasion_class,
+                 supersedes, reason, added_by, fields["added_at"], prev_hash, record_hash),
             )
             return int(cur.lastrowid or 0)
 
@@ -194,10 +196,10 @@ class CalibrationStore:
             payload = row["payload"]
             payload_hash = content_digest({"b": bytes(payload).hex()}) if payload is not None else None
             fields = {
-                "op": row["op"], "fixture_id": row["fixture_id"], "label": row["label"],
-                "payload_hash": payload_hash, "evasion_class": row["evasion_class"],
-                "supersedes": row["supersedes"], "reason": row["reason"],
-                "added_by": row["added_by"], "added_at": row["added_at"],
+                "op": row["op"], "fixture_id": row["fixture_id"], "set_id": row["set_id"],
+                "label": row["label"], "payload_hash": payload_hash,
+                "evasion_class": row["evasion_class"], "supersedes": row["supersedes"],
+                "reason": row["reason"], "added_by": row["added_by"], "added_at": row["added_at"],
             }
             if row["prev_hash"] != prev or row["record_hash"] != chain_hash(prev, _digest_fields(fields)):
                 return False
@@ -226,6 +228,34 @@ class CalibrationStore:
             elif op is ChangeOp.DEPRECATE_KNOWN_BAD:
                 bad.pop(fid, None)  # excluded from the head; the record STAYS in the chain
         return CalibrationSet(known_good=tuple(good.values()), known_bad=tuple(bad.values()))
+
+    def set_head(self, set_id: str) -> str:
+        """3.4 close-3: the SET-SCOPED oracle head — a digest of the CURRENT membership of ``set_id``
+        (its non-deprecated/superseded fixtures). It changes IFF this set's membership changes: an
+        append to set X moves set_head(X) and NOTHING else, so a fixture change invalidates only the
+        policies calibrated against X — never a global wedge. A policy binds the set_head it was
+        calibrated against; enforcement compares that to the current set_head and blocks (UNATTESTABLE)
+        on mismatch. Fails CLOSED on a broken chain."""
+        if not self.verify_chain():
+            raise ChainIntegrityError("calibration chain failed verification — refusing to read")
+        members: dict[str, str] = {}  # fixture_id -> payload_hash, for CURRENT fixtures in set_id
+        for row in self._conn().execute("SELECT * FROM calibration_chain ORDER BY seq ASC"):
+            if row["set_id"] != set_id and ChangeOp[row["op"]] is not ChangeOp.DEPRECATE_KNOWN_BAD:
+                continue
+            op = ChangeOp[row["op"]]
+            fid = row["fixture_id"]
+            payload = row["payload"]
+            ph = content_digest({"b": bytes(payload).hex()}) if payload is not None else ""
+            if op in (ChangeOp.ADD_KNOWN_BAD, ChangeOp.ADD_KNOWN_GOOD):
+                members[fid] = ph
+            elif op is ChangeOp.SUPERSEDE_KNOWN_GOOD:
+                members.pop(str(row["supersedes"]), None)
+                members[fid] = ph
+            elif op is ChangeOp.DEPRECATE_KNOWN_BAD:
+                members.pop(fid, None)  # a deprecate may target this set regardless of the row's set_id
+        # The head is a digest of the sorted (fixture_id, payload_hash) membership — order-independent,
+        # changes on any add/supersede/deprecate that alters THIS set.
+        return content_digest({"set_id": set_id, "members": sorted(members.items())})
 
     def record_count(self) -> int:
         return int(self._conn().execute("SELECT COUNT(*) AS n FROM calibration_chain").fetchone()["n"])

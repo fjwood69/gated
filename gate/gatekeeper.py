@@ -74,11 +74,17 @@ def resolve_disposition(
     snapshot: CalibrationSnapshot | None,
     snapshot_key: bytes,
     now: float,
+    oracle_head_for: Callable[[str], str | None],
 ) -> GateDecision:
     """Decide the dispatcher's action for ``policy_id``. Order: live store -> identity-bound signed
     snapshot -> fail-closed UNATTESTABLE. A tampered chain blocks immediately (never falls back — a
-    tamper is worse than an outage). ``expected_detector_identity`` is the detector about to run;
-    the snapshot path refuses to enforce a stale attestation bound to a DIFFERENT detector."""
+    tamper is worse than an outage). ``expected_detector_identity`` is the detector about to run.
+
+    close-3: a live ENABLED policy is enforced ONLY if its calibration's bound set-head still equals
+    the CURRENT set-head (``oracle_head_for(set_id)``). A fixture append to that set moves the head,
+    so the policy immediately goes UNATTESTABLE (transient action_required) until 3.5 re-calibrates —
+    SCOPED, so an append to set X never touches policies on set Y. Unknown set membership fails
+    CLOSED (a policy whose set can't be resolved is not attestable)."""
     try:
         state = store.current_state(policy_id)
     except ChainIntegrityError:
@@ -95,7 +101,33 @@ def resolve_disposition(
         return GateDecision(
             Disposition.SKIP_NEUTRAL, None, "no policy configured for this check", "live"
         )
+    if state is PolicyState.ENABLED:
+        return _enforce_if_oracle_current(policy_id, store=store, oracle_head_for=oracle_head_for)
     return GateDecision(disposition_for(state), state, f"live state {state.value}", "live")
+
+
+def _enforce_if_oracle_current(
+    policy_id: str,
+    *,
+    store: PolicyStore,
+    oracle_head_for: Callable[[str], str | None],
+) -> GateDecision:
+    """A live ENABLED policy enforces only if its bound set-head equals the current set-head. Scoped
+    invalidation: an append to the policy's set moves the head -> UNATTESTABLE until re-calibration."""
+    attestation = store.current_attestation(policy_id)
+    if attestation is None:
+        return _unattestable("ENABLED policy has no calibration attestation to check the oracle head")
+    set_id, bound_head = attestation
+    current_head = oracle_head_for(set_id)
+    if current_head is None:
+        return _unattestable(f"unknown calibration set membership for {set_id!r} — failing closed")
+    if current_head != bound_head:
+        return _unattestable(
+            f"oracle set {set_id!r} has grown since calibration (head {bound_head[:12]}.. -> "
+            f"{current_head[:12]}..) — re-calibration pending"
+        )
+    return GateDecision(Disposition.RUN_ENFORCING, PolicyState.ENABLED,
+                        f"live ENABLED, oracle set {set_id!r} current", "live")
 
 
 def _from_snapshot(
@@ -186,6 +218,7 @@ def run_calibration(
     calibration_chain_head: str,
     detector_identity: str,
     approval: GovernanceApproval,
+    set_id: str = "default",
     trials: int = DEFAULT_CALIBRATION_TRIALS,
 ) -> CalibrationOutcome:
     """Run the 3.2 BATCH calibrator (shadow-first — full fixture distribution, zero live-PR cost)
@@ -205,7 +238,7 @@ def run_calibration(
         ref = _result_ref(policy_id, calibration_chain_head, detector_identity, result)
         store.record_calibration_pass(
             ref, policy_id=policy_id, pinned_set_version=calibration_chain_head,
-            detector_identity=detector_identity,
+            detector_identity=detector_identity, set_id=set_id,
         )
     else:
         store.transition(
