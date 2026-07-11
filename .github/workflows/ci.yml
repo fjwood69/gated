@@ -21,19 +21,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: No internal / homelab / secret markers in tracked content
-        run: |
-          # Signal = homelab identifiers + REAL credential-prefix shapes. The bare words
-          # api_key/password/bearer are deliberately NOT matched: this codebase's job is
-          # GitHub auth, so it legitimately contains "Bearer"/"token"/"password" in comments
-          # and code — bare-word matching there is pure false-positive, not a leak signal. A
-          # real leaked credential has a shape (sk-ant-…, ghp_…, xoxb-…); that we do match.
-          if grep -rniE 'nucadmin|piadmin|jadmin|10\.1\.2\.|uk-smr|ca-gcp|tailscale|dotfiles|get-secret|/home/[a-z]|sk-ant-|ghp_[A-Za-z0-9]{20,}|xoxb-' \
-              --include='*.py' --include='*.md' --include='Makefile' \
-              --exclude-dir=.git . ; then
-            echo "::error::internal/homelab marker or credential shape found in tracked content"; exit 1
-          fi
-          echo "clean"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      # The mori project's sterility gate (adopted): a maintained MARKERS + ALLOW script
+      # over `git ls-files`, replacing the brittle inline grep. Also catches pre-extraction
+      # naming and env prefixes, so a de-baptism miss fails the build.
+      - name: Content sterility (scripts/check-sterility.py)
+        run: python scripts/check-sterility.py
 
   lint:
     name: Lint (ruff)
