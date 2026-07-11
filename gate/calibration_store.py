@@ -46,14 +46,17 @@ class ChangeOp(IntEnum):
     DEPRECATE_KNOWN_BAD = 3    # exclude a known-bad from the head; it STAYS in the chain
 
 
-# The authority the STRENGTHENING ops require (single GOVERNANCE — the enum is an acceptable
-# in-process MODEL of a deploy-time boundary for a low-risk strengthening op). The one WEAKENING op,
-# DEPRECATE_KNOWN_BAD, no longer gates on the enum: it requires a real ``GovernanceApproval`` with
-# TWO DISTINCT principals (3.3-consistency ruling — an enum a single caller names is not PROOF of
-# dual control). See ``append``.
+# Ops that require REAL dual control — a GovernanceApproval with two distinct principals. As of 3.4
+# this is every op that admits a fixture to the oracle (both ADDs) plus the weakening DEPRECATE:
+# admitting is high-stakes (a known-bad blocks merges; a known-good masks a true positive). This is
+# what makes gate/admission.py the only sufficient-authority path in. See ``append``.
+_DUAL_APPROVAL_OPS: frozenset[ChangeOp] = frozenset(
+    {ChangeOp.ADD_KNOWN_BAD, ChangeOp.ADD_KNOWN_GOOD, ChangeOp.DEPRECATE_KNOWN_BAD}
+)
+
+# The enum authority the remaining (non-dual) ops require. SUPERSEDE_KNOWN_GOOD (a correction of an
+# existing known-good) keeps the single-GOVERNANCE enum model for now.
 _REQUIRED: dict[ChangeOp, Authority] = {
-    ChangeOp.ADD_KNOWN_BAD: Authority.GOVERNANCE,
-    ChangeOp.ADD_KNOWN_GOOD: Authority.GOVERNANCE,
     ChangeOp.SUPERSEDE_KNOWN_GOOD: Authority.GOVERNANCE,
 }
 
@@ -137,17 +140,18 @@ class CalibrationStore:
     ) -> int:
         """Append a fixture-set change, hash-chained. PRIVILEGED. RUNTIME can never append (1b).
 
-        Authority model (3.3-consistency): the STRENGTHENING ops (add / supersede) gate on the
-        ``authority`` ENUM (GOVERNANCE) — an acceptable in-process model of the deploy-time boundary.
-        The one WEAKENING op, DEPRECATE_KNOWN_BAD (1e), requires a real ``approval`` —
-        ``GovernanceApproval`` with TWO DISTINCT authenticated principals — because an enum a single
-        caller names is not PROOF of dual control. The approval's principals are recorded in
-        ``added_by`` (schema/digest unchanged). Returns the new seq. No update/delete method."""
-        if op is ChangeOp.DEPRECATE_KNOWN_BAD:
+        Authority model (3.4): admitting a fixture to the ORACLE is high-stakes governance, so the
+        ADD ops AND the weakening DEPRECATE op all require a real ``approval`` — ``GovernanceApproval``
+        with TWO DISTINCT authenticated principals (an enum a single caller names is not proof of
+        dual control). This makes the ADMISSION GATE the only sufficient-authority path into the
+        fixture store: a known-bad can block merges, a known-good can mask a true positive — both
+        earn dual control. SUPERSEDE (a correction of an existing known-good) keeps the ENUM for now.
+        Principals are recorded in ``added_by`` (schema/digest unchanged). No update/delete method."""
+        if op in _DUAL_APPROVAL_OPS:
             if approval is None or not approval.meets(2):
                 raise PrivilegedOperationError(
-                    "DEPRECATE_KNOWN_BAD requires a GovernanceApproval with two distinct principals "
-                    "— the one weakening op is real dual control, not an enum a caller names (1e)"
+                    f"{op.name} requires a GovernanceApproval with two distinct principals — "
+                    "admitting/weakening the oracle is dual-controlled governance, not an enum"
                 )
             added_by = added_by or ",".join(sorted(approval.distinct_principals))
         else:
