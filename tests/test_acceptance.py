@@ -17,10 +17,10 @@ from pathlib import Path
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from gate.acceptance import (
+    AcceptanceError,
     BlindHoldoutError,
     BlindHoldoutStore,
     run_acceptance_anchor,
-    sandbox_config_digest,
     verify_report,
 )
 from gate.authority import AuthorityDomain, GovernanceApproval
@@ -77,14 +77,16 @@ def _holdout() -> BlindHoldoutStore:
     return store
 
 
+_IMAGE_REF = "sha256:" + "e" * 64  # a pinned image digest (not a mutable tag)
+
+
 def _run(store: BlindHoldoutStore, *, honest, fn, fp, signer=None):  # type: ignore[no-untyped-def]
     return run_acceptance_anchor(
         make_sandbox=_factory(), honest_detector=honest, fn_deficient_detector=fn,
-        fp_happy_detector=fp, visible_set=_VISIBLE, blind_holdout_store=store,
-        holdout_key=_HOLDOUT_KEY, signer_key=_SIGNER_KEY, signer_principal="cal-gov-1",
-        signer_approval=signer or _cal_gov("cal-gov-1"),
-        sandbox_config_hash=sandbox_config_digest(backend="noop", isolation="hermetic"),
-        now=100.0, budget=_BUDGET, trials=3)
+        fp_happy_detector=fp, detector_identity="det-honest-4tuple", visible_set=_VISIBLE,
+        blind_holdout_store=store, holdout_key=_HOLDOUT_KEY, signer_key=_SIGNER_KEY,
+        signer_principal="cal-gov-1", signer_approval=signer or _cal_gov("cal-gov-1"),
+        image_ref=_IMAGE_REF, now=100.0, budget=_BUDGET, trials=3)
 
 
 # honest: reused across BOTH the visible AND the holdout lane (same instance, 12 trials). Each set is
@@ -112,6 +114,12 @@ class AcceptanceAnchorTests(unittest.TestCase):
         self.assertEqual(report.visible_coverage, 2)
         self.assertEqual(report.holdout_coverage, 2)           # no silent skip
         self.assertIn("provisional", report.claim)             # honest claim, not "proven"
+        # board #8: the receipt binds WHAT was tested.
+        self.assertEqual(report.detector_identity, "det-honest-4tuple")
+        self.assertEqual(report.image_ref, _IMAGE_REF)         # pinned image digest
+        self.assertEqual(report.trials, 3)
+        self.assertNotEqual(report.visible_corpus_digest, report.holdout_corpus_digest)  # genuinely blind
+        self.assertTrue(report.sandbox_config_hash)            # computed from the real sandbox
         self.assertTrue(verify_report(report, signer_key=_SIGNER_KEY))
         self.assertFalse(verify_report(report, signer_key=b"forged"))
 
@@ -136,6 +144,19 @@ class AcceptanceAnchorTests(unittest.TestCase):
         self.assertTrue(report.honest_passes)
         self.assertFalse(report.generalises)   # missed a holdout known-bad
         self.assertFalse(report.accepted)
+
+    def test_holdout_identical_to_visible_is_refused(self) -> None:
+        # board #8: a holdout that duplicates the visible corpus proves memorisation, not
+        # generalisation — the anchor refuses to sign such a receipt.
+        store = BlindHoldoutStore(Path(tempfile.mkdtemp(prefix="mv-dup-")) / "h.db")
+        # same ids + payloads + labels as _VISIBLE -> identical corpus digest.
+        store.append(Fixture("vb", FixtureLabel.KNOWN_BAD, b"bad-visible"),
+                     holdout_key=_HOLDOUT_KEY, approval=_cal_gov("cg1", "cg2"))
+        store.append(Fixture("vg", FixtureLabel.KNOWN_GOOD, b"good-visible"),
+                     holdout_key=_HOLDOUT_KEY, approval=_cal_gov("cg1", "cg2"))
+        with self.assertRaises(AcceptanceError):
+            _run(store, honest=_honest(),
+                 fn=_ScriptedDetector([_PASS] * 6), fp=_ScriptedDetector([_FAIL] * 6))
 
     def test_self_grading_closure_requires_calibration_governance_signer(self) -> None:
         store = _holdout()

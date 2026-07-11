@@ -165,7 +165,12 @@ class AcceptanceReport:
     refuses_on_fp: bool         # a known-good-blocking detector is REFUSED
     generalises: bool           # the honest detector PASSES the blind holdout (not memorisation)
     short_circuit: bool         # asserted OFF
-    sandbox_config_hash: str
+    detector_identity: str      # the 4-tuple execution identity of the HONEST detector under test
+    visible_corpus_digest: str  # digest of the exact visible fixtures (id+label+payload)
+    holdout_corpus_digest: str  # digest of the exact blind-holdout fixtures
+    trials: int                 # trials per fixture (the run's statistical depth)
+    image_ref: str              # the PINNED sandbox image (a digest, not a mutable tag)
+    sandbox_config_hash: str    # computed from the REAL sandbox isolation level + image_ref
     visible_coverage: int
     holdout_coverage: int
     signer_principal: str
@@ -178,14 +183,27 @@ class AcceptanceReport:
             "accepted": self.accepted, "honest_passes": self.honest_passes,
             "refuses_on_fn": self.refuses_on_fn, "refuses_on_fp": self.refuses_on_fp,
             "generalises": self.generalises, "short_circuit": self.short_circuit,
-            "sandbox_config_hash": self.sandbox_config_hash, "visible_coverage": self.visible_coverage,
-            "holdout_coverage": self.holdout_coverage, "signer_principal": self.signer_principal,
-            "claim": self.claim, "issued_at": self.issued_at,
+            "detector_identity": self.detector_identity,
+            "visible_corpus_digest": self.visible_corpus_digest,
+            "holdout_corpus_digest": self.holdout_corpus_digest, "trials": self.trials,
+            "image_ref": self.image_ref, "sandbox_config_hash": self.sandbox_config_hash,
+            "visible_coverage": self.visible_coverage, "holdout_coverage": self.holdout_coverage,
+            "signer_principal": self.signer_principal, "claim": self.claim, "issued_at": self.issued_at,
         }
 
 
 _HONEST_CLAIM = ("resists the CURRENT corpus (visible + blind holdout) — provisional, the corpus grows; "
                  "NOT a proof of absolute safety")
+
+
+def _corpus_digest(cset: CalibrationSet) -> str:
+    """A stable digest of the EXACT fixtures a lane ran — sorted (id, label, payload-hash). Binds the
+    receipt to WHAT was tested, so a later corpus swap is detectable."""
+    items = sorted(
+        (f.fixture_id, f.label.value, hashlib.sha256(f.payload).hexdigest())
+        for f in (*cset.known_bad, *cset.known_good)
+    )
+    return content_digest({"corpus": items})
 
 
 def _sign_report(unsigned: AcceptanceReport, key: bytes) -> AcceptanceReport:
@@ -208,29 +226,46 @@ def run_acceptance_anchor(
     honest_detector: RuntimeAssertion,
     fn_deficient_detector: RuntimeAssertion,
     fp_happy_detector: RuntimeAssertion,
+    detector_identity: str,
     visible_set: CalibrationSet,
     blind_holdout_store: BlindHoldoutStore,
     holdout_key: bytes,
     signer_key: bytes,
     signer_principal: str,
     signer_approval: GovernanceApproval,
-    sandbox_config_hash: str,
+    image_ref: str,
     now: float,
     budget: ResourceBudget,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
 ) -> AcceptanceReport:
-    """Conduct the two-sided acceptance run against REAL fixtures + a REAL sandbox and return a SIGNED
-    report. Self-grading closure: ``signer_approval`` must be a CALIBRATION_GOVERNANCE principal (the
-    author cannot own the grader). Runs, in order: honest detector on the visible set (must PASS),
-    FN-deficient (must be REFUSED), FP-happy (must be REFUSED), honest detector on the blind holdout
-    (must PASS — generalisation). ``accepted`` iff all four hold. short-circuit is OFF (calibrate runs
-    the full distribution) and that is recorded + asserted."""
+    """Conduct the two-sided acceptance run against REAL fixtures + a REAL sandbox and return a SIGNED,
+    FULLY-BOUND report. Self-grading closure: ``signer_approval`` must be a CALIBRATION_GOVERNANCE
+    principal (the author cannot own the grader). Runs, in order: honest detector on the visible set
+    (must PASS), FN-deficient (must be REFUSED), FP-happy (must be REFUSED), honest detector on the blind
+    holdout (must PASS — generalisation). ``accepted`` iff all four hold.
+
+    The receipt binds WHAT was tested (board blocker #8): the honest detector's 4-tuple
+    ``detector_identity``, the visible + holdout CORPUS DIGESTS, the ``trials`` depth, and the PINNED
+    ``image_ref`` (a digest, not a mutable tag). ``sandbox_config_hash`` is computed HERE from the REAL
+    sandbox isolation level + the pinned image (not caller-supplied), so a mismatched environment cannot
+    be laundered into a green receipt. Also refuses if the visible + holdout corpora are IDENTICAL (a
+    holdout that duplicates the visible set proves memorisation, not generalisation)."""
     if not signer_approval.meets(1, domain=AuthorityDomain.CALIBRATION_GOVERNANCE):
         raise AcceptanceError(
             "the acceptance report must be signed by a CALIBRATION_GOVERNANCE principal — the detector "
             "author cannot own the harness that grades their detector (self-grading closure)"
         )
     holdout = blind_holdout_store.load(holdout_key=holdout_key)
+    visible_corpus_digest = _corpus_digest(visible_set)
+    holdout_corpus_digest = _corpus_digest(holdout)
+    if holdout_corpus_digest == visible_corpus_digest:
+        raise AcceptanceError(
+            "the blind holdout is IDENTICAL to the visible corpus — that proves memorisation, not "
+            "generalisation. The holdout must contain fixtures the detector's authors never saw."
+        )
+    # sandbox config bound from the REAL sandbox (isolation level) + the pinned image digest.
+    probe_isolation = make_sandbox().isolation_level
+    sandbox_config_hash = sandbox_config_digest(isolation=probe_isolation.value, image=image_ref)
 
     honest = calibrate(make_sandbox, honest_detector, visible_set, budget, trials=trials)
     fn = calibrate(make_sandbox, fn_deficient_detector, visible_set, budget, trials=trials)
@@ -243,15 +278,15 @@ def run_acceptance_anchor(
     generalises = gen.passed
     accepted = honest_passes and refuses_on_fn and refuses_on_fp and generalises
 
-    visible_coverage = len(visible_set.known_good) + len(visible_set.known_bad)
-    holdout_coverage = len(holdout.known_good) + len(holdout.known_bad)
-
     unsigned = AcceptanceReport(
         accepted=accepted, honest_passes=honest_passes, refuses_on_fn=refuses_on_fn,
         refuses_on_fp=refuses_on_fp, generalises=generalises, short_circuit=False,
-        sandbox_config_hash=sandbox_config_hash, visible_coverage=visible_coverage,
-        holdout_coverage=holdout_coverage, signer_principal=signer_principal, claim=_HONEST_CLAIM,
-        issued_at=now,
+        detector_identity=detector_identity, visible_corpus_digest=visible_corpus_digest,
+        holdout_corpus_digest=holdout_corpus_digest, trials=trials, image_ref=image_ref,
+        sandbox_config_hash=sandbox_config_hash,
+        visible_coverage=len(visible_set.known_good) + len(visible_set.known_bad),
+        holdout_coverage=len(holdout.known_good) + len(holdout.known_bad),
+        signer_principal=signer_principal, claim=_HONEST_CLAIM, issued_at=now,
     )
     return _sign_report(unsigned, signer_key)
 
