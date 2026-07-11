@@ -54,7 +54,8 @@ class LayeringTests(unittest.TestCase):
         # (allowed; engine⊥gate is one-directional). This mirrors 3.2's calibration STORE being
         # engine-free while the calibrate CALL lives engine-side.
         engine_free = ("policy_state.py", "policy_store.py", "snapshot.py", "snapshot_refresh.py",
-                       "authority.py", "calibration_store.py", "candidate_store.py", "admission.py")
+                       "authority.py", "calibration_store.py", "candidate_store.py", "admission.py",
+                       "closure_audit.py")
         gate_dir = _ROOT / "gate"
         hits = [
             f"{name}: {line}"
