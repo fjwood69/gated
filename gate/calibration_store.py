@@ -41,6 +41,17 @@ from gate.authority import Authority, GovernanceApproval  # re-exported below fo
 
 
 @dataclass(frozen=True)
+class OutboxEntry:
+    """One undrained re-calibration trigger: a set changed, its new head is ``oracle_head_after``.
+    The relay fans this out to the ENABLED policies bound to ``set_id`` and enqueues a re-cal each."""
+
+    id: int
+    set_id: str
+    oracle_head_after: str
+    appended_at: float
+
+
+@dataclass(frozen=True)
 class SealedSet:
     """3.5 job-1: a SNAPSHOT-CONSISTENT seal of a calibration set (the fourth-hole fix). The
     ``calibration_set``, the ``oracle_head`` (== ``set_head(set_id)`` at the seal instant), and the
@@ -103,6 +114,18 @@ CREATE TABLE IF NOT EXISTS calibration_chain (
     prev_hash      TEXT NOT NULL,
     record_hash    TEXT NOT NULL
 );
+-- 3.5 job-1: the TRANSACTIONAL OUTBOX (co-located with the fixture store). A re-calibration trigger
+-- is INSERTed in the SAME transaction as the fixture append that necessitates it (see append()'s
+-- outbox path), so a crash can never leave 'fixture appended but re-cal never enqueued' (which would
+-- wedge every bound policy UNATTESTABLE forever). A relay drains it to the lease queue at-least-once;
+-- the queue dedups by job_id, so a relay crash after enqueue / before mark is safe.
+CREATE TABLE IF NOT EXISTS re_calibration_outbox (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    set_id            TEXT NOT NULL,
+    oracle_head_after TEXT NOT NULL,   -- set_head(set_id) computed inside the append transaction
+    appended_at       REAL NOT NULL,
+    drained           INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -157,8 +180,16 @@ class CalibrationStore:
         supersedes: str | None = None,
         reason: str | None = None,
         added_by: str | None = None,
+        outbox_set_id: str | None = None,
     ) -> int:
         """Append a fixture-set change, hash-chained. PRIVILEGED. RUNTIME can never append (1b).
+
+        3.5 job-1 (transactional outbox): when ``outbox_set_id`` is given, the fixture INSERT and a
+        ``re_calibration_outbox`` row (carrying the NEW ``set_head`` computed inside the transaction)
+        are committed ATOMICALLY — so a crash can never leave the set changed but the re-calibration
+        un-enqueued. Board amendment 4: the caller (``commit_fixture_append``) revokes-and-fsyncs the
+        fallback FIRST, THEN calls this; a failure before this commit safely OVER-BLOCKS (the fixture
+        never lands, the fallback is already revoked, the policy stays fail-closed).
 
         Authority model (3.4): admitting a fixture to the ORACLE is high-stakes governance, so the
         ADD ops AND the weakening DEPRECATE op all require a real ``approval`` — ``GovernanceApproval``
@@ -183,6 +214,7 @@ class CalibrationStore:
                 )
         payload_hash = content_digest({"b": payload.hex()}) if payload is not None else None
         with self._lock:
+            conn = self._conn()
             prev_hash = self._head_hash()
             fields = {
                 "op": op.name, "fixture_id": fixture_id, "set_id": set_id,
@@ -192,14 +224,32 @@ class CalibrationStore:
                 "added_at": self._clock(),
             }
             record_hash = chain_hash(prev_hash, _digest_fields(fields))
-            cur = self._conn().execute(
+            insert_args = (
+                fields["op"], fixture_id, set_id, fields["label"], payload, evasion_class,
+                supersedes, reason, added_by, fields["added_at"], prev_hash, record_hash,
+            )
+            insert_sql = (
                 "INSERT INTO calibration_chain "
                 "(op, fixture_id, set_id, label, payload, evasion_class, supersedes, reason,"
-                " added_by, added_at, prev_hash, record_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (fields["op"], fixture_id, set_id, fields["label"], payload, evasion_class,
-                 supersedes, reason, added_by, fields["added_at"], prev_hash, record_hash),
+                " added_by, added_at, prev_hash, record_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
             )
-            return int(cur.lastrowid or 0)
+            if outbox_set_id is None:
+                return int(conn.execute(insert_sql, insert_args).lastrowid or 0)
+            # Atomic {fixture append + outbox enqueue}: both rows commit together or not at all.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                seq = int(conn.execute(insert_sql, insert_args).lastrowid or 0)
+                new_head = self._compute_set_head(outbox_set_id)  # sees the just-inserted row
+                conn.execute(
+                    "INSERT INTO re_calibration_outbox (set_id, oracle_head_after, appended_at,"
+                    " drained) VALUES (?,?,?,0)",
+                    (outbox_set_id, new_head, fields["added_at"]),
+                )
+                conn.execute("COMMIT")
+                return seq
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def _head_hash(self) -> str:
         row = self._conn().execute(
@@ -256,6 +306,13 @@ class CalibrationStore:
         on mismatch. Fails CLOSED on a broken chain."""
         if not self.verify_chain():
             raise ChainIntegrityError("calibration chain failed verification — refusing to read")
+        return self._compute_set_head(set_id)
+
+    def _compute_set_head(self, set_id: str) -> str:
+        """The set-scoped head from the CURRENT chain rows (no verify — callers that need fail-closed
+        verify first; the outbox path calls this INSIDE its own append transaction after writing a
+        valid record). A digest of the sorted (fixture_id, payload_hash) membership — order-independent,
+        changes on any add/supersede/deprecate that alters THIS set."""
         members: dict[str, str] = {}  # fixture_id -> payload_hash, for CURRENT fixtures in set_id
         for row in self._conn().execute("SELECT * FROM calibration_chain ORDER BY seq ASC"):
             if row["set_id"] != set_id and ChangeOp[row["op"]] is not ChangeOp.DEPRECATE_KNOWN_BAD:
@@ -271,8 +328,6 @@ class CalibrationStore:
                 members[fid] = ph
             elif op is ChangeOp.DEPRECATE_KNOWN_BAD:
                 members.pop(fid, None)  # a deprecate may target this set regardless of the row's set_id
-        # The head is a digest of the sorted (fixture_id, payload_hash) membership — order-independent,
-        # changes on any add/supersede/deprecate that alters THIS set.
         return content_digest({"set_id": set_id, "members": sorted(members.items())})
 
     def seal_set(self, set_id: str) -> SealedSet:
@@ -329,6 +384,27 @@ class CalibrationStore:
             fixture_ids=tuple(sorted(members.keys())),
         )
 
+    def undrained_outbox(self) -> tuple[OutboxEntry, ...]:
+        """The re-calibration triggers not yet relayed to the queue (oldest first). The relay fans
+        each out to the ENABLED policies bound to its set and enqueues a re-cal."""
+        rows = self._conn().execute(
+            "SELECT id, set_id, oracle_head_after, appended_at FROM re_calibration_outbox "
+            "WHERE drained=0 ORDER BY id ASC"
+        ).fetchall()
+        return tuple(
+            OutboxEntry(id=int(r["id"]), set_id=r["set_id"], oracle_head_after=r["oracle_head_after"],
+                        appended_at=float(r["appended_at"]))
+            for r in rows
+        )
+
+    def mark_outbox_drained(self, entry_id: int) -> None:
+        """Mark one outbox entry relayed. Called AFTER the enqueue commits (at-least-once): a crash
+        between enqueue and this mark re-delivers the entry, and the queue's job_id dedup makes the
+        re-delivery a no-op."""
+        with self._lock:
+            self._conn().execute(
+                "UPDATE re_calibration_outbox SET drained=1 WHERE id=?", (entry_id,))
+
     def head(self) -> str:
         """The chain head (record_hash of the last append) — an opaque epoch that changes on ANY
         fixture append. The snapshot-refresh CAS pairs this with the policy-store tier head; if
@@ -344,6 +420,7 @@ __all__ = [
     "ChangeOp",
     "CalibrationStore",
     "SealedSet",
+    "OutboxEntry",
     "PrivilegedOperationError",
     "ChainIntegrityError",
 ]

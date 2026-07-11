@@ -289,6 +289,20 @@ class PolicyStore:
             )
             return int(cur.lastrowid or 0)
 
+    def enabled_policies_for_set(self, set_id: str) -> list[tuple[str, str]]:
+        """3.5 job-1: the ENABLED policies whose CURRENT calibration is bound to ``set_id`` — as
+        ``(policy_id, detector_identity)`` pairs. The re-cal relay fans a set's outbox trigger out to
+        exactly these. Fails CLOSED on a broken chain (via current_attestation)."""
+        out: list[tuple[str, str]] = []
+        for row in self._conn().execute(
+            "SELECT DISTINCT policy_id FROM tier_transition_chain"
+        ).fetchall():
+            pid = str(row["policy_id"])
+            att = self.current_attestation(pid)  # (set_id, oracle_head, detector_identity) if ENABLED
+            if att is not None and att[0] == set_id:
+                out.append((pid, att[2]))
+        return out
+
     def policy_head(self, policy_id: str) -> str:
         """3.5 job-1: the POLICY-SPECIFIC evidence head — the record_hash of this policy's latest
         record (enable / transition / re-attest), or GENESIS if it has none. The restore controller's
