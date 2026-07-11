@@ -257,6 +257,12 @@ class CalibrationStore:
         # changes on any add/supersede/deprecate that alters THIS set.
         return content_digest({"set_id": set_id, "members": sorted(members.items())})
 
+    def head(self) -> str:
+        """The chain head (record_hash of the last append) — an opaque epoch that changes on ANY
+        fixture append. The snapshot-refresh CAS pairs this with the policy-store tier head; if
+        either moves during a mint, the refresh retries (close-4)."""
+        return self._head_hash()
+
     def record_count(self) -> int:
         return int(self._conn().execute("SELECT COUNT(*) AS n FROM calibration_chain").fetchone()["n"])
 

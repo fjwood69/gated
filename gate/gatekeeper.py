@@ -94,7 +94,7 @@ def resolve_disposition(
     except _UNREACHABLE:
         return _from_snapshot(
             policy_id, expected_detector_identity=expected_detector_identity,
-            snapshot=snapshot, key=snapshot_key, now=now,
+            snapshot=snapshot, key=snapshot_key, now=now, oracle_head_for=oracle_head_for,
         )
 
     if state is None:
@@ -137,13 +137,17 @@ def _from_snapshot(
     snapshot: CalibrationSnapshot | None,
     key: bytes,
     now: float,
+    oracle_head_for: Callable[[str], str | None],
 ) -> GateDecision:
-    """Store unreachable -> consult the signed snapshot. Fresh + HMAC-valid + IDENTITY-MATCHING ->
-    enforce (an ENABLED check keeps enforcing through a store blip — the engine doesn't need the
-    tier store at enforce time). Missing / tampered / stale snapshot, a detector-identity mismatch,
-    OR a policy ABSENT from an otherwise-valid snapshot -> UNATTESTABLE-block: during an outage,
-    absence is indistinguishable from an incomplete mint, so it fails CLOSED (gap-2). (Only the LIVE
-    path, store reachable + state None, skip-neutrals — there not-configured is provable.)"""
+    """Store unreachable -> consult the signed snapshot. Fresh + HMAC-valid + IDENTITY-MATCHING +
+    ORACLE-CURRENT -> enforce. Missing / tampered / stale snapshot, a detector-identity mismatch, a
+    policy ABSENT from an otherwise-valid snapshot, OR (close-4) an oracle-head DRIFT -> UNATTESTABLE.
+
+    close-4 oracle-freshness: the tier store being unreachable does NOT mean the CALIBRATION store
+    is — if it is reachable, the fallback compares the snapshot's attested ``oracle_head`` for the
+    policy's set to the CURRENT ``set_head`` and blocks on drift, exactly as the live path does. Only
+    when the calibration store is ALSO unreachable (oracle_head_for -> None) does the fallback trust
+    the snapshot's attested head, bounded by the freshness horizon (outage-freshness)."""
     if snapshot is None:
         return _unattestable("tier store unreachable and no signed snapshot available")
     try:
@@ -152,10 +156,8 @@ def _from_snapshot(
         return _unattestable(f"tier store unreachable and snapshot untrusted: {exc}")
     record = attested_record(snapshot, policy_id)
     if record is None:
-        # gap-2: absence from a valid snapshot is INDISTINGUISHABLE from an incomplete mint (the
-        # buggy-refresh fail-open). During an outage we cannot prove "not enabled" vs "dropped by a
-        # partial snapshot", so we fail CLOSED -> block. (The LIVE path, store reachable + state
-        # None, DOES skip-neutral — there the not-configured fact is provable.)
+        # gap-2: absence from a valid snapshot is INDISTINGUISHABLE from an incomplete mint. During
+        # an outage we cannot prove "not enabled" vs "dropped by a partial mint", so we fail CLOSED.
         return _unattestable(
             "store unreachable; policy absent from snapshot — cannot distinguish not-enabled from "
             "an incomplete mint, failing closed"
@@ -165,6 +167,13 @@ def _from_snapshot(
             f"store unreachable; snapshot attests detector {record.detector_identity!r} but "
             f"{expected_detector_identity!r} is about to run — refusing to enforce an "
             "un-calibrated detector"
+        )
+    # close-4: oracle-head drift on the fallback path (calibration store still reachable).
+    current_head = oracle_head_for(record.set_id)
+    if current_head is not None and current_head != record.oracle_head:
+        return _unattestable(
+            f"store unreachable; snapshot oracle set {record.set_id!r} drifted since mint "
+            f"({record.oracle_head[:12]}.. -> {current_head[:12]}..) — re-calibration pending"
         )
     return GateDecision(
         Disposition.RUN_ENFORCING, PolicyState.ENABLED,

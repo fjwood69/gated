@@ -50,7 +50,11 @@ class SnapshotError(RuntimeError):
 @dataclass(frozen=True)
 class AttestationRecord:
     """One ENABLED policy's attestation tuple, as of the last known-good state. Identity-bearing:
-    the consumer verifies ``detector_identity`` matches the detector about to enforce."""
+    the consumer verifies ``detector_identity`` matches the detector about to enforce, AND (close-4)
+    that the calibration SET is unchanged — ``oracle_head`` is the ``set_head(set_id)`` at mint, so
+    the FALLBACK path detects a fixture-append drift (when the calibration store is still reachable)
+    exactly as the live path does. Two freshness dimensions: outage (``valid_until``) + oracle
+    (per-set ``oracle_head``)."""
 
     policy_id: str
     detector_identity: str
@@ -58,6 +62,8 @@ class AttestationRecord:
     fixture_set_version: str
     tier_chain_head: str
     backend: str
+    set_id: str = "default"
+    oracle_head: str = ""
 
 
 @dataclass(frozen=True)
@@ -80,6 +86,7 @@ class CalibrationSnapshot:
                 "calibration_result_ref": r.calibration_result_ref,
                 "fixture_set_version": r.fixture_set_version,
                 "tier_chain_head": r.tier_chain_head, "backend": r.backend,
+                "set_id": r.set_id, "oracle_head": r.oracle_head,
             }
             for pid, r in sorted(self.records.items())
         }
@@ -135,6 +142,35 @@ def verify_snapshot(snapshot: CalibrationSnapshot, *, key: bytes, now: float) ->
         )
 
 
+def to_json(snapshot: CalibrationSnapshot) -> str:
+    """Serialise a snapshot for on-disk persistence (the refresh job writes this atomically)."""
+    import json
+
+    payload = snapshot._payload()
+    payload["mac"] = snapshot.mac
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def from_json(data: str) -> CalibrationSnapshot:
+    """Load a persisted snapshot. The MAC is re-verified by ``verify_snapshot`` at use — loading
+    does not trust it."""
+    import json
+
+    obj = json.loads(data)
+    records = {
+        pid: AttestationRecord(
+            policy_id=r["policy_id"], detector_identity=r["detector_identity"],
+            calibration_result_ref=r["calibration_result_ref"],
+            fixture_set_version=r["fixture_set_version"], tier_chain_head=r["tier_chain_head"],
+            backend=r["backend"], set_id=r.get("set_id", "default"),
+            oracle_head=r.get("oracle_head", ""),
+        )
+        for pid, r in obj["records"].items()
+    }
+    return CalibrationSnapshot(records=records, issued_at=obj["issued_at"],
+                              valid_until=obj["valid_until"], mac=obj["mac"])
+
+
 def attested_record(snapshot: CalibrationSnapshot, policy_id: str) -> AttestationRecord | None:
     """The attestation for a policy from an (already-verified) snapshot, or None if the policy is
     not ENABLED as of it. Caller MUST verify first, then compare ``detector_identity``."""
@@ -148,4 +184,6 @@ __all__ = [
     "issue_snapshot",
     "verify_snapshot",
     "attested_record",
+    "to_json",
+    "from_json",
 ]
