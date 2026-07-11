@@ -75,6 +75,17 @@ class ChangeOp(IntEnum):
     DEPRECATE_KNOWN_BAD = 3    # exclude a known-bad from the head; it STAYS in the chain
 
 
+class AdmissionCapability:
+    """Merge-ready #1: an unforgeable-by-convention capability proving a fixture ADD is going through
+    the admission gate. ``append`` REFUSES an ADD op without it, so there is no low-level path that
+    adds a fixture while skipping the validated, dual-controlled, safe (revoke+outbox) admission — the
+    bypass is removed, not merely a safe path added alongside it. Constructed ONLY by
+    ``gate.admission.admit()`` (enforced by the structural no-bypass test); any other construction in
+    the gate tree fails that test. Tests seed via the same capability (they are trusted)."""
+
+    __slots__ = ()
+
+
 # Ops that require REAL dual control — a GovernanceApproval with two distinct principals. As of 3.4
 # this is every op that admits a fixture to the oracle (both ADDs) plus the weakening DEPRECATE:
 # admitting is high-stakes (a known-bad blocks merges; a known-good masks a true positive). This is
@@ -181,8 +192,13 @@ class CalibrationStore:
         reason: str | None = None,
         added_by: str | None = None,
         outbox_set_id: str | None = None,
+        admission: AdmissionCapability | None = None,
     ) -> int:
         """Append a fixture-set change, hash-chained. PRIVILEGED. RUNTIME can never append (1b).
+
+        Merge-ready #1: the two ADD ops additionally REQUIRE an ``AdmissionCapability`` — there is no
+        low-level path that adds a fixture while skipping the admission gate's validation + safe append.
+        Only ``gate.admission.admit()`` holds the capability; a direct ADD without it is refused.
 
         3.5 job-1 (transactional outbox): when ``outbox_set_id`` is given, the fixture INSERT and a
         ``re_calibration_outbox`` row (carrying the NEW ``set_head`` computed inside the transaction)
@@ -198,6 +214,13 @@ class CalibrationStore:
         fixture store: a known-bad can block merges, a known-good can mask a true positive — both
         earn dual control. SUPERSEDE (a correction of an existing known-good) keeps the ENUM for now.
         Principals are recorded in ``added_by`` (schema/digest unchanged). No update/delete method."""
+        if op in (ChangeOp.ADD_KNOWN_BAD, ChangeOp.ADD_KNOWN_GOOD) and not isinstance(
+            admission, AdmissionCapability
+        ):
+            raise PrivilegedOperationError(
+                f"{op.name} may only be appended through the admission gate (gate.admission.admit) — "
+                "a fixture cannot be added on the low-level path, skipping validation + safe append"
+            )
         if op in _DUAL_APPROVAL_OPS:
             if approval is None or not approval.meets(2):
                 raise PrivilegedOperationError(
@@ -418,6 +441,7 @@ class CalibrationStore:
 __all__ = [
     "Authority",
     "ChangeOp",
+    "AdmissionCapability",
     "CalibrationStore",
     "SealedSet",
     "OutboxEntry",

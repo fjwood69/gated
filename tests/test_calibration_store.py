@@ -15,6 +15,7 @@ from pathlib import Path
 from core.calibration import FixtureLabel
 from gate.authority import Authority, GovernanceApproval
 from gate.calibration_store import (
+    AdmissionCapability,
     CalibrationStore,
     ChainIntegrityError,
     ChangeOp,
@@ -36,12 +37,15 @@ def _dual() -> GovernanceApproval:
     return _appr("gov1", "gov2")
 
 
+_ADMIT_CAP = AdmissionCapability()
+
+
 class LoadAndReplayTests(unittest.TestCase):
     def test_add_and_load_current_set(self) -> None:
         s = _store()
-        s.append(ChangeOp.ADD_KNOWN_BAD, approval=_dual(), fixture_id="b1",
+        s.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_dual(), fixture_id="b1",
                  label=FixtureLabel.KNOWN_BAD, payload=b"bad\n")
-        s.append(ChangeOp.ADD_KNOWN_GOOD, approval=_dual(), fixture_id="g1",
+        s.append(ChangeOp.ADD_KNOWN_GOOD, admission=_ADMIT_CAP, approval=_dual(), fixture_id="g1",
                  label=FixtureLabel.KNOWN_GOOD, payload=b"good\n")
         cset = s.load_current_set()
         self.assertEqual({f.fixture_id for f in cset.known_bad}, {"b1"})
@@ -50,9 +54,9 @@ class LoadAndReplayTests(unittest.TestCase):
 
     def test_supersede_known_good_replaces_in_head(self) -> None:
         s = _store()
-        s.append(ChangeOp.ADD_KNOWN_BAD, approval=_dual(), fixture_id="b1",
+        s.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_dual(), fixture_id="b1",
                  label=FixtureLabel.KNOWN_BAD, payload=b"bad\n")
-        s.append(ChangeOp.ADD_KNOWN_GOOD, approval=_dual(), fixture_id="g1",
+        s.append(ChangeOp.ADD_KNOWN_GOOD, admission=_ADMIT_CAP, approval=_dual(), fixture_id="g1",
                  label=FixtureLabel.KNOWN_GOOD, payload=b"v1\n")
         # SUPERSEDE keeps the single-GOVERNANCE enum model for now.
         s.append(ChangeOp.SUPERSEDE_KNOWN_GOOD, authority=Authority.GOVERNANCE, fixture_id="g2",
@@ -67,12 +71,12 @@ class AuthorityTests(unittest.TestCase):
         # principal / a bare RUNTIME token are all refused.
         s = _store()
         with self.assertRaises(PrivilegedOperationError):  # no approval
-            s.append(ChangeOp.ADD_KNOWN_BAD, authority=Authority.RUNTIME, fixture_id="b1",
+            s.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, authority=Authority.RUNTIME, fixture_id="b1",
                      label=FixtureLabel.KNOWN_BAD, payload=b"bad\n")
         with self.assertRaises(PrivilegedOperationError):  # one principal is not dual
-            s.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("gov1"), fixture_id="b1",
+            s.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("gov1"), fixture_id="b1",
                      label=FixtureLabel.KNOWN_BAD, payload=b"bad\n")
-        s.append(ChangeOp.ADD_KNOWN_BAD, approval=_dual(), fixture_id="b1",
+        s.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_dual(), fixture_id="b1",
                  label=FixtureLabel.KNOWN_BAD, payload=b"bad\n")  # two distinct -> ok
         self.assertEqual({f.fixture_id for f in s.load_current_set().known_bad}, {"b1"})
 
@@ -80,7 +84,7 @@ class AuthorityTests(unittest.TestCase):
         # 1e: DEPRECATE (the weakening op) needs a real GovernanceApproval with TWO DISTINCT
         # principals — the enum (even GOVERNANCE_DUAL) is not proof; a single principal is refused.
         s = _store()
-        s.append(ChangeOp.ADD_KNOWN_BAD, approval=_dual(), fixture_id="b1",
+        s.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_dual(), fixture_id="b1",
                  label=FixtureLabel.KNOWN_BAD, payload=b"bad\n")
         with self.assertRaises(PrivilegedOperationError):  # enum no longer suffices
             s.append(ChangeOp.DEPRECATE_KNOWN_BAD, authority=Authority.GOVERNANCE_DUAL,
@@ -97,9 +101,9 @@ class AppendOnlyTests(unittest.TestCase):
     def test_deprecate_excludes_from_head_but_stays_in_chain(self) -> None:
         # DELETES FORBIDDEN: deprecation removes from the ACTIVE set but the record STAYS.
         s = _store()
-        s.append(ChangeOp.ADD_KNOWN_BAD, approval=_dual(), fixture_id="b1",
+        s.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_dual(), fixture_id="b1",
                  label=FixtureLabel.KNOWN_BAD, payload=b"b1\n")
-        s.append(ChangeOp.ADD_KNOWN_BAD, approval=_dual(), fixture_id="b2",
+        s.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_dual(), fixture_id="b2",
                  label=FixtureLabel.KNOWN_BAD, payload=b"b2\n")
         s.append(ChangeOp.DEPRECATE_KNOWN_BAD, approval=_dual(),
                  fixture_id="b1", reason="obsolete")
@@ -117,9 +121,9 @@ class AppendOnlyTests(unittest.TestCase):
 class TamperEvidenceTests(unittest.TestCase):
     def test_edit_detected_and_load_fails_closed(self) -> None:
         s = _store()
-        s.append(ChangeOp.ADD_KNOWN_BAD, approval=_dual(), fixture_id="b1",
+        s.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_dual(), fixture_id="b1",
                  label=FixtureLabel.KNOWN_BAD, payload=b"bad\n")
-        s.append(ChangeOp.ADD_KNOWN_GOOD, approval=_dual(), fixture_id="g1",
+        s.append(ChangeOp.ADD_KNOWN_GOOD, admission=_ADMIT_CAP, approval=_dual(), fixture_id="g1",
                  label=FixtureLabel.KNOWN_GOOD, payload=b"good\n")
         self.assertTrue(s.verify_chain())
         s._conn().execute("UPDATE calibration_chain SET payload=? WHERE seq=1", (b"weakened\n",))

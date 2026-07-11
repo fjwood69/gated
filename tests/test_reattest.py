@@ -20,6 +20,7 @@ from gate.policy_store import (
     IllegalTransitionError,
     PrivilegedOperationError,
     PolicyStore,
+    ReAttestGrant,
     _digest_fields,
 )
 
@@ -45,6 +46,9 @@ def _enable(s: PolicyStore, pid: str = "p1", *, det: str = "det-1", head: str = 
     return ref
 
 
+_GRANT = ReAttestGrant()
+
+
 class ReAttestPrimitiveTests(unittest.TestCase):
     def test_reattest_advances_evidence_state_unchanged(self) -> None:
         s = _store()
@@ -53,7 +57,7 @@ class ReAttestPrimitiveTests(unittest.TestCase):
         # fixture appended -> new head v2; async re-cal PASS -> new persisted pass -> re-attest.
         s.record_calibration_pass("cal-v2", policy_id="p1", pinned_set_version="v2",
                                   detector_identity="det-1", set_id="X")
-        s.reattest("p1", calibration_result_ref="cal-v2", pinned_set_version="v2",
+        s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", pinned_set_version="v2",
                    detector_identity="det-1", job_id="job-abc", nonce="n1")
         self.assertEqual(s.current_attestation("p1"), ("X", "v2", "det-1"))  # evidence moved forward
         self.assertIs(s.current_state("p1"), PolicyState.ENABLED)            # tier UNCHANGED
@@ -72,14 +76,14 @@ class ReAttestPrimitiveTests(unittest.TestCase):
         s = _store()
         s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="a"))
         with self.assertRaises(IllegalTransitionError):
-            s.reattest("p1", calibration_result_ref="x", pinned_set_version="v1",
+            s.reattest("p1", grant=_GRANT, calibration_result_ref="x", pinned_set_version="v1",
                        detector_identity="det-1", job_id="j", nonce="n")
 
     def test_reattest_forged_ref_rejected_gap1(self) -> None:
         s = _store()
         _enable(s)
         with self.assertRaises(PrivilegedOperationError):
-            s.reattest("p1", calibration_result_ref="FORGED", pinned_set_version="v1",
+            s.reattest("p1", grant=_GRANT, calibration_result_ref="FORGED", pinned_set_version="v1",
                        detector_identity="det-1", job_id="j", nonce="n")
 
     def test_reattest_mismatched_identity_rejected(self) -> None:
@@ -89,7 +93,7 @@ class ReAttestPrimitiveTests(unittest.TestCase):
                                   detector_identity="det-1", set_id="X")
         # the pass is for det-1; a re-attest claiming det-EVIL must not resolve it.
         with self.assertRaises(PrivilegedOperationError):
-            s.reattest("p1", calibration_result_ref="cal-v2", pinned_set_version="v2",
+            s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", pinned_set_version="v2",
                        detector_identity="det-EVIL", job_id="j", nonce="n")
 
     def test_policy_head_is_policy_scoped(self) -> None:
@@ -100,7 +104,7 @@ class ReAttestPrimitiveTests(unittest.TestCase):
         # an append to p2 must NOT move p1's evidence head (avoids cross-policy CAS thrash).
         s.record_calibration_pass("cal-p2-v2", policy_id="p2", pinned_set_version="v2",
                                   detector_identity="det-1", set_id="X")
-        s.reattest("p2", calibration_result_ref="cal-p2-v2", pinned_set_version="v2",
+        s.reattest("p2", grant=_GRANT, calibration_result_ref="cal-p2-v2", pinned_set_version="v2",
                    detector_identity="det-1", job_id="j", nonce="n")
         self.assertEqual(s.policy_head("p1"), h1)              # untouched
         self.assertNotEqual(s.policy_head("p2"), h1)

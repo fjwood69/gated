@@ -18,6 +18,7 @@ from core.ed25519 import public_key
 from gate.attestation import verify_measurement
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
+from gate.calibration_store import AdmissionCapability
 from gate.recalibration import deterministic_job_id, run_recalibration
 from sandbox.noop import NoOpSandbox
 
@@ -26,6 +27,9 @@ _SEED = bytes(range(32))
 _PUB = public_key(_SEED)
 _FAIL = Verdict(VerdictType.FAIL, Reason.EGRESS_ONE)
 _PASS = Verdict(VerdictType.PASS, Reason.EGRESS_GE_2)
+
+
+_ADMIT_CAP = AdmissionCapability()
 
 
 class _HermeticNoOp(NoOpSandbox):
@@ -57,9 +61,9 @@ def _appr(*p: str, op: str) -> GovernanceApproval:
 
 def _store_with_set() -> CalibrationStore:
     c = CalibrationStore(Path(tempfile.mkdtemp(prefix="mv-recal-")) / "c.db")
-    c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="1"), fixture_id="b1",
+    c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="1"), fixture_id="b1",
              set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad")
-    c.append(ChangeOp.ADD_KNOWN_GOOD, approval=_appr("g1", "g2", op="2"), fixture_id="g1",
+    c.append(ChangeOp.ADD_KNOWN_GOOD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="2"), fixture_id="g1",
              set_id="X", label=FixtureLabel.KNOWN_GOOD, payload=b"good")
     return c
 
@@ -92,7 +96,7 @@ class RunnerOutcomeTests(unittest.TestCase):
 
     def test_inadequate_set_is_ERROR(self) -> None:
         c = CalibrationStore(Path(tempfile.mkdtemp(prefix="mv-recal-i-")) / "c.db")
-        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="1"), fixture_id="b1",
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="1"), fixture_id="b1",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad")  # no known-good -> inadequate
         att = _run(c, _ScriptedDetector([_FAIL] * 3))
         self.assertIs(att.outcome, VerdictType.ERROR)

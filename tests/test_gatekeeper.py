@@ -30,7 +30,7 @@ from core import (
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from core.identity import DetectorManifest, identity_for
 from gate.authority import GovernanceApproval
-from gate.calibration_store import CalibrationStore, ChangeOp
+from gate.calibration_store import AdmissionCapability, CalibrationStore, ChangeOp
 from gate.gatekeeper import ratify_enable, resolve_disposition, run_calibration
 from gate.policy_state import Disposition, PolicyState
 from gate.policy_store import PolicyStore
@@ -41,6 +41,9 @@ _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
 _KEY = b"gate-governance-key"
 _FAIL = Verdict(VerdictType.FAIL, Reason.EGRESS_ONE)
 _PASS = Verdict(VerdictType.PASS, Reason.EGRESS_GE_2)
+
+
+_ADMIT_CAP = AdmissionCapability()
 
 
 class _HermeticNoOp(NoOpSandbox):
@@ -260,7 +263,7 @@ class Close3ScopedOracleTests(unittest.TestCase):
                                   operation_id=f"op-{fid}")
         op = ChangeOp.ADD_KNOWN_BAD if bad else ChangeOp.ADD_KNOWN_GOOD
         label = FixtureLabel.KNOWN_BAD if bad else FixtureLabel.KNOWN_GOOD
-        cal.append(op, approval=appr, fixture_id=fid, set_id=set_id, label=label,
+        cal.append(op, admission=_ADMIT_CAP, approval=appr, fixture_id=fid, set_id=set_id, label=label,
                    payload=fid.encode())
 
     def test_append_to_set_X_blocks_bound_policies_set_Y_unaffected(self) -> None:

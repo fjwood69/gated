@@ -37,7 +37,12 @@ from gate.attestation import (
 )
 from gate.attestation_store import MeasurementAttestationStore
 from gate.policy_state import PolicyState
-from gate.policy_store import PolicyStore, ReAttestConflict
+from gate.policy_store import PolicyStore, ReAttestConflict, ReAttestGrant
+
+# The ONE legitimate construction of the re-attest capability (merge-ready #1). The structural
+# no-bypass test asserts no other gate module constructs ReAttestGrant, so a verified restore is the
+# sole path that advances a policy's enforcement evidence.
+_REATTEST_GRANT = ReAttestGrant()
 
 
 class ReAttestCapability:
@@ -65,7 +70,7 @@ class ReAttestCapability:
     def reattest(self, policy_id: str, *, calibration_result_ref: str, pinned_set_version: str,
                  detector_identity: str, job_id: str, nonce: str, expect_policy_head: str) -> int:
         return self._store.reattest(
-            policy_id, calibration_result_ref=calibration_result_ref,
+            policy_id, grant=_REATTEST_GRANT, calibration_result_ref=calibration_result_ref,
             pinned_set_version=pinned_set_version, detector_identity=detector_identity,
             job_id=job_id, nonce=nonce, expect_policy_head=expect_policy_head)
 

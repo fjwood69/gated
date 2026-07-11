@@ -60,6 +60,17 @@ class ReAttestConflict(RuntimeError):
     human may have just demoted)."""
 
 
+class ReAttestGrant:
+    """Merge-ready #1: an unforgeable-by-convention capability proving a re-attestation is going
+    through the RestoreController's full verification (issuer allowlist + Ed25519 signature + clean-PASS
+    + identity-trusted + oracle/policy-head CAS). ``reattest`` REFUSES without it, so there is no
+    low-level path that advances a policy's enforcement evidence while skipping that verification — the
+    bypass is removed. Constructed ONLY by ``gate.restore_controller`` (enforced by the structural
+    no-bypass test)."""
+
+    __slots__ = ()
+
+
 def _required_principals(src: PolicyState, dst: PolicyState) -> int:
     """Distinct governance principals a transition demands: 2 for weakening (dual control), else 1."""
     return 2 if is_weakening(src, dst) else 1
@@ -220,6 +231,7 @@ class PolicyStore:
         self,
         policy_id: str,
         *,
+        grant: ReAttestGrant,
         calibration_result_ref: str,
         pinned_set_version: str,
         detector_identity: str,
@@ -242,7 +254,16 @@ class PolicyStore:
         Carries NO governance principal (principals=[]) — a re-attest is measurement-driven evidence, not a
         governance act; ``job_id``/``nonce`` record the signed measurement's provenance + idempotency.
         gap-1 still holds: the ref must resolve to a persisted matching ``calibration_pass`` (a fabricated
-        ref cannot re-attest, exactly as it cannot enable). Requires the policy to currently be ENABLED."""
+        ref cannot re-attest, exactly as it cannot enable). Requires the policy to currently be ENABLED.
+
+        Merge-ready #1: a ``ReAttestGrant`` is REQUIRED — the only holder is the RestoreController, which
+        constructs it after full verification, so there is no low-level path that advances evidence while
+        skipping that verification."""
+        if not isinstance(grant, ReAttestGrant):
+            raise PrivilegedOperationError(
+                "re-attestation may only proceed through the RestoreController (a ReAttestGrant is "
+                "required) — the low-level path that skips measurement verification is removed"
+            )
         with self._lock:
             prior = self._current_state_unlocked(policy_id)
             if prior is not PolicyState.ENABLED:
@@ -468,4 +489,5 @@ __all__ = [
     "IllegalTransitionError",
     "ChainIntegrityError",
     "ReAttestConflict",
+    "ReAttestGrant",
 ]

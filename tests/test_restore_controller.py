@@ -19,6 +19,7 @@ from core.ed25519 import public_key
 from gate.attestation_store import MeasurementAttestationStore
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
+from gate.calibration_store import AdmissionCapability
 from gate.gatekeeper import resolve_disposition
 from gate.policy_state import Disposition, PolicyState
 from gate.policy_store import PolicyStore
@@ -37,6 +38,9 @@ _ISSUER = "cal-gov-1"
 _DET = "det-1"
 _FAIL = Verdict(VerdictType.FAIL, Reason.EGRESS_ONE)
 _PASS = Verdict(VerdictType.PASS, Reason.EGRESS_GE_2)
+
+
+_ADMIT_CAP = AdmissionCapability()
 
 
 class _HermeticNoOp(NoOpSandbox):
@@ -68,9 +72,9 @@ def _appr(*p: str, op: str) -> GovernanceApproval:
 
 def _cal_store() -> CalibrationStore:
     c = CalibrationStore(Path(tempfile.mkdtemp(prefix="mv-rc-cal-")) / "c.db")
-    c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="1"), fixture_id="b1",
+    c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="1"), fixture_id="b1",
              set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad1")
-    c.append(ChangeOp.ADD_KNOWN_GOOD, approval=_appr("g1", "g2", op="2"), fixture_id="g1",
+    c.append(ChangeOp.ADD_KNOWN_GOOD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="2"), fixture_id="g1",
              set_id="X", label=FixtureLabel.KNOWN_GOOD, payload=b"good1")
     return c
 
@@ -116,7 +120,7 @@ class RestoreControllerTests(unittest.TestCase):
                                           oracle_head_for=c.set_head).disposition,
                       Disposition.RUN_ENFORCING)
         # a security engineer appends a new known-bad -> set_head moves -> live UNATTESTABLE (blocking).
-        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
         self.assertIs(resolve_disposition("p1", expected_detector_identity=_DET, store=s,
                                           snapshot=None, snapshot_key=b"k", now=1.0,
@@ -138,7 +142,7 @@ class RestoreControllerTests(unittest.TestCase):
     def test_fail_is_noop_on_governance_state(self) -> None:
         c = _cal_store()
         s = _policy_store_enabled(c.set_head("X"))
-        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
         head_before = s.policy_head("p1")
         # re-cal MISSES the new known-bad -> FAIL.
@@ -174,7 +178,7 @@ class RestoreControllerTests(unittest.TestCase):
         s = _policy_store_enabled(c.set_head("X"))
         att = _run(c, [_FAIL] * 3 + [_PASS] * 3)  # PASS bound to the CURRENT head
         # the set drifts AGAIN after the measurement, before restore.
-        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="drift2"), fixture_id="b9",
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift2"), fixture_id="b9",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad9")
         self.assertIs(_controller(s, c).attempt_restore(att).result, RestoreResult.REFUSED_ORACLE_STALE)
 
@@ -189,7 +193,7 @@ class RestoreControllerTests(unittest.TestCase):
         # board blocker #3: the re-attest ref must bind a DURABLE, immutable, signed attestation.
         c = _cal_store()
         s = _policy_store_enabled(c.set_head("X"))
-        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
         att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3)
         store = _att_store()
@@ -219,7 +223,7 @@ class RestoreControllerTests(unittest.TestCase):
                      calibration_result_ref="cal-p2", pinned_set_version=c.set_head("X"),
                      detector_identity=_DET)
         self.assertNotEqual(s.policy_head("p1"), s.head_hash())  # p1's head != global head
-        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
         att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3)
         outcome = _controller(s, c).attempt_restore(att)

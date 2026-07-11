@@ -34,13 +34,18 @@ from typing import Callable
 from core import VerdictType
 from core.calibration import FixtureLabel
 from gate.authority import GovernanceApproval
-from gate.calibration_store import CalibrationStore, ChangeOp
+from gate.calibration_store import AdmissionCapability, CalibrationStore, ChangeOp
 from gate.candidate_store import Candidate, CandidateKind, CandidateSource, CandidateStore
 from gate.snapshot_refresh import commit_fixture_append
 
 # The distinct-principal count admitting a fixture requires. Admitting is high-stakes (a known-bad
 # can block merges; a known-good can mask a true positive) — dual control, not a low-friction add.
 _REQUIRED_PRINCIPALS = 2
+
+# The ONE legitimate construction of the fixture-ADD capability (merge-ready #1). The structural
+# no-bypass test asserts no other gate module constructs AdmissionCapability, so admit() is the sole
+# path a fixture can enter the oracle.
+_ADMISSION_CAPABILITY = AdmissionCapability()
 
 
 class AdmissionError(PermissionError):
@@ -152,6 +157,7 @@ def admit(
             reason=provenance,
             set_id=set_id,
             outbox_set_id=set_id,  # atomic re-calibration trigger for the policies bound to this set
+            admission=_ADMISSION_CAPABILITY,  # the sole capability path a fixture enters the oracle
         )
 
     # revoke-and-fsync the fallback FIRST, then the atomic {append + outbox} — board amendment 4.

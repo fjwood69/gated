@@ -18,9 +18,10 @@ from core.ed25519 import public_key
 from gate.attestation_store import MeasurementAttestationStore
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
+from gate.calibration_store import AdmissionCapability
 from gate.gatekeeper import resolve_disposition
 from gate.policy_state import Disposition, PolicyState
-from gate.policy_store import PolicyStore
+from gate.policy_store import PolicyStore, ReAttestGrant
 from gate.recal_metrics import zombies, zombies_over_threshold
 from gate.recal_queue import JobStatus, RecalQueue
 from gate.recal_relay import relay_outbox
@@ -36,6 +37,12 @@ _ISSUER = "cal-gov-1"
 _DET = "det-1"
 _FAIL = Verdict(VerdictType.FAIL, Reason.EGRESS_ONE)
 _PASS = Verdict(VerdictType.PASS, Reason.EGRESS_GE_2)
+
+
+_ADMIT_CAP = AdmissionCapability()
+
+
+_GRANT = ReAttestGrant()
 
 
 class _HermeticNoOp(NoOpSandbox):
@@ -63,9 +70,9 @@ def _appr(*p: str, op: str) -> GovernanceApproval:
 
 def _cal() -> CalibrationStore:
     c = CalibrationStore(Path(tempfile.mkdtemp(prefix="mv-orch-cal-")) / "c.db")
-    c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="1"), fixture_id="b1",
+    c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="1"), fixture_id="b1",
              set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad1")
-    c.append(ChangeOp.ADD_KNOWN_GOOD, approval=_appr("g1", "g2", op="2"), fixture_id="g1",
+    c.append(ChangeOp.ADD_KNOWN_GOOD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="2"), fixture_id="g1",
              set_id="X", label=FixtureLabel.KNOWN_GOOD, payload=b"good1")
     return c
 
@@ -85,7 +92,7 @@ class OutboxAtomicityTests(unittest.TestCase):
     def test_append_with_outbox_is_atomic_and_records_new_head(self) -> None:
         c = _cal()
         n_before = c.record_count()
-        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="d"), fixture_id="b2",
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="d"), fixture_id="b2",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2", outbox_set_id="X")
         self.assertEqual(c.record_count(), n_before + 1)  # fixture landed
         outbox = c.undrained_outbox()
@@ -103,7 +110,7 @@ class OutboxAtomicityTests(unittest.TestCase):
 
         def append() -> int:
             order.append("append")
-            return c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="d"),
+            return c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="d"),
                             fixture_id="b2", set_id="X", label=FixtureLabel.KNOWN_BAD,
                             payload=b"bad2", outbox_set_id="X")
         commit_fixture_append(invalidate=invalidate, append=append)
@@ -134,7 +141,7 @@ class RelayTests(unittest.TestCase):
         c = _cal()
         s = _pol(c.set_head("X"))
         q = RecalQueue(Path(tempfile.mkdtemp(prefix="mv-orch-q-")) / "q.db")
-        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="d"), fixture_id="b2",
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="d"), fixture_id="b2",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2", outbox_set_id="X")
         self.assertEqual(relay_outbox(calibration_store=c, policy_store=s, queue=q, now=10.0), 1)
         self.assertEqual(c.undrained_outbox(), ())          # drained
@@ -147,9 +154,9 @@ class RelayTests(unittest.TestCase):
         c = _cal()
         s = _pol(c.set_head("X"))
         q = RecalQueue(Path(tempfile.mkdtemp(prefix="mv-orch-q2-")) / "q.db")
-        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="d1"), fixture_id="b2",
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="d1"), fixture_id="b2",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2", outbox_set_id="X")
-        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="d2"), fixture_id="b3",
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="d2"), fixture_id="b3",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad3", outbox_set_id="X")
         # two outbox entries, but both target the CURRENT head -> one job (dedup).
         relay_outbox(calibration_store=c, policy_store=s, queue=q, now=10.0)
@@ -178,7 +185,7 @@ class FullLoopTests(unittest.TestCase):
         # a fixture append via the transactional path: fallback revoked, fixture+outbox atomic.
         commit_fixture_append(
             invalidate=lambda: None,
-            append=lambda: c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="d"),
+            append=lambda: c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="d"),
                                     fixture_id="b2", set_id="X", label=FixtureLabel.KNOWN_BAD,
                                     payload=b"bad2", outbox_set_id="X"))
         self.assertIs(enforcing(), Disposition.BLOCK_ACTION_REQUIRED)  # transiently UNATTESTABLE
@@ -203,7 +210,7 @@ class ZombieMetricTests(unittest.TestCase):
         c = _cal()
         s = _pol(c.set_head("X"))
         q = RecalQueue(Path(tempfile.mkdtemp(prefix="mv-orch-z-")) / "q.db")
-        c.append(ChangeOp.ADD_KNOWN_BAD, approval=_appr("g1", "g2", op="d"), fixture_id="b2",
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="d"), fixture_id="b2",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2", outbox_set_id="X")
         relay_outbox(calibration_store=c, policy_store=s, queue=q, now=0.0)
         return c, s, q
@@ -233,7 +240,7 @@ class ZombieMetricTests(unittest.TestCase):
         # re-attest p1 back to the current head, and mark the job done.
         s.record_calibration_pass("cal-1", policy_id="p1", pinned_set_version=c.set_head("X"),
                                   detector_identity=_DET, set_id="X")
-        s.reattest("p1", calibration_result_ref="cal-1", pinned_set_version=c.set_head("X"),
+        s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-1", pinned_set_version=c.set_head("X"),
                    detector_identity=_DET, job_id="j", nonce="n")
         job = q.lease(lease_token="w1", visibility_timeout=60.0, now=0.0)
         assert job is not None
