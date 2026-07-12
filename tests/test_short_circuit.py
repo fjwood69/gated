@@ -20,6 +20,7 @@ from core import (
     ArtifactSpec,
     Command,
     Fixtures,
+    IsolationLevel,
     Reason,
     ResourceBudget,
     Verdict,
@@ -85,6 +86,8 @@ class _RecordingSandbox:
     created. The short-circuit BREAKS out of the trial loop; this catches a teardown
     that was loop-scoped rather than iteration-scoped (a leaked container on the fast
     path). ``session()`` mirrors BaseSandbox's contract: teardown in ``finally``."""
+
+    isolation_level: IsolationLevel = IsolationLevel.HERMETIC  # required Sandbox coordinate (#3 identity)
 
     def __init__(self, events: list[str]) -> None:
         self._events = events
