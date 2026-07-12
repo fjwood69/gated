@@ -54,6 +54,11 @@ from engine.runner import ExecutionIdentity, TrialReport, run_check
 # OFF for calibration, so all TRIALS run and the full distribution (flaky vs consistent) is seen.
 DEFAULT_CALIBRATION_TRIALS = 5
 
+# #4 (Option B): the entry points take a detector by NAME + an INJECTED resolver, never a detector
+# object — the only way an id becomes runnable code is a TRUSTED registry (gate-side). Defined here,
+# engine-side, as a plain Callable so the engine need not import the gate (engine⊥gate preserved).
+DetectorResolver = Callable[[str], RuntimeAssertion]
+
 
 class CalibrationConfigError(RuntimeError):
     """The calibration harness is mis-configured (e.g. a non-HERMETIC sandbox). Engine-side (the
@@ -202,16 +207,23 @@ def _materialised(fixture: Fixture) -> Iterator[ArtifactSpec]:
 
 def calibrate(
     make_sandbox: Callable[[], Sandbox],
-    detector: RuntimeAssertion,
+    detector_id: str,
+    resolve: DetectorResolver,
     calibration_set: CalibrationSet,
     budget: ResourceBudget,
     *,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
     pin_image: Callable[[str], str] | None = None,
 ) -> CalibrationResult:
-    """Run ``detector`` against every fixture in ``calibration_set`` and return whether it earns
-    enablement. Two-sided (FR3.1 + marker-1): refuse on any missed known-bad OR false-positived
-    known-good; also refuse on non-determinism (flaky-on-ground-truth) or harness ERROR.
+    """Resolve ``detector_id`` through the injected trusted ``resolve`` and run that detector against
+    every fixture in ``calibration_set``, returning whether it earns enablement. Two-sided (FR3.1 +
+    marker-1): refuse on any missed known-bad OR false-positived known-good; also refuse on
+    non-determinism (flaky-on-ground-truth) or harness ERROR.
+
+    #4 (Option B): the detector arrives by NAME, not as an object — the caller cannot smuggle in
+    arbitrary detector code (which could game the holdout via the verdict side-channel); only a
+    trusted, content-addressed registry can turn the id into runnable code. ``resolve`` raising
+    (unregistered / integrity mismatch) propagates — fail-closed, no calibration on untrusted code.
 
     Oracle-invariant properties (3.2): requires HERMETIC (adversarial fixtures); each fixture is
     materialised from opaque bytes under a randomised handle with its label kept OUT of the sandbox
@@ -224,6 +236,7 @@ def calibrate(
             passed=False, inadequate=True, fn_failures=(), fp_failures=(), flaky=(),
             harness_errors=(), outcomes=(), execution_identity=None, identity_consistent=True,
         )
+    detector = resolve(detector_id)  # trusted registry only — an unregistered id is refused here
 
     outcomes: list[FixtureOutcome] = []
     for fixture in (*calibration_set.known_bad, *calibration_set.known_good):
@@ -275,6 +288,7 @@ __all__ = [
     "FixtureOutcome",
     "CalibrationResult",
     "CalibrationConfigError",
+    "DetectorResolver",
     "calibrate",
     "DEFAULT_CALIBRATION_TRIALS",
 ]

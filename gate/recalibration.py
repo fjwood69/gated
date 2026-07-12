@@ -28,9 +28,14 @@ from __future__ import annotations
 
 from typing import Callable
 
-from core import ResourceBudget, RuntimeAssertion, Sandbox, VerdictType
+from core import ResourceBudget, Sandbox, VerdictType
 from core.chain import content_digest
-from engine.calibration import DEFAULT_CALIBRATION_TRIALS, CalibrationResult, calibrate
+from engine.calibration import (
+    DEFAULT_CALIBRATION_TRIALS,
+    CalibrationResult,
+    DetectorResolver,
+    calibrate,
+)
 from gate.attestation import MeasurementAttestation, sign_measurement
 from gate.calibration_store import CalibrationStore
 
@@ -64,7 +69,8 @@ def run_recalibration(
     set_id: str,
     calibration_store: CalibrationStore,
     make_sandbox: Callable[[], Sandbox],
-    detector: RuntimeAssertion,
+    detector_id: str,
+    resolve: DetectorResolver,
     detector_identity: str,
     tier_generation: str,
     budget: ResourceBudget,
@@ -84,7 +90,8 @@ def run_recalibration(
     lives in the restore controller's read-reread CAS (strictly better than binding a value that would
     go stale on any unrelated policy append and thrash re-runs)."""
     sealed = calibration_store.seal_set(set_id)  # one consistent snapshot; released on return
-    result = calibrate(make_sandbox, detector, sealed.calibration_set, budget, trials=trials)
+    # the detector arrives by NAME, resolved only through the trusted registry (never a caller object).
+    result = calibrate(make_sandbox, detector_id, resolve, sealed.calibration_set, budget, trials=trials)
     job_id = deterministic_job_id(
         policy_id=policy_id, set_id=set_id, oracle_head=sealed.oracle_head,
         detector_identity=detector_identity,

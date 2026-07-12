@@ -165,9 +165,10 @@ class RelayTests(unittest.TestCase):
 
 class FullLoopTests(unittest.TestCase):
     def _run(self, c: CalibrationStore, verdicts: list[Verdict]):  # type: ignore[no-untyped-def]
+        det = _ScriptedDetector(verdicts)
         return run_recalibration(
             policy_id="p1", set_id="X", calibration_store=c,
-            make_sandbox=lambda: _HermeticNoOp(), detector=_ScriptedDetector(verdicts),
+            make_sandbox=lambda: _HermeticNoOp(), detector_id="d", resolve=lambda _id: det,
             detector_identity=_DET, tier_generation="tg", budget=_BUDGET, issuer=_ISSUER,
             nonce="n1", now=100.0, signing_seed=_SEED, trials=3)
 

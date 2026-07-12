@@ -44,6 +44,16 @@ class _HermeticNoOp(NoOpSandbox):
     isolation_level: IsolationLevel = IsolationLevel.HERMETIC
 
 
+_DID = "test-detector"  # the registry NAME the entry point resolves (never a detector object)
+
+
+def _res(detector: object):  # type: ignore[no-untyped-def]
+    """A trivial TRUSTED resolver (the test's trust domain): the entry point takes a detector_id + this
+    Callable, never the object directly. The real content-addressed registry is exercised in
+    test_detector_registry + test_acceptance."""
+    return lambda _id: detector
+
+
 def _fx(label: FixtureLabel, fid: str, payload: bytes = b"x = 1\n") -> Fixture:
     return Fixture(fixture_id=fid, label=label, payload=payload)
 
@@ -84,7 +94,8 @@ class _ScriptedDetector:
 def _cal(known_bad, known_good, per_fixture, factory=None, trials=_TRIALS):  # type: ignore[no-untyped-def]
     flat = [v for lst in per_fixture for v in lst]
     cset = CalibrationSet(known_good=tuple(known_good), known_bad=tuple(known_bad))
-    return calibrate(factory or _hermetic_factory(), _ScriptedDetector(flat), cset, _BUDGET, trials=trials)
+    return calibrate(factory or _hermetic_factory(), _DID, _res(_ScriptedDetector(flat)),
+                     cset, _BUDGET, trials=trials)
 
 
 class TwoSidedCalibratorTests(unittest.TestCase):
@@ -129,7 +140,7 @@ class GroundTruthDefectTests(unittest.TestCase):
 class AdequacyGuardTests(unittest.TestCase):
     def test_empty_known_bad_refused_vacuously(self) -> None:
         g1 = _fx(FixtureLabel.KNOWN_GOOD, "g1")
-        r = calibrate(_hermetic_factory(), _ScriptedDetector([]),
+        r = calibrate(_hermetic_factory(), _DID, _res(_ScriptedDetector([])),
                       CalibrationSet(known_good=(g1,), known_bad=()), _BUDGET, trials=_TRIALS)
         self.assertTrue(r.inadequate)
         self.assertIn("inadequate", r.report())
@@ -201,7 +212,8 @@ class OracleInvariantTests(unittest.TestCase):
         b1, g1 = _fx(FixtureLabel.KNOWN_BAD, "b1"), _fx(FixtureLabel.KNOWN_GOOD, "g1")
         cset = CalibrationSet(known_good=(g1,), known_bad=(b1,))
         with self.assertRaises(CalibrationConfigError):
-            calibrate(weak_factory, _ScriptedDetector([_FAIL] * 6), cset, _BUDGET, trials=_TRIALS)
+            calibrate(weak_factory, _DID, _res(_ScriptedDetector([_FAIL] * 6)), cset, _BUDGET,
+                      trials=_TRIALS)
 
     def test_1a_fixture_label_never_enters_materialised_artifact(self) -> None:
         # 1a: a fixture executing in the sandbox must not be able to read its own label. The
@@ -225,7 +237,7 @@ class OracleInvariantTests(unittest.TestCase):
         cset = CalibrationSet(known_good=(g1,), known_bad=(b1, b2))
         # detector catches b1 [FAIL], MISSES b2 [PASS], passes g1 [PASS] — and "prefers" only b1.
         detector = _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3 + [_PASS] * 3, preferred_fixtures=["b1"])
-        r = calibrate(_hermetic_factory(), detector, cset, _BUDGET, trials=_TRIALS)
+        r = calibrate(_hermetic_factory(), _DID, _res(detector), cset, _BUDGET, trials=_TRIALS)
         self.assertFalse(r.passed)
         self.assertEqual(r.fn_failures, ("b2",))  # b2 was run despite the detector's preference
         self.assertEqual(len(r.outcomes), 3)       # ALL 3 fixtures evaluated

@@ -103,9 +103,10 @@ def _controller(s: PolicyStore, c: CalibrationStore, *, trusted: bool = True,
 
 
 def _run(c: CalibrationStore, verdicts: list[Verdict], *, tier_gen: str = "tg", nonce: str = "n1"):  # type: ignore[no-untyped-def]
+    det = _ScriptedDetector(verdicts)
     return run_recalibration(
         policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(),
-        detector=_ScriptedDetector(verdicts), detector_identity=_DET, tier_generation=tier_gen,
+        detector_id="d", resolve=lambda _id: det, detector_identity=_DET, tier_generation=tier_gen,
         budget=_BUDGET, issuer=_ISSUER, nonce=nonce, now=100.0, signing_seed=_SEED, trials=3)
 
 

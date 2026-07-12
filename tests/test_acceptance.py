@@ -27,6 +27,7 @@ from gate.acceptance import (
     verify_report,
 )
 from gate.authority import AuthorityDomain, GovernanceApproval
+from gate.detector_registry import DetectorRegistry
 from sandbox.noop import NoOpSandbox
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
@@ -46,8 +47,9 @@ def _factory():  # type: ignore[no-untyped-def]
 
 
 class _ScriptedDetector:
-    def __init__(self, verdicts: list[Verdict]) -> None:
+    def __init__(self, verdicts: list[Verdict], content_id: str = "scripted-detector") -> None:
         self.fixtures = Fixtures()
+        self.content_id = content_id  # #4: the trusted content address the registry binds + verifies
         self._verdicts = verdicts
         self._i = 0
 
@@ -58,6 +60,16 @@ class _ScriptedDetector:
         v = self._verdicts[self._i]
         self._i += 1
         return v
+
+
+def _registry(**detectors: object) -> DetectorRegistry:
+    """A trusted content-addressed registry binding each id to its detector (each detector cached, so a
+    stateful scripted honest detector keeps ONE instance across the visible + holdout lanes — the anchor
+    grades the SAME build). Exercises the real resolver the entry point calls."""
+    reg = DetectorRegistry()
+    for did, det in detectors.items():
+        reg.register(did, (lambda d=det: d), content_hash=det.content_id)  # type: ignore[attr-defined]
+    return reg
 
 
 def _cal_gov(*p: str) -> GovernanceApproval:
@@ -86,10 +98,12 @@ _MANIFEST = DetectorManifest(check_type="egress", entrypoint=("python3", "main.p
 _HOST_CLOSURE = "host-closure-digest-v1"
 
 
-def _run(store: BlindHoldoutStore, *, honest, fn, fp, signer=None):  # type: ignore[no-untyped-def]
+def _run(store: BlindHoldoutStore, *, honest, fn, fp, signer=None, make_sandbox=None):  # type: ignore[no-untyped-def]
+    resolve = _registry(honest=honest, fn=fn, fp=fp).resolve  # detectors by NAME through the registry
     return run_acceptance_anchor(
-        make_sandbox=_factory(), honest_detector=honest, fn_deficient_detector=fn,
-        fp_happy_detector=fp, detector_manifest=_MANIFEST, host_closure_digest=_HOST_CLOSURE,
+        make_sandbox=make_sandbox or _factory(), honest_detector_id="honest",
+        fn_deficient_detector_id="fn", fp_happy_detector_id="fp", resolve=resolve,
+        detector_manifest=_MANIFEST, host_closure_digest=_HOST_CLOSURE,
         visible_set=_VISIBLE, blind_holdout_store=store, holdout_key=_HOLDOUT_KEY,
         signer_seed=_SIGNER_SEED, signer_principal="cal-gov-1",
         signer_approval=signer or _cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3)
@@ -126,7 +140,9 @@ class AcceptanceAnchorTests(unittest.TestCase):
         self.assertEqual(report.detector_identity, expected_id)  # COMPUTED, not a caller string
         self.assertEqual(report.image_ref, "<_HermeticNoOp>")    # DERIVED from the real sandbox
         self.assertEqual(report.trials, 3)
-        self.assertNotEqual(report.visible_corpus_digest, report.holdout_corpus_digest)  # genuinely blind
+        # disjoint holdout (blind under the trusted-detector model — the verdict side-channel means
+        # in-process blindness holds only for registry-resolved, not author-supplied, detectors).
+        self.assertNotEqual(report.visible_corpus_digest, report.holdout_corpus_digest)
         self.assertTrue(report.sandbox_config_hash)            # computed from the real sandbox
         self.assertTrue(verify_report(report, verify_key=_SIGNER_PUB))
         self.assertFalse(verify_report(report, verify_key=public_key(bytes(range(2, 34)))))
@@ -192,14 +208,8 @@ class AcceptanceAnchorTests(unittest.TestCase):
             return sb
 
         with self.assertRaises(AcceptanceError):
-            run_acceptance_anchor(
-                make_sandbox=drift, honest_detector=_honest(),
-                fn_deficient_detector=_ScriptedDetector([_PASS] * 6),
-                fp_happy_detector=_ScriptedDetector([_FAIL] * 6),
-                detector_manifest=_MANIFEST, host_closure_digest=_HOST_CLOSURE,
-                visible_set=_VISIBLE, blind_holdout_store=store, holdout_key=_HOLDOUT_KEY,
-                signer_seed=_SIGNER_SEED, signer_principal="cal-gov-1",
-                signer_approval=_cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3)
+            _run(store, honest=_honest(), fn=_ScriptedDetector([_PASS] * 6),
+                 fp=_ScriptedDetector([_FAIL] * 6), make_sandbox=drift)
 
     def test_self_grading_closure_requires_calibration_governance_signer(self) -> None:
         store = _holdout()

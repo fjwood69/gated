@@ -194,9 +194,9 @@ class Done2_LegibleRefuseTests(unittest.TestCase):
         # detector catches b1 [FAIL]*3, MISSES b2 [PASS]*3, passes g1 [PASS]*3.
         det = _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3 + [_PASS] * 3)
         outcome = run_calibration(
-            "p1", store=s, make_sandbox=_hermetic_factory(), detector=det, calibration_set=cset,
-            budget=_BUDGET, calibration_chain_head="fx-head", detector_identity="det-1",
-            approval=_appr("gov1", op="p1-cal"), trials=3,
+            "p1", store=s, make_sandbox=_hermetic_factory(), detector_id="d", resolve=lambda _id: det,
+            calibration_set=cset, budget=_BUDGET, calibration_chain_head="fx-head",
+            detector_identity="det-1", approval=_appr("gov1", op="p1-cal"), trials=3,
         )
         self.assertFalse(outcome.passed)
         self.assertIsNone(outcome.calibration_result_ref)  # no PASS -> no ref -> cannot enable
@@ -216,9 +216,10 @@ class Done3_PerPolicyIsolationTests(unittest.TestCase):
             known_bad=(Fixture("bad", FixtureLabel.KNOWN_BAD, b"y"),),
         )
         det = _ScriptedDetector([_PASS] * 3 + [_PASS] * 3)  # MISSES the known-bad
-        run_calibration("pA", store=s, make_sandbox=_hermetic_factory(), detector=det,
-                        calibration_set=cset, budget=_BUDGET, calibration_chain_head="fx",
-                        detector_identity="det-A", approval=_appr("gov1", op="pA-cal"), trials=3)
+        run_calibration("pA", store=s, make_sandbox=_hermetic_factory(), detector_id="d",
+                        resolve=lambda _id: det, calibration_set=cset, budget=_BUDGET,
+                        calibration_chain_head="fx", detector_identity="det-A",
+                        approval=_appr("gov1", op="pA-cal"), trials=3)
         self.assertIs(s.current_state("pA"), PolicyState.REJECTED)
         self.assertIs(_resolve(s, "pA").disposition, Disposition.SKIP_NEUTRAL)
         # pB untouched by pA's failure.
@@ -235,10 +236,10 @@ class EnablePathTests(unittest.TestCase):
             known_bad=(Fixture("b1", FixtureLabel.KNOWN_BAD, b"y"),),
         )
         det = _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3)  # catches b1, passes g1
-        outcome = run_calibration("p1", store=s, make_sandbox=_hermetic_factory(), detector=det,
-                                  calibration_set=cset, budget=_BUDGET, calibration_chain_head="fx",
-                                  detector_identity="det-1", approval=_appr("gov1", op="p1-cal"),
-                                  trials=3)
+        outcome = run_calibration("p1", store=s, make_sandbox=_hermetic_factory(), detector_id="d",
+                                  resolve=lambda _id: det, calibration_set=cset, budget=_BUDGET,
+                                  calibration_chain_head="fx", detector_identity="det-1",
+                                  approval=_appr("gov1", op="p1-cal"), trials=3)
         self.assertTrue(outcome.passed)
         self.assertIsNotNone(outcome.calibration_result_ref)  # PASS -> a ref to bind ENABLED to
         self.assertIs(s.current_state("p1"), PolicyState.CALIBRATING)  # NOT auto-enabled

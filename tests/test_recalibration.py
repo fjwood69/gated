@@ -70,7 +70,8 @@ def _store_with_set() -> CalibrationStore:
 
 def _run(c: CalibrationStore, det: _ScriptedDetector, *, nonce: str = "n1"):  # type: ignore[no-untyped-def]
     return run_recalibration(
-        policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(), detector=det,
+        policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(),
+        detector_id="d", resolve=lambda _id: det,  # detector by NAME through a trusted resolver
         detector_identity="det-1", tier_generation="tier-h", budget=_BUDGET, issuer="cal-gov-1",
         nonce=nonce, now=100.0, signing_seed=_SEED, trials=3,
     )

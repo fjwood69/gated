@@ -34,6 +34,16 @@ from .checkrun import (
     verdict_to_conclusion,
 )
 from .dedup import DeliveryLog, InMemoryDeliveryLog
+from .detector_registry import (
+    DetectorIntegrityError,
+    DetectorRegistry,
+    DetectorResolutionError,
+    DetectorResolver,
+    RegistrableDetector,
+    RegistrationError,
+    UnregisteredDetectorError,
+    registration_binding,
+)
 from .executor import (
     ERROR_VERDICT,
     Executor,
@@ -151,4 +161,12 @@ __all__ = [
     "verify_check_required",
     "ConfigurationError",
     "RateLimitBudget",
+    "DetectorRegistry",
+    "RegistrableDetector",
+    "DetectorResolver",
+    "DetectorResolutionError",
+    "UnregisteredDetectorError",
+    "DetectorIntegrityError",
+    "RegistrationError",
+    "registration_binding",
 ]

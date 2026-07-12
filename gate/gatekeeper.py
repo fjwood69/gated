@@ -32,10 +32,15 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Callable
 
-from core import ResourceBudget, RuntimeAssertion, Sandbox
+from core import ResourceBudget, Sandbox
 from core.calibration import CalibrationSet
 from core.chain import content_digest
-from engine.calibration import CalibrationResult, DEFAULT_CALIBRATION_TRIALS, calibrate
+from engine.calibration import (
+    CalibrationResult,
+    DEFAULT_CALIBRATION_TRIALS,
+    DetectorResolver,
+    calibrate,
+)
 from gate.authority import GovernanceApproval
 from gate.policy_state import Disposition, PolicyState, disposition_for
 from gate.policy_store import ChainIntegrityError, PolicyStore
@@ -237,7 +242,8 @@ def run_calibration(
     *,
     store: PolicyStore,
     make_sandbox: Callable[[], Sandbox],
-    detector: RuntimeAssertion,
+    detector_id: str,
+    resolve: DetectorResolver,
     calibration_set: CalibrationSet,
     budget: ResourceBudget,
     calibration_chain_head: str,
@@ -256,7 +262,8 @@ def run_calibration(
         policy_id, PolicyState.CALIBRATING, approval=approval,
         pinned_set_version=calibration_chain_head,
     )
-    result = calibrate(make_sandbox, detector, calibration_set, budget, trials=trials)
+    # detector by NAME, resolved only through the trusted registry (never a caller-supplied object).
+    result = calibrate(make_sandbox, detector_id, resolve, calibration_set, budget, trials=trials)
     breaking = (*result.fn_failures, *result.fp_failures, *result.flaky, *result.harness_errors)
     ref: str | None = None
     if result.passed:

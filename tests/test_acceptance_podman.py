@@ -25,6 +25,7 @@ from gate.acceptance import (
     verify_report,
 )
 from gate.authority import AuthorityDomain, GovernanceApproval
+from gate.detector_registry import DetectorRegistry
 from sandbox.oci import OCISandbox
 
 IMAGE = "localhost/mori:local"
@@ -56,6 +57,8 @@ class _ExitCodeDetector:
     """A real RuntimeAssertion judging OUT-OF-BAND by exit code only: FAIL (caught) on nonzero, else
     PASS. The artifact cannot write its own verdict — the exit code is observed by the host."""
 
+    content_id = "exitcode-detector-v1"  # #4: the trusted content address the registry binds
+
     def __init__(self) -> None:
         self.fixtures = Fixtures()
 
@@ -70,6 +73,8 @@ class _ExitCodeDetector:
 
 
 class _AlwaysPass:  # FN-deficient: never catches the bad
+    content_id = "always-pass-v1"
+
     def __init__(self) -> None:
         self.fixtures = Fixtures()
 
@@ -81,6 +86,8 @@ class _AlwaysPass:  # FN-deficient: never catches the bad
 
 
 class _AlwaysFail:  # FP-happy: blocks the good
+    content_id = "always-fail-v1"
+
     def __init__(self) -> None:
         self.fixtures = Fixtures()
 
@@ -111,10 +118,16 @@ class AcceptanceAnchorOnRealPodmanTests(unittest.TestCase):
 
         manifest = DetectorManifest(check_type="exit-code", entrypoint=("python3", "/artifact/main.py"),
                                     impl_digest="exitcode-detector-build", eval_profile={"trials": 2})
+        # detectors arrive by NAME through a trusted content-addressed registry, never as objects.
+        registry = DetectorRegistry()
+        honest, fn, fp = _ExitCodeDetector(), _AlwaysPass(), _AlwaysFail()
+        registry.register("honest", lambda: honest, content_hash=honest.content_id)
+        registry.register("fn", lambda: fn, content_hash=fn.content_id)
+        registry.register("fp", lambda: fp, content_hash=fp.content_id)
         report = run_acceptance_anchor(
             make_sandbox=lambda: OCISandbox(image=IMAGE),
-            honest_detector=_ExitCodeDetector(), fn_deficient_detector=_AlwaysPass(),
-            fp_happy_detector=_AlwaysFail(), detector_manifest=manifest,
+            honest_detector_id="honest", fn_deficient_detector_id="fn", fp_happy_detector_id="fp",
+            resolve=registry.resolve, detector_manifest=manifest,
             host_closure_digest="host-closure-oci-v1", visible_set=visible,
             blind_holdout_store=holdout, holdout_key=_HOLDOUT_KEY, signer_seed=_SIGNER_SEED,
             signer_principal="cal-gov-1", signer_approval=_cal_gov("cal-gov-1"),
@@ -130,8 +143,8 @@ class AcceptanceAnchorOnRealPodmanTests(unittest.TestCase):
         self.assertEqual(report.visible_coverage, 2)
         self.assertEqual(report.holdout_coverage, 2)
         self.assertTrue(verify_report(report, verify_key=_SIGNER_PUB))
-        # the receipt binds a PINNED image digest (derived from the real sandbox), a genuinely-blind
-        # holdout, and the real sandbox hash — nothing is a caller string.
+        # the receipt binds a PINNED image digest (derived from the real sandbox), a disjoint holdout
+        # (blind under the trusted-detector model), and the real sandbox hash — nothing is a caller string.
         self.assertEqual(report.image_ref, image_digest)
         self.assertTrue(report.image_ref.startswith("sha256:"))
         self.assertNotEqual(report.visible_corpus_digest, report.holdout_corpus_digest)

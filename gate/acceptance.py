@@ -19,6 +19,16 @@ grows — never "proven safe". The blind holdout is DUAL-CONTROLLED and ENCRYPTE
 CALIBRATION_GOVERNANCE-only key: the authoring side cannot read it (no key), so it cannot be overfit, and
 a poisoned holdout needs two calibration-governance principals to land.
 
+BLIND ONLY UNDER THE TRUSTED-DETECTOR MODEL (#4 — the fundamental in-process limit). Encryption hides the
+holdout's CONTENT, but an AUTHOR-CONTROLLED detector needs no content: it can encode holdout membership in
+the cross-fixture PASS/FAIL pattern it emits (~1 bit per fixture — the *verdict side-channel*). In-process
+blindness against a detector the author supplies is therefore impossible. This anchor is blind ONLY because
+the detectors arrive by NAME through a TRUSTED, content-addressed registry (``gate.detector_registry``),
+never as caller objects — so the graded code is the detector-maintainer's, not the (untrusted) policy
+author's. A deployment closes the residual channel by running each detector in its own container with
+AGGREGATE-ONLY output (the ~1 bit/fixture pattern never returns to the author). "Genuinely blind" below
+means "blind under this trusted-detector model", not unconditionally.
+
 Gate-side; imports engine (it RUNS the real calibrator) + core + the calibration/authority types.
 Encryption here is a stdlib HMAC-keystream reference construction (encrypt-then-MAC); a deployment binds
 a real AEAD/KMS — the STRUCTURE (author-invisible, key-gated, in-memory-only decrypt) is what this proves.
@@ -34,12 +44,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from core import ResourceBudget, RuntimeAssertion, Sandbox
+from core import ResourceBudget, Sandbox
 from gate import signing
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from core.chain import content_digest
 from core.identity import DetectorManifest, identity_for
-from engine.calibration import DEFAULT_CALIBRATION_TRIALS, calibrate
+from engine.calibration import DEFAULT_CALIBRATION_TRIALS, DetectorResolver, calibrate
 from gate.authority import AuthorityDomain, GovernanceApproval
 
 
@@ -234,9 +244,10 @@ def verify_report(report: AcceptanceReport, *, verify_key: bytes) -> bool:
 def run_acceptance_anchor(
     *,
     make_sandbox: Callable[[], Sandbox],
-    honest_detector: RuntimeAssertion,
-    fn_deficient_detector: RuntimeAssertion,
-    fp_happy_detector: RuntimeAssertion,
+    honest_detector_id: str,
+    fn_deficient_detector_id: str,
+    fp_happy_detector_id: str,
+    resolve: DetectorResolver,
     detector_manifest: DetectorManifest,
     host_closure_digest: str,
     visible_set: CalibrationSet,
@@ -289,13 +300,16 @@ def run_acceptance_anchor(
             "the blind holdout must be two-sided (>=1 known-bad AND >=1 known-good) to prove "
             "generalisation on both sides"
         )
-    honest = calibrate(make_sandbox, honest_detector, visible_set, budget,
+    # every detector arrives by NAME and is resolved ONLY through the trusted registry (``resolve``);
+    # the anchor never accepts a detector object, so an author cannot smuggle in a holdout-gaming
+    # detector. The honest id is graded on BOTH the visible and holdout lanes (same trusted build).
+    honest = calibrate(make_sandbox, honest_detector_id, resolve, visible_set, budget,
                        trials=trials, pin_image=pin_image)
-    fn = calibrate(make_sandbox, fn_deficient_detector, visible_set, budget,
+    fn = calibrate(make_sandbox, fn_deficient_detector_id, resolve, visible_set, budget,
                    trials=trials, pin_image=pin_image)
-    fp = calibrate(make_sandbox, fp_happy_detector, visible_set, budget,
+    fp = calibrate(make_sandbox, fp_happy_detector_id, resolve, visible_set, budget,
                    trials=trials, pin_image=pin_image)
-    gen = calibrate(make_sandbox, honest_detector, holdout, budget,
+    gen = calibrate(make_sandbox, honest_detector_id, resolve, holdout, budget,
                     trials=trials, pin_image=pin_image)
 
     # image + isolation DERIVED from the PARENT-MEASURED identity of the lanes that ACTUALLY ran (no
