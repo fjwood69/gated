@@ -24,6 +24,7 @@ from core import (
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from engine.calibration import (
     CalibrationConfigError,
+    ResolvedDetector,
     _materialised,
     calibrate,
 )
@@ -48,10 +49,12 @@ _DID = "test-detector"  # the registry NAME the entry point resolves (never a de
 
 
 def _res(detector: object):  # type: ignore[no-untyped-def]
-    """A trivial TRUSTED resolver (the test's trust domain): the entry point takes a detector_id + this
-    Callable, never the object directly. The real content-addressed registry is exercised in
-    test_detector_registry + test_acceptance."""
-    return lambda _id: detector
+    """A trivial TRUSTED bundle resolver (the test's trust domain): calibrate takes a detector_id + this
+    ``BundleResolver``, returning the assertion + a profile digest from ONE resolution (P1-3 v3), never the
+    object directly. The real content-addressed registry is exercised in test_detector_registry +
+    test_acceptance."""
+    return lambda _id: ResolvedDetector(
+        assertion=detector, profile_digest=f"test-profile:{_id}", command=detector.entrypoint())  # type: ignore[attr-defined]
 
 
 def _fx(label: FixtureLabel, fid: str, payload: bytes = b"x = 1\n") -> Fixture:

@@ -10,19 +10,22 @@ measurement≠governance, and the separation is STRUCTURAL, not documented:
   * It signs with the MEASUREMENT key (``gate.attestation``), which is NOT the tier-write key.
   * On a FAIL it does NOTHING but surface the failure breakdown in the signed attestation (the
     missed-FN evidence a human uses for the dual-controlled split). No auto-resolve, no auto-degrade
-    (board D4). The policy is already blocking (transiently UNATTESTABLE via the oracle-head drift);
-    the runner does not touch that either.
+    (board D4).
 
-The fourth-hole fix (board): the runner SEALS the set under one consistent read snapshot
-(``CalibrationStore.seal_set`` — head + coverage + fixtures from one pass), RELEASES the transaction,
-THEN runs the expensive calibration against the frozen set. The signed PASS therefore binds an
-``oracle_head`` and a ``coverage_digest`` that provably co-existed; the restore CAS later rechecks the
-head is still current, so a set change mid-run just forces a re-run — it can never smuggle a coverage
-that never co-existed with the head into a valid signature.
+3.5-close P1-3 — the signed identity is MEASUREMENT-DERIVED, not a caller string (the sign-A-run-B
+close). The runner no longer accepts a ``detector_identity`` to sign. It resolves the detector through
+the trusted registry, and the attestation's ``subject_identity`` is
+``H(resolved_profile_digest, execution_identity_digest)`` where BOTH components come from the SAME
+calibration run: ``resolved_profile_digest`` is captured inside ``calibrate`` (no second resolution),
+and ``execution_identity_digest`` is the parent-measured environment. A drifted/unregistered detector
+yields a signed ERROR attestation (audit evidence, categorically NON-restorable), never a measurement
+that could restore a tier. ``expected_subject_identity`` is used ONLY as the deterministic job/dedup key
+(governance-provenance, from the policy store via the relay/queue) — it is NEVER signed, so a wrong value
+can at worst mis-dedup, never sign-A-run-B.
 
-job_id is DETERMINISTIC in ``(policy_id, set_id, oracle_head, detector_identity)`` so re-triggers for
-the SAME measurement dedupe; the per-attempt ``nonce`` stays unique. Gate-side; ``core`` never imports
-this. Reads the oracle (allowed); never writes it or any tier.
+job_id is DETERMINISTIC in ``(policy_id, set_id, oracle_head, subject_identity)`` so re-triggers for the
+SAME measurement dedupe; the per-attempt ``nonce`` stays unique. Gate-side; ``core`` never imports this.
+Reads the oracle (allowed); never writes it or any tier.
 """
 from __future__ import annotations
 
@@ -33,24 +36,30 @@ from core.chain import content_digest
 from engine.calibration import (
     DEFAULT_CALIBRATION_TRIALS,
     BackendGuard,
+    BundleResolver,
     CalibrationResult,
-    DetectorResolver,
     calibrate,
 )
-from gate.attestation import MeasurementAttestation, sign_measurement
+from gate.attestation import (
+    MeasurementAttestation,
+    calibrated_subject_identity,
+    sign_measurement,
+)
 from gate.calibration_store import CalibrationStore
+from gate.detector_registry import DetectorResolutionError
 from gate.signing import Signer
 
 
 def deterministic_job_id(
-    *, policy_id: str, set_id: str, oracle_head: str, detector_identity: str
+    *, policy_id: str, set_id: str, oracle_head: str, subject_identity: str
 ) -> str:
-    """The dedup key for a re-calibration: two triggers for the SAME (policy, set, oracle head,
-    detector) are the SAME measurement job and must not run twice. The per-attempt nonce (unique)
-    still distinguishes retries within the queue."""
+    """The dedup key for a re-calibration: two triggers for the SAME (policy, set, oracle head, subject)
+    are the SAME measurement job and must not run twice. The per-attempt nonce (unique) still
+    distinguishes retries within the queue. ``subject_identity`` here is the intended (queued) subject
+    from the policy store — a routing/dedup value, not signed authority."""
     return content_digest({
         "policy_id": policy_id, "set_id": set_id, "oracle_head": oracle_head,
-        "detector_identity": detector_identity,
+        "subject_identity": subject_identity,
     })
 
 
@@ -72,8 +81,8 @@ def run_recalibration(
     calibration_store: CalibrationStore,
     make_sandbox: Callable[[], Sandbox],
     detector_id: str,
-    resolve: DetectorResolver,
-    detector_identity: str,
+    resolve: BundleResolver,
+    requested_subject_identity: str,
     tier_generation: str,
     budget: ResourceBudget,
     issuer: str,
@@ -84,27 +93,60 @@ def run_recalibration(
     backend_guard: BackendGuard | None = None,
 ) -> MeasurementAttestation:
     """Seal the set (snapshot-isolated), run the batch calibrator against the frozen fixtures, and
-    return a SIGNED measurement. Emits — never enforces. ``detector_identity`` is the caller's 4-tuple
-    identity for the exact detector build/host/image/eval; ``tier_generation`` is the tier-chain head
-    the trigger observed (the restore CAS rechecks currency). Deterministic ``run_id`` = the job id.
+    return a SIGNED measurement. Emits — never enforces.
+
+    P1-3: the detector arrives by NAME and is resolved ONLY through the trusted registry via an ATOMIC
+    ``resolve`` bundle (assertion + profile digest from one resolution). The SIGNED ``subject_identity`` is
+    derived from the MEASURED run (the bundle's resolved-profile digest + the parent-measured execution
+    identity), NEVER from a caller string. ``requested_subject_identity`` is the GOVERNANCE target this run
+    was asked to measure — it is SIGNED (it also selects run_id) but carries no measurement authority: the
+    restore controller separately requires measured==requested AND requested==the policy's currently
+    authorized target, so measurement can never SELECT the governance target (measurement ≠ governance).
+    A drifted / unregistered detector produces a signed ERROR attestation (audit evidence, non-restorable).
 
     NOTE (no ``PolicyStore`` parameter — by construction): the runner cannot read or write the tier
-    store, so it can neither move a tier nor bind a policy-evidence head. The policy-evidence-head gate
-    lives in the restore controller's read-reread CAS (strictly better than binding a value that would
-    go stale on any unrelated policy append and thrash re-runs)."""
+    store, so it can neither move a tier nor bind a policy-evidence head."""
     sealed = calibration_store.seal_set(set_id)  # one consistent snapshot; released on return
-    # the detector arrives by NAME, resolved only through the trusted registry (never a caller object).
-    result = calibrate(make_sandbox, detector_id, resolve, sealed.calibration_set, budget,
-                       trials=trials, backend_guard=backend_guard)
     job_id = deterministic_job_id(
         policy_id=policy_id, set_id=set_id, oracle_head=sealed.oracle_head,
-        detector_identity=detector_identity,
+        subject_identity=requested_subject_identity,
+    )
+    issued_at_ms = int(round(now * 1000))
+    try:
+        # ATOMIC resolution: calibrate resolves ONCE and carries the exact resolved-profile digest into
+        # the CalibrationResult, so the signed subject binds the detector that ACTUALLY ran.
+        result = calibrate(
+            make_sandbox, detector_id, resolve, sealed.calibration_set, budget,
+            trials=trials, backend_guard=backend_guard,
+        )
+    except DetectorResolutionError as exc:
+        # drift / unregistered -> a signed ERROR AUDIT attestation with null components: categorically
+        # non-restorable (is_clean_pass False), never a measurement that could restore a tier.
+        unsigned = MeasurementAttestation(
+            outcome=VerdictType.ERROR, policy_id=policy_id, subject_identity=None,
+            requested_subject_identity=requested_subject_identity,
+            resolved_profile_digest=None, execution_identity_digest=None, set_id=set_id,
+            oracle_head=sealed.oracle_head, coverage_digest=sealed.coverage_digest,
+            tier_generation=tier_generation, issuer=issuer, run_id=job_id, nonce=nonce,
+            issued_at_ms=issued_at_ms, fixture_coverage=sealed.fixture_ids, short_circuit=False,
+            harness_errors=(f"detector-unresolved:{exc.__class__.__name__}",),
+        )
+        return sign_measurement(unsigned, signer=signer)
+
+    rpd = result.resolved_profile_digest
+    eid = result.execution_identity.digest() if result.execution_identity is not None else None
+    # conditional validity: a subject exists ONLY when both components are present (PASS/FAIL); an
+    # unattestable ERROR (no execution identity) carries null components and a null subject.
+    subject = (
+        calibrated_subject_identity(rpd, eid) if (rpd is not None and eid is not None) else None
     )
     unsigned = MeasurementAttestation(
-        outcome=_outcome_of(result), policy_id=policy_id, detector_identity=detector_identity,
-        set_id=set_id, oracle_head=sealed.oracle_head, coverage_digest=sealed.coverage_digest,
-        tier_generation=tier_generation, issuer=issuer, run_id=job_id, nonce=nonce, issued_at=now,
-        fixture_coverage=sealed.fixture_ids,
+        outcome=_outcome_of(result), policy_id=policy_id, subject_identity=subject,
+        requested_subject_identity=requested_subject_identity,
+        resolved_profile_digest=rpd, execution_identity_digest=eid, set_id=set_id,
+        oracle_head=sealed.oracle_head, coverage_digest=sealed.coverage_digest,
+        tier_generation=tier_generation, issuer=issuer, run_id=job_id, nonce=nonce,
+        issued_at_ms=issued_at_ms, fixture_coverage=sealed.fixture_ids,
         short_circuit=False,  # calibrate() runs the full distribution — short-circuit is always OFF
         fn_failures=result.fn_failures, fp_failures=result.fp_failures, flaky=result.flaky,
         harness_errors=result.harness_errors,

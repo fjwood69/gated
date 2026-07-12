@@ -33,7 +33,7 @@ from core import (
     Verdict,
     VerdictType,
 )
-from engine.calibration import DetectorResolver
+from engine.calibration import BundleResolver, DetectorResolver
 from engine.retry import RetryCheck
 from engine.runner import TrialReport, TrialReportSink, run_check
 from sandbox.observed import ObservedOCISandbox
@@ -42,7 +42,7 @@ from .artifact import build_artifact_spec, extraction_workspace, safe_extract_ta
 from .detector_registry import (
     DetectorRegistry,
     DetectorResolutionError,
-    content_address,
+    profile_of,
 )
 from .preflight import ConfigurationError
 from .checkrun import (
@@ -101,16 +101,23 @@ def extract_to_spec(tar_path: Path, workspace: Path) -> ArtifactSpec:
 
 
 def default_detector_registry(
-    *, detector_id: str = "retry", entrypoint: tuple[str, ...] = DEFAULT_ENTRYPOINT
+    *,
+    detector_id: str = "retry",
+    entrypoint: tuple[str, ...] = DEFAULT_ENTRYPOINT,
+    accepted_profile_digest: str | None = None,
 ) -> DetectorRegistry:
-    """Build a ``DetectorRegistry`` with the accepted first-party detector (``RetryCheck``) registered
-    under ``detector_id``, bound to its ACCEPTED content-address (3.5-close #1.3). A DEPLOYMENT pins the
-    address from the acceptance receipt so the live gate enforces the exact detector that was accepted;
-    the in-process reference pins the current ``RetryCheck`` bytes. ``resolve`` then refuses an
-    unregistered id or a detector whose content-address drifted (bad rollout / rollback)."""
+    """Build a ``DetectorRegistry`` with the first-party ``RetryCheck`` registered under ``detector_id``,
+    bound to an ACCEPTED PROFILE DIGEST (module bytes + entrypoint + config — 3.5-close P1-1/P1-3).
+
+    ``accepted_profile_digest`` (injected) is the digest from an INDEPENDENT acceptance ceremony — a
+    DEPLOYMENT must supply it so the live gate enforces the exact profile that was accepted (see
+    ``build_live_app``, which fails boot if it is absent). If ``None`` the registry SELF-COMPUTES it from
+    the current ``RetryCheck`` bytes — a DEMONSTRATION of the mechanism for the reference / tests, NOT
+    enforcement (it is circular: current-bytes vs a hash of current-bytes). ``resolve`` refuses an
+    unregistered id or a profile-digest drift on every resolve."""
     registry = DetectorRegistry()
-    accepted = content_address(RetryCheck(entrypoint))
-    registry.register(detector_id, lambda: RetryCheck(entrypoint), content_hash=accepted)
+    digest = accepted_profile_digest or profile_of(detector_id, RetryCheck(entrypoint)).digest()
+    registry.register(detector_id, lambda: RetryCheck(entrypoint), accepted_profile_digest=digest)
     return registry
 
 
@@ -131,7 +138,7 @@ def run_engine_check(
     artifact: ArtifactSpec,
     *,
     image: str,
-    resolve: DetectorResolver,
+    resolve: BundleResolver,
     detector_id: str,
     trials: int = DEFAULT_TRIALS,
     budget: ResourceBudget = DEFAULT_ENGINE_BUDGET,
@@ -147,7 +154,11 @@ def run_engine_check(
     increment — see ARCHITECTURE.md.) A resolution failure raises ``DetectorResolutionError``, caught by
     the job-runner and mapped to a blocking ERROR (never run an unverified detector). The sandbox verifies
     the SHA-bind; a mismatch raises + propagates. ``first_fail`` short-circuits the FAIL path (C1)."""
-    detector = resolve(detector_id)  # trusted registry: unregistered / drifted -> raises -> ERROR
+    # v5 P1a: resolve the ATOMIC bundle and execute its FROZEN command — the LIVE enforcement path must
+    # run exactly the entrypoint the accepted profile bound, never a fresh detector.entrypoint() a stateful
+    # detector could answer differently. (Was: resolve() + run_check without command -> re-called entrypoint.)
+    bundle = resolve(detector_id)  # trusted registry: unregistered / drifted -> raises -> ERROR
+    detector = bundle.assertion
 
     def make_sandbox() -> ObservedOCISandbox:
         return ObservedOCISandbox(image=image, runtime="podman")
@@ -155,6 +166,7 @@ def run_engine_check(
     return run_check(
         make_sandbox, detector, artifact, budget,
         trials=trials, first_fail=first_fail, report_sink=report_sink, detector_id=detector_id,
+        command=bundle.command,
     )
 
 
@@ -162,7 +174,7 @@ def make_job_runner(
     artifact_source: ArtifactSource,
     *,
     image: str,
-    resolve: DetectorResolver,
+    resolve: BundleResolver,
     detector_id: str,
     trials: int = DEFAULT_TRIALS,
     budget: ResourceBudget = DEFAULT_ENGINE_BUDGET,

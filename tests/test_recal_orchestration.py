@@ -19,6 +19,7 @@ from gate.attestation_store import MeasurementAttestationStore
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
 from gate.calibration_store import AdmissionCapability
+from gate.detector_registry import DetectorRegistry, profile_of
 from gate.gatekeeper import resolve_disposition
 from gate.policy_state import Disposition, PolicyState
 from gate.policy_store import PolicyStore, ReAttestGrant
@@ -34,7 +35,6 @@ _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
 _SEED = bytes(range(32))
 _PUB = public_key(_SEED)
 _ISSUER = "cal-gov-1"
-_DET = "det-1"
 _FAIL = Verdict(VerdictType.FAIL, Reason.EGRESS_ONE)
 _PASS = Verdict(VerdictType.PASS, Reason.EGRESS_GE_2)
 
@@ -75,6 +75,31 @@ def _cal() -> CalibrationStore:
     c.append(ChangeOp.ADD_KNOWN_GOOD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="2"), fixture_id="g1",
              set_id="X", label=FixtureLabel.KNOWN_GOOD, payload=b"good1")
     return c
+
+
+def _make_att(c: CalibrationStore, verdicts: list[Verdict], *, nonce: str = "n1",  # type: ignore[no-untyped-def]
+              requested: str | None = None):
+    # detectors arrive by NAME through a trusted registry via the ATOMIC bundle (P1-3 v3); the SIGNED
+    # subject is measurement-derived. The requested target defaults to the policy's authorized subject.
+    det = _ScriptedDetector(verdicts)
+    reg = DetectorRegistry()
+    reg.register("d", lambda: det, accepted_profile_digest=profile_of("d", det).digest())
+    return run_recalibration(
+        policy_id="p1", set_id="X", calibration_store=c, make_sandbox=lambda: _HermeticNoOp(),
+        detector_id="d", resolve=reg.resolve_bundle,
+        requested_subject_identity=(requested if requested is not None else _DET),
+        tier_generation="tg", budget=_BUDGET, issuer=_ISSUER,
+        nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3)
+
+
+# the deterministic measurement-derived subject identity the whole loop binds + enforces (P1-3).
+def _canonical_subject() -> str:
+    att = _make_att(_cal(), [_FAIL] * 3 + [_PASS] * 3, requested="bootstrap")
+    assert att.subject_identity is not None
+    return att.subject_identity
+
+
+_DET = _canonical_subject()
 
 
 def _pol(head: str) -> PolicyStore:
@@ -165,12 +190,7 @@ class RelayTests(unittest.TestCase):
 
 class FullLoopTests(unittest.TestCase):
     def _run(self, c: CalibrationStore, verdicts: list[Verdict]):  # type: ignore[no-untyped-def]
-        det = _ScriptedDetector(verdicts)
-        return run_recalibration(
-            policy_id="p1", set_id="X", calibration_store=c,
-            make_sandbox=lambda: _HermeticNoOp(), detector_id="d", resolve=lambda _id: det,
-            detector_identity=_DET, tier_generation="tg", budget=_BUDGET, issuer=_ISSUER,
-            nonce="n1", now=100.0, signer=SeedSigner(_SEED), trials=3)
+        return _make_att(c, verdicts)
 
     def test_proactive_trigger_to_restore_end_to_end(self) -> None:
         c = _cal()

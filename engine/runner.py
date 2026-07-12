@@ -35,6 +35,7 @@ from typing import Callable, Protocol, Sequence
 
 from core import (
     ArtifactSpec,
+    Command,
     ExecutionResult,
     ImageResolutionError,
     Reason,
@@ -148,6 +149,7 @@ def run_check(
     first_fail: bool = True,
     report_sink: TrialReportSink | None = None,
     detector_id: str | None = None,
+    command: Command | None = None,
 ) -> Verdict:
     """Run ``check`` on ``artifact`` across up to ``trials`` isolated trials -> one
     Verdict. ``make_sandbox`` is a factory so each trial gets a fresh sandbox instance
@@ -165,11 +167,16 @@ def run_check(
     -> ``Verdict(ERROR, IMAGE_UNRESOLVED)`` for that trial, NEVER a silent pass."""
     verdicts: list[Verdict] = []
     raws: list[tuple[str, object, str, str] | None] = []
+    # v4 P1-c: execute the FROZEN resolved command if one was captured at resolution (the trusted-registry
+    # profile's entrypoint), computed ONCE. Falls back to a single ``check.entrypoint()`` for callers that
+    # do not resolve through the registry — but the value is fixed before the loop, never re-called per
+    # trial (a stateful detector must not resolve one command and run another).
+    cmd = command if command is not None else check.entrypoint()
     for _ in range(trials):
         sb = make_sandbox()
         try:
             with sb.session(artifact, check.fixtures) as handle:
-                result = sb.run(handle, check.entrypoint(), budget)
+                result = sb.run(handle, cmd, budget)
         except ImageResolutionError:
             # 3.5-close #1.1 (finding A): the image digest could not be resolved BEFORE run -> the run
             # is UNATTESTABLE -> fail-closed ERROR, never a silent pass / "the detector did not fire".

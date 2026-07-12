@@ -15,10 +15,11 @@ from pathlib import Path
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import FixtureLabel
 from gate.signing import KeyVerifier, SeedSigner, public_key
-from gate.attestation import verify_measurement
+from gate.attestation import calibrated_subject_identity, verify_measurement
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
 from gate.calibration_store import AdmissionCapability
+from gate.detector_registry import DetectorRegistry, UnregisteredDetectorError, profile_of
 from gate.recalibration import deterministic_job_id, run_recalibration
 from sandbox.noop import NoOpSandbox
 
@@ -68,11 +69,17 @@ def _store_with_set() -> CalibrationStore:
     return c
 
 
-def _run(c: CalibrationStore, det: _ScriptedDetector, *, nonce: str = "n1"):  # type: ignore[no-untyped-def]
+def _run(c: CalibrationStore, det: _ScriptedDetector, *, nonce: str = "n1",  # type: ignore[no-untyped-def]
+         requested: str = "det-1", resolve=None):
+    # detectors arrive by NAME through a trusted content-addressed registry via the ATOMIC bundle (P1-3
+    # v3). The SIGNED subject identity is measurement-derived; ``requested`` is the governance target
+    # (signed, but not measurement authority).
+    reg = DetectorRegistry()
+    reg.register("d", lambda: det, accepted_profile_digest=profile_of("d", det).digest())
     return run_recalibration(
         policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(),
-        detector_id="d", resolve=lambda _id: det,  # detector by NAME through a trusted resolver
-        detector_identity="det-1", tier_generation="tier-h", budget=_BUDGET, issuer="cal-gov-1",
+        detector_id="d", resolve=resolve or reg.resolve_bundle,
+        requested_subject_identity=requested, tier_generation="tier-h", budget=_BUDGET, issuer="cal-gov-1",
         nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3,
     )
 
@@ -87,6 +94,11 @@ class RunnerOutcomeTests(unittest.TestCase):
         self.assertFalse(att.short_circuit)
         self.assertEqual(att.oracle_head, c.set_head("X"))  # co-sealed head is the live head
         self.assertEqual(att.fixture_coverage, ("b1", "g1"))
+        # P1-3: the signed subject is measurement-derived from BOTH components (present on a PASS).
+        self.assertIsNotNone(att.resolved_profile_digest)
+        self.assertIsNotNone(att.execution_identity_digest)
+        self.assertEqual(att.subject_identity, calibrated_subject_identity(
+            att.resolved_profile_digest, att.execution_identity_digest))  # type: ignore[arg-type]
 
     def test_missed_known_bad_is_FAIL_and_names_the_fixture(self) -> None:
         c = _store_with_set()
@@ -107,10 +119,39 @@ class RunnerOutcomeTests(unittest.TestCase):
         c = _store_with_set()
         a1 = _run(c, _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3), nonce="n1")
         a2 = _run(c, _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3), nonce="n2")
-        self.assertEqual(a1.run_id, a2.run_id)  # same (policy,set,head,detector) -> same job
+        self.assertEqual(a1.run_id, a2.run_id)  # same (policy,set,head,subject) -> same job
         self.assertEqual(a1.run_id, deterministic_job_id(
-            policy_id="p1", set_id="X", oracle_head=c.set_head("X"), detector_identity="det-1"))
+            policy_id="p1", set_id="X", oracle_head=c.set_head("X"), subject_identity="det-1"))
         self.assertNotEqual(a1.nonce, a2.nonce)  # attempts stay unique
+
+    def test_signed_subject_is_measurement_derived_not_the_caller_dedup_key(self) -> None:
+        # P1-3 core close: the SIGNED subject_identity is derived from the MEASURED run (resolved-profile
+        # digest + parent-measured execution identity), NEVER from the caller's expected_subject_identity
+        # (a dedup key only). A spoofed expected value cannot become the signed identity (no sign-A-run-B).
+        c = _store_with_set()
+        att = _run(c, _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3), requested="totally-spoofed-identity")
+        verify_measurement(att, verifier=KeyVerifier(_PUB))
+        self.assertNotEqual(att.subject_identity, "totally-spoofed-identity")
+        self.assertEqual(att.requested_subject_identity, "totally-spoofed-identity")  # signed governance value
+        self.assertEqual(att.subject_identity, calibrated_subject_identity(
+            att.resolved_profile_digest, att.execution_identity_digest))  # type: ignore[arg-type]
+
+    def test_unresolved_detector_is_signed_error_and_non_restorable(self) -> None:
+        # P1-3 conditional validity: a drifted / unregistered detector yields a SIGNED ERROR audit
+        # attestation with null components and null subject — categorically non-restorable (never a
+        # measurement that could restore a tier), and it must still verify as a valid signed record.
+        c = _store_with_set()
+
+        def _drift(_id: str) -> object:
+            raise UnregisteredDetectorError("the detector is no longer registered")
+
+        att = _run(c, _ScriptedDetector([]), resolve=_drift)
+        verify_measurement(att, verifier=KeyVerifier(_PUB))
+        self.assertIs(att.outcome, VerdictType.ERROR)
+        self.assertIsNone(att.subject_identity)
+        self.assertIsNone(att.execution_identity_digest)
+        self.assertIsNone(att.resolved_profile_digest)
+        self.assertFalse(att.is_clean_pass)
 
 
 class RunnerStructuralSeparationTests(unittest.TestCase):

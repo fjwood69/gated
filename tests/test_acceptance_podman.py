@@ -17,7 +17,6 @@ import subprocess
 from core import Command, Fixtures, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from gate.signing import KeyVerifier, SeedSigner, public_key
-from core.identity import DetectorManifest
 
 from gate.acceptance import (
     BlindHoldoutStore,
@@ -26,7 +25,7 @@ from gate.acceptance import (
 )
 from gate.authority import AuthorityDomain, GovernanceApproval
 from gate.backends import trusted_backend_guard, trusted_sandbox_factory
-from gate.detector_registry import DetectorRegistry, content_address
+from gate.detector_registry import DetectorRegistry, profile_of
 from sandbox.oci import OCISandbox
 
 IMAGE = "localhost/mori:local"
@@ -117,20 +116,18 @@ class AcceptanceAnchorOnRealPodmanTests(unittest.TestCase):
         holdout.append(Fixture("hg", FixtureLabel.KNOWN_GOOD, _GOOD_HOLD),
                        holdout_key=_HOLDOUT_KEY, approval=_cal_gov("cg1", "cg2"))
 
-        manifest = DetectorManifest(check_type="exit-code", entrypoint=("python3", "/artifact/main.py"),
-                                    impl_digest="exitcode-detector-build", eval_profile={"trials": 2})
         # detectors arrive by NAME through a trusted content-addressed registry, never as objects.
         registry = DetectorRegistry()
         honest, fn, fp = _ExitCodeDetector(), _AlwaysPass(), _AlwaysFail()
-        registry.register("honest", lambda: honest, content_hash=content_address(honest))
-        registry.register("fn", lambda: fn, content_hash=content_address(fn))
-        registry.register("fp", lambda: fp, content_hash=content_address(fp))
+        registry.register("honest", lambda: honest, accepted_profile_digest=profile_of("honest", honest).digest())
+        registry.register("fn", lambda: fn, accepted_profile_digest=profile_of("fn", fn).digest())
+        registry.register("fp", lambda: fp, accepted_profile_digest=profile_of("fp", fp).digest())
         report = run_acceptance_anchor(
             # §1.6: the AUDITED backend built through the trusted factory (token-stamped) + the guard.
             make_sandbox=trusted_sandbox_factory("oci", IMAGE), backend_guard=trusted_backend_guard,
             honest_detector_id="honest", fn_deficient_detector_id="fn", fp_happy_detector_id="fp",
-            resolve=registry.resolve, detector_manifest=manifest,
-            host_closure_digest="host-closure-oci-v1", visible_set=visible,
+            resolve=registry.resolve_bundle,
+            trust_policy_id="trust-policy:completed-trusted", visible_set=visible,
             blind_holdout_store=holdout, holdout_key=_HOLDOUT_KEY, signer=SeedSigner(_SIGNER_SEED),
             signer_principal="cal-gov-1", signer_approval=_cal_gov("cal-gov-1"),
             now=100.0, budget=_BUDGET, trials=2)
@@ -151,6 +148,8 @@ class AcceptanceAnchorOnRealPodmanTests(unittest.TestCase):
         # (blind under the trusted-detector model), and the real sandbox hash — nothing is a caller string.
         self.assertEqual(report.image_ref, image_digest)
         self.assertTrue(report.image_ref.startswith("sha256:"))
+        # P1-3: the receipt's detector identity is the trusted registry's resolved profile digest.
+        self.assertEqual(report.resolved_profile_digest, profile_of("honest", honest).digest())
         self.assertNotEqual(report.visible_corpus_digest, report.holdout_corpus_digest)
         self.assertTrue(report.sandbox_config_hash)
 

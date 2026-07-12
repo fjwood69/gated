@@ -42,9 +42,11 @@ def relay_outbox(
     for entry in calibration_store.undrained_outbox():
         current_head = calibration_store.set_head(entry.set_id)
         for policy_id, detector_identity in policy_store.enabled_policies_for_set(entry.set_id):
+            # the policy's stored identity IS the calibrated-subject identity (P1-3) — passed as the
+            # dedup/routing key, never as signed authority.
             job_id = deterministic_job_id(
                 policy_id=policy_id, set_id=entry.set_id, oracle_head=current_head,
-                detector_identity=detector_identity,
+                subject_identity=detector_identity,
             )
             if queue.enqueue(
                 job_id=job_id, policy_id=policy_id, set_id=entry.set_id, oracle_head=current_head,

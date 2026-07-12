@@ -29,13 +29,21 @@ from core import (
 )
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from core.identity import DetectorManifest, identity_for
+from engine.calibration import ResolvedDetector
 from gate.authority import GovernanceApproval
 from gate.calibration_store import AdmissionCapability, CalibrationStore, ChangeOp
+from gate.detector_registry import profile_of
 from gate.gatekeeper import ratify_enable, resolve_disposition, run_calibration
 from gate.policy_state import Disposition, PolicyState
 from gate.policy_store import PolicyStore
 from gate.snapshot import AttestationRecord, issue_snapshot
 from sandbox.noop import NoOpSandbox
+
+
+def _bundle(det):  # type: ignore[no-untyped-def]
+    # P1-3 v3/v4: run_calibration takes a BundleResolver (assertion + profile digest + frozen command).
+    return lambda _id: ResolvedDetector(
+        assertion=det, profile_digest=profile_of(_id, det).digest(), command=det.entrypoint())
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
 _KEY = b"gate-governance-key"
@@ -194,9 +202,9 @@ class Done2_LegibleRefuseTests(unittest.TestCase):
         # detector catches b1 [FAIL]*3, MISSES b2 [PASS]*3, passes g1 [PASS]*3.
         det = _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3 + [_PASS] * 3)
         outcome = run_calibration(
-            "p1", store=s, make_sandbox=_hermetic_factory(), detector_id="d", resolve=lambda _id: det,
+            "p1", store=s, make_sandbox=_hermetic_factory(), detector_id="d", resolve=_bundle(det),
             calibration_set=cset, budget=_BUDGET, calibration_chain_head="fx-head",
-            detector_identity="det-1", approval=_appr("gov1", op="p1-cal"), trials=3,
+            approval=_appr("gov1", op="p1-cal"), trials=3,
         )
         self.assertFalse(outcome.passed)
         self.assertIsNone(outcome.calibration_result_ref)  # no PASS -> no ref -> cannot enable
@@ -217,8 +225,8 @@ class Done3_PerPolicyIsolationTests(unittest.TestCase):
         )
         det = _ScriptedDetector([_PASS] * 3 + [_PASS] * 3)  # MISSES the known-bad
         run_calibration("pA", store=s, make_sandbox=_hermetic_factory(), detector_id="d",
-                        resolve=lambda _id: det, calibration_set=cset, budget=_BUDGET,
-                        calibration_chain_head="fx", detector_identity="det-A",
+                        resolve=_bundle(det), calibration_set=cset, budget=_BUDGET,
+                        calibration_chain_head="fx",
                         approval=_appr("gov1", op="pA-cal"), trials=3)
         self.assertIs(s.current_state("pA"), PolicyState.REJECTED)
         self.assertIs(_resolve(s, "pA").disposition, Disposition.SKIP_NEUTRAL)
@@ -237,16 +245,15 @@ class EnablePathTests(unittest.TestCase):
         )
         det = _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3)  # catches b1, passes g1
         outcome = run_calibration("p1", store=s, make_sandbox=_hermetic_factory(), detector_id="d",
-                                  resolve=lambda _id: det, calibration_set=cset, budget=_BUDGET,
-                                  calibration_chain_head="fx", detector_identity="det-1",
+                                  resolve=_bundle(det), calibration_set=cset, budget=_BUDGET,
+                                  calibration_chain_head="fx",
                                   approval=_appr("gov1", op="p1-cal"), trials=3)
         self.assertTrue(outcome.passed)
         self.assertIsNotNone(outcome.calibration_result_ref)  # PASS -> a ref to bind ENABLED to
         self.assertIs(s.current_state("p1"), PolicyState.CALIBRATING)  # NOT auto-enabled
         # human ratify with the ref the PASS produced (mechanically bound — gap-1).
         ratify_enable("p1", store=s, approval=_appr("gov1", op="p1-ratify"),
-                      calibration_result_ref=outcome.calibration_result_ref, pinned_set_version="fx",
-                      detector_identity="det-1")
+                      calibration_result_ref=outcome.calibration_result_ref, pinned_set_version="fx")
         self.assertIs(s.current_state("p1"), PolicyState.ENABLED)
 
 

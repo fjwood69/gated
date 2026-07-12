@@ -238,6 +238,7 @@ class PolicyStore:
         job_id: str,
         nonce: str,
         expect_policy_head: str | None = None,
+        expect_authorized_subject: str | None = None,
     ) -> int:
         """3.5 job-1: append a RE_ATTESTATION record — an EVIDENCE refresh, NOT a state transition.
 
@@ -281,6 +282,16 @@ class PolicyStore:
                 raise ReAttestConflict(
                     f"policy-evidence head for {policy_id} moved since the restore CAS read it "
                     f"(expected {expect_policy_head[:12]}..) — aborting re-attestation, will retry"
+                )
+            # v4 P1-b: the AUTHORIZED-SUBJECT check must be ATOMIC with the head CAS (same lock) — else a
+            # concurrent governance change of the authorized target (A->B) between the restore's read and
+            # this append would let a re-attest for the stale subject land. Verify the policy's CURRENT
+            # authorized subject still equals what the restore controller verified against.
+            if expect_authorized_subject is not None and \
+                    self._current_authorized_subject_unlocked(policy_id) != expect_authorized_subject:
+                raise ReAttestConflict(
+                    f"authorized subject for {policy_id} moved since the restore CAS read it "
+                    f"(expected {expect_authorized_subject!r}) — aborting re-attestation, will retry"
                 )
             if not self._pass_exists_unlocked(
                 calibration_result_ref, policy_id, pinned_set_version, detector_identity
@@ -383,6 +394,37 @@ class PolicyStore:
         if prow is None:
             return None
         return (str(prow["set_id"]), str(prow["pinned_set_version"]), str(prow["detector_identity"]))
+
+    def _current_authorized_subject_unlocked(self, policy_id: str) -> str | None:
+        """v4 P1-b: the subject identity the policy's CURRENT ENABLED calibration is bound to, read UNDER
+        THE LOCK (no verify_chain — the reattest CAS holds the lock and only needs the current binding).
+        None if the policy is not ENABLED or has no bound pass. Mirrors ``current_attestation``'s identity
+        column, used for the atomic authorized-subject check inside ``reattest``."""
+        row = self._conn().execute(
+            "SELECT new_state, calibration_result_ref FROM tier_transition_chain WHERE policy_id=? "
+            "ORDER BY seq DESC LIMIT 1", (policy_id,)
+        ).fetchone()
+        if row is None or row["new_state"] != PolicyState.ENABLED.value:
+            return None
+        prow = self._conn().execute(
+            "SELECT detector_identity FROM calibration_pass "
+            "WHERE calibration_result_ref=? AND policy_id=? LIMIT 1",
+            (row["calibration_result_ref"], policy_id)
+        ).fetchone()
+        return None if prow is None else str(prow["detector_identity"])
+
+    def subject_for_pass(
+        self, calibration_result_ref: str, policy_id: str, pinned_set_version: str,
+    ) -> str | None:
+        """v4 P1-a: recover the MEASURED subject identity bound to a persisted calibration_pass, so
+        ``ratify_enable`` enables the identity the RUN produced, not a caller-supplied one. None if no such
+        pass exists (a fabricated ref cannot enable)."""
+        row = self._conn().execute(
+            "SELECT detector_identity FROM calibration_pass WHERE calibration_result_ref=? AND policy_id=? "
+            "AND pinned_set_version=? LIMIT 1",
+            (calibration_result_ref, policy_id, pinned_set_version),
+        ).fetchone()
+        return None if row is None else str(row["detector_identity"])
 
     def _pass_exists_unlocked(
         self, calibration_result_ref: str, policy_id: str, pinned_set_version: str,

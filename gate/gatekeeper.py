@@ -37,14 +37,16 @@ from core.calibration import CalibrationSet
 from core.chain import content_digest
 from engine.calibration import (
     BackendGuard,
+    BundleResolver,
     CalibrationResult,
     DEFAULT_CALIBRATION_TRIALS,
-    DetectorResolver,
     calibrate,
 )
+from gate.attestation import calibrated_subject_identity
 from gate.authority import GovernanceApproval
 from gate.policy_state import Disposition, PolicyState, disposition_for
 from gate.policy_store import ChainIntegrityError, PolicyStore
+from gate.preflight import ConfigurationError
 from gate.snapshot import CalibrationSnapshot, SnapshotError, attested_record, verify_snapshot
 
 # Exceptions that mean "the tier store could not be reached" (vs "the chain is tampered", which is
@@ -244,11 +246,10 @@ def run_calibration(
     store: PolicyStore,
     make_sandbox: Callable[[], Sandbox],
     detector_id: str,
-    resolve: DetectorResolver,
+    resolve: BundleResolver,
     calibration_set: CalibrationSet,
     budget: ResourceBudget,
     calibration_chain_head: str,
-    detector_identity: str,
     approval: GovernanceApproval,
     set_id: str = "default",
     trials: int = DEFAULT_CALIBRATION_TRIALS,
@@ -259,7 +260,12 @@ def run_calibration(
     on FAIL records CALIBRATING->REJECTED with the breaking fixtures in the (tamper-evident) reason;
     on PASS PERSISTS a calibration_pass attestation (the thing ENABLED binds to, gap-1) and LEAVES
     the policy at CALIBRATING (awaiting human ratify). It NEVER enables — enabling is
-    ``ratify_enable`` (the human gate)."""
+    ``ratify_enable`` (the human gate).
+
+    v4 P1-a (fold): the enable path no longer trusts a CALLER identity. The calibration_pass binds the
+    MEASUREMENT-DERIVED subject — H(resolved_profile_digest, execution_identity) from the SAME calibration
+    run, exactly as ``run_recalibration`` — so governance later chooses WHICH persisted pass to ratify but
+    cannot define what code it ran."""
     store.transition(
         policy_id, PolicyState.CALIBRATING, approval=approval,
         pinned_set_version=calibration_chain_head,
@@ -270,10 +276,17 @@ def run_calibration(
     breaking = (*result.fn_failures, *result.fp_failures, *result.flaky, *result.harness_errors)
     ref: str | None = None
     if result.passed:
-        ref = _result_ref(policy_id, calibration_chain_head, detector_identity, result)
+        rpd = result.resolved_profile_digest
+        eid = result.execution_identity.digest() if result.execution_identity is not None else None
+        if rpd is None or eid is None:  # a clean pass implies both (identity_consistent + bundle); fail-closed
+            raise ConfigurationError(
+                "a PASSED calibration lacked a resolved-profile or execution identity — cannot derive the "
+                "measured subject; refusing to persist an un-attributable pass")
+        subject = calibrated_subject_identity(rpd, eid)
+        ref = _result_ref(policy_id, calibration_chain_head, subject, result)
         store.record_calibration_pass(
             ref, policy_id=policy_id, pinned_set_version=calibration_chain_head,
-            detector_identity=detector_identity, set_id=set_id,
+            detector_identity=subject, set_id=set_id,
         )
     else:
         store.transition(
@@ -293,18 +306,23 @@ def ratify_enable(
     approval: GovernanceApproval,
     calibration_result_ref: str,
     pinned_set_version: str,
-    detector_identity: str,
 ) -> int:
-    """The human-gated CALIBRATING->ENABLED grant, ANCHORED to a PERSISTED PASS (addition #3 +
-    gap-1): the store requires non-null anchors AND that ``calibration_result_ref`` match a recorded
-    calibration_pass for (policy, pinned_set_version, detector_identity) — a fabricated reference
-    cannot enable. The ``approval`` carries the ratifier principal(s). This is the shadow->binding
-    graduation — a governance decision informed by the ``run_calibration`` report, NOT a config flag.
-    The store also enforces the legal edge (state must be CALIBRATING)."""
+    """The human-gated CALIBRATING->ENABLED grant, ANCHORED to a PERSISTED PASS (addition #3 + gap-1).
+
+    v4 P1-a: governance chooses WHICH persisted pass to ratify (the ``calibration_result_ref``) but does
+    NOT supply the identity — the store RECOVERS the measurement-derived subject bound to that ref and
+    enables THAT. A caller can no longer rewrite the enabled identity; a fabricated ref recovers no subject
+    and cannot enable. ``approval`` carries the ratifier principal(s). The store enforces the legal edge
+    (state must be CALIBRATING)."""
+    subject = store.subject_for_pass(calibration_result_ref, policy_id, pinned_set_version)
+    if subject is None:
+        raise ConfigurationError(
+            f"no persisted calibration_pass matches ref={calibration_result_ref!r} for "
+            f"({policy_id}, set={pinned_set_version}) — a fabricated reference cannot enable")
     return store.transition(
         policy_id, PolicyState.ENABLED, approval=approval,
         calibration_result_ref=calibration_result_ref, pinned_set_version=pinned_set_version,
-        detector_identity=detector_identity,
+        detector_identity=subject,
     )
 
 

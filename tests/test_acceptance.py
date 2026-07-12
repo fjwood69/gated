@@ -16,9 +16,7 @@ from pathlib import Path
 
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
-from core.chain import content_digest
 from gate.signing import KeyVerifier, SeedSigner, public_key
-from core.identity import DetectorManifest, identity_for
 from gate.acceptance import (
     AcceptanceError,
     BlindHoldoutError,
@@ -27,7 +25,7 @@ from gate.acceptance import (
     verify_report,
 )
 from gate.authority import AuthorityDomain, GovernanceApproval
-from gate.detector_registry import DetectorRegistry, content_address
+from gate.detector_registry import DetectorRegistry, profile_of
 from sandbox.noop import NoOpSandbox
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
@@ -62,13 +60,21 @@ class _ScriptedDetector:
         return v
 
 
+class _OtherEntrypoint(_ScriptedDetector):
+    """Same module bytes as _ScriptedDetector, DIFFERENT entrypoint — its resolved profile digest must
+    differ, so an acceptance receipt for one detector cannot be reused for the other (P1-3 neg 2)."""
+
+    def entrypoint(self) -> Command:
+        return Command(argv=("false",))
+
+
 def _registry(**detectors: object) -> DetectorRegistry:
     """A trusted content-addressed registry binding each id to its detector (each detector cached, so a
     stateful scripted honest detector keeps ONE instance across the visible + holdout lanes — the anchor
     grades the SAME build). Exercises the real resolver the entry point calls."""
     reg = DetectorRegistry()
     for did, det in detectors.items():
-        reg.register(did, (lambda d=det: d), content_hash=content_address(det))
+        reg.register(did, (lambda d=det: d), accepted_profile_digest=profile_of(did, det).digest())
     return reg
 
 
@@ -93,17 +99,16 @@ def _holdout() -> BlindHoldoutStore:
     return store
 
 
-_MANIFEST = DetectorManifest(check_type="egress", entrypoint=("python3", "main.py"),
-                             impl_digest="detector-build-abc", eval_profile={"trials": 3})
-_HOST_CLOSURE = "host-closure-digest-v1"
+_TRUST_POLICY_ID = "trust-policy:completed-trusted"
 
 
-def _run(store: BlindHoldoutStore, *, honest, fn, fp, signer=None, make_sandbox=None):  # type: ignore[no-untyped-def]
-    resolve = _registry(honest=honest, fn=fn, fp=fp).resolve  # detectors by NAME through the registry
+def _run(store: BlindHoldoutStore, *, honest, fn, fp, signer=None, make_sandbox=None,  # type: ignore[no-untyped-def]
+         trust_policy_id=_TRUST_POLICY_ID):
+    reg = _registry(honest=honest, fn=fn, fp=fp)  # detectors by NAME through the trusted registry
     return run_acceptance_anchor(
         make_sandbox=make_sandbox or _factory(), honest_detector_id="honest",
-        fn_deficient_detector_id="fn", fp_happy_detector_id="fp", resolve=resolve,
-        detector_manifest=_MANIFEST, host_closure_digest=_HOST_CLOSURE,
+        fn_deficient_detector_id="fn", fp_happy_detector_id="fp", resolve=reg.resolve_bundle,
+        trust_policy_id=trust_policy_id,
         visible_set=_VISIBLE, blind_holdout_store=store, holdout_key=_HOLDOUT_KEY,
         signer=SeedSigner(_SIGNER_SEED), signer_principal="cal-gov-1",
         signer_approval=signer or _cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3)
@@ -134,10 +139,11 @@ class AcceptanceAnchorTests(unittest.TestCase):
         self.assertEqual(report.visible_coverage, 2)
         self.assertEqual(report.holdout_coverage, 2)           # no silent skip
         self.assertIn("provisional", report.claim)             # honest claim, not "proven"
-        # board #3/#8: the receipt binds WHAT was tested, DERIVED from execution (not caller strings).
-        expected_id = identity_for(_MANIFEST, host_closure_digest=_HOST_CLOSURE,
-                                   artifact_image_digest=content_digest({"image": report.image_ref}))
-        self.assertEqual(report.detector_identity, expected_id)  # COMPUTED, not a caller string
+        # P1-3: the receipt's DETECTOR identity is the RESOLVER-derived profile digest (module bytes +
+        # entrypoint + trusted config) — NOT a caller manifest. The ENVIRONMENT is bound separately.
+        self.assertEqual(report.resolved_profile_digest, profile_of("honest", _honest()).digest())
+        self.assertTrue(report.measured_execution_identity)      # env identity, DERIVED from the real run
+        self.assertEqual(report.trust_policy_id, _TRUST_POLICY_ID)
         self.assertEqual(report.image_ref, "<_HermeticNoOp>")    # DERIVED from the real sandbox
         self.assertEqual(report.trials, 3)
         # disjoint holdout (blind under the trusted-detector model — the verdict side-channel means
@@ -152,7 +158,7 @@ class AcceptanceAnchorTests(unittest.TestCase):
         report = _run(store, honest=_honest(),
                       fn=_ScriptedDetector([_PASS] * 3 + [_PASS] * 3),
                       fp=_ScriptedDetector([_FAIL] * 3 + [_FAIL] * 3))
-        blob = str(report._payload())
+        blob = str(report._envelope())
         for secret in ("hb", "hg", "bad-holdout", "good-holdout", "vb", "vg"):
             self.assertNotIn(secret, blob)  # only counts + booleans + digests
 
@@ -226,6 +232,63 @@ class AcceptanceAnchorTests(unittest.TestCase):
             _run(store, honest=_honest(),
                  fn=_ScriptedDetector([_PASS] * 6), fp=_ScriptedDetector([_FAIL] * 6),
                  signer=gov_signer)
+
+    def test_signed_identity_is_resolver_derived_not_caller_supplied(self) -> None:
+        # P1-3 (neg 3): the caller has NO channel to describe the detector — run_acceptance_anchor takes
+        # no detector_manifest / host_closure_digest, only an injected resolve_profile. The signed
+        # detector identity is exactly the trusted registry's resolved profile digest — no sign-A-run-B.
+        import inspect
+        params = inspect.signature(run_acceptance_anchor).parameters
+        self.assertNotIn("detector_manifest", params)
+        self.assertNotIn("host_closure_digest", params)
+        self.assertIn("resolve", params)  # the single ATOMIC bundle resolver (v3) — assertion + profile
+        store = _holdout()
+        report = _run(store, honest=_honest(),
+                      fn=_ScriptedDetector([_PASS] * 6), fp=_ScriptedDetector([_FAIL] * 6))
+        self.assertEqual(report.resolved_profile_digest, profile_of("honest", _honest()).digest())
+
+    def test_alternating_resolver_for_the_honest_lane_is_refused(self) -> None:
+        # v4 P1-d: the visible-honest and holdout-honest lanes MUST resolve the SAME detector. A resolver
+        # that returns a DIFFERENT profile on the 2nd honest resolve (the holdout lane) than the 1st (the
+        # visible lane) is refused — otherwise the holdout is graded by a different detector than the one
+        # the receipt signs. Guard = the visible==holdout profile-digest equality; remove it and this signs.
+        store = _holdout()
+        a = _honest()
+        b = _OtherEntrypoint([_FAIL] * 3 + [_PASS] * 3 + [_FAIL] * 3 + [_PASS] * 3)  # different entrypoint
+        fn = _ScriptedDetector([_PASS] * 3 + [_PASS] * 3)
+        fp = _ScriptedDetector([_FAIL] * 3 + [_FAIL] * 3)
+        reg = DetectorRegistry()
+        reg.register("ha", lambda: a, accepted_profile_digest=profile_of("ha", a).digest())
+        reg.register("hb", lambda: b, accepted_profile_digest=profile_of("hb", b).digest())
+        reg.register("fn", lambda: fn, accepted_profile_digest=profile_of("fn", fn).digest())
+        reg.register("fp", lambda: fp, accepted_profile_digest=profile_of("fp", fp).digest())
+        calls = {"honest": 0}
+
+        def alternating(did):  # type: ignore[no-untyped-def]
+            if did == "honest":
+                calls["honest"] += 1
+                return reg.resolve_bundle("ha" if calls["honest"] == 1 else "hb")  # visible=A, holdout=B
+            return reg.resolve_bundle(did)
+
+        with self.assertRaises(AcceptanceError):
+            run_acceptance_anchor(
+                make_sandbox=_factory(), honest_detector_id="honest", fn_deficient_detector_id="fn",
+                fp_happy_detector_id="fp", resolve=alternating, trust_policy_id=_TRUST_POLICY_ID,
+                visible_set=_VISIBLE, blind_holdout_store=store, holdout_key=_HOLDOUT_KEY,
+                signer=SeedSigner(_SIGNER_SEED), signer_principal="cal-gov-1",
+                signer_approval=_cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3)
+
+    def test_same_module_different_entrypoint_is_a_distinct_identity(self) -> None:
+        # P1-3 (neg 2): the entrypoint argv is part of the resolved profile, so a detector with the SAME
+        # module bytes but a DIFFERENT entrypoint has a DIFFERENT identity — a receipt for one cannot be
+        # reused for the other. (Guard = entrypoint_argv in ResolvedDetectorProfile.digest; drop it and
+        # these two digests collide and this fails.)
+        store = _holdout()
+        report = _run(store, honest=_honest(),
+                      fn=_ScriptedDetector([_PASS] * 6), fp=_ScriptedDetector([_FAIL] * 6))
+        other = _OtherEntrypoint([_FAIL] * 6)  # same module, entrypoint ("false",) not ("true",)
+        self.assertNotEqual(report.resolved_profile_digest, profile_of("honest", other).digest())
+        self.assertEqual(report.resolved_profile_digest, profile_of("honest", _honest()).digest())
 
 
 class BlindHoldoutTests(unittest.TestCase):

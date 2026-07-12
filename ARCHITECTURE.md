@@ -141,6 +141,23 @@ content-addressed, signed artifact store** (e.g. signed OCI images), and signing
 None of these are TEE/MPC-grade requirements — they are ordinary container hygiene the reference
 deliberately defers. (3.5 #4 / Option B, 2026-07.)
 
+**Named residuals of the v4 identity hardening (trusted-process model — hygiene, not runtime assurance).**
+Resolution PINS one process-lifetime bundle (assertion + validated profile digest + frozen entrypoint
+command), so the executed command and the signed profile cannot diverge, the cached digest is never
+recomputed from a mutable object, and the trusted `behavioral_config` is deep-frozen at registration.
+Three residuals remain, closed only at the deploy tier:
+- **First-resolve read.** At first resolution the profile is a hash of the module's **source file bytes**
+  while the runnable object comes from Python's **already-imported** module. A swap between import and that
+  single read is a first-resolve-only window; strong closure is an **immutable verified execution process**
+  (a custom loader binding the exact loaded bytes is deploy-tier, not built here).
+- **Registry-update blast radius.** The authorized target is the ENABLED policy's bound subject
+  (`current_attestation`), matched exactly on restore. A detector **v1→v2** registry update therefore
+  leaves every ENABLED policy bound to v1 **UNATTESTABLE** (restore refused) until it is re-accepted with
+  the new version — the correct fail-closed posture, stated so operators know the blast radius.
+- **In-process monkeypatch.** The loaded host-side object could be monkeypatched in process; the registry
+  is hygiene against file/config drift, not a guarantee the object still implements the hashed bytes. The
+  trusted-process model is the boundary; an immutable execution process is the deploy-tier close.
+
 ## 3.5-close hardening — exactly what it binds, and what it does NOT
 
 The close increment narrows every claim to what the in-process reference *establishes* — **identity /

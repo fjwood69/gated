@@ -20,6 +20,7 @@ from gate.attestation_store import MeasurementAttestationStore
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
 from gate.calibration_store import AdmissionCapability
+from gate.detector_registry import DetectorRegistry, profile_of
 from gate.gatekeeper import resolve_disposition
 from gate.policy_state import Disposition, PolicyState
 from gate.policy_store import PolicyStore
@@ -35,7 +36,6 @@ _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
 _SEED = bytes(range(32))
 _PUB = public_key(_SEED)
 _ISSUER = "cal-gov-1"
-_DET = "det-1"
 _FAIL = Verdict(VerdictType.FAIL, Reason.EGRESS_ONE)
 _PASS = Verdict(VerdictType.PASS, Reason.EGRESS_GE_2)
 
@@ -64,6 +64,14 @@ class _ScriptedDetector:
         v = self._verdicts[self._i]
         self._i += 1
         return v
+
+
+class _OtherEntrypoint(_ScriptedDetector):
+    """Same module, DIFFERENT entrypoint -> a DIFFERENT resolved profile -> a DIFFERENT measured subject
+    (v3 governance-target negatives)."""
+
+    def entrypoint(self) -> Command:
+        return Command(argv=("false",))
 
 
 def _appr(*p: str, op: str) -> GovernanceApproval:
@@ -102,12 +110,31 @@ def _controller(s: PolicyStore, c: CalibrationStore, *, trusted: bool = True,
         identity_trusted=lambda _i: trusted)
 
 
-def _run(c: CalibrationStore, verdicts: list[Verdict], *, tier_gen: str = "tg", nonce: str = "n1"):  # type: ignore[no-untyped-def]
-    det = _ScriptedDetector(verdicts)
+def _run(c: CalibrationStore, verdicts: list[Verdict], *, tier_gen: str = "tg", nonce: str = "n1",  # type: ignore[no-untyped-def]
+         requested: str | None = None, detector: "_ScriptedDetector | None" = None):
+    # detectors arrive by NAME through a trusted registry via the ATOMIC bundle (P1-3 v3); the SIGNED
+    # subject is measurement-derived. ``requested`` defaults to the policy's authorized subject (_DET).
+    det = detector if detector is not None else _ScriptedDetector(verdicts)
+    reg = DetectorRegistry()
+    reg.register("d", lambda: det, accepted_profile_digest=profile_of("d", det).digest())
     return run_recalibration(
         policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(),
-        detector_id="d", resolve=lambda _id: det, detector_identity=_DET, tier_generation=tier_gen,
+        detector_id="d", resolve=reg.resolve_bundle,
+        requested_subject_identity=(requested if requested is not None else _DET), tier_generation=tier_gen,
         budget=_BUDGET, issuer=_ISSUER, nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3)
+
+
+# The deterministic MEASUREMENT-DERIVED subject identity for this module's detector + NoOp environment
+# (P1-3): resolved-profile digest (module bytes + entrypoint + config) ⊕ parent-measured execution
+# identity. The whole restore loop binds and enforces THIS — not a caller string. Computed from one clean
+# pass; constant across runs because both components are deterministic here.
+def _canonical_subject() -> str:
+    att = _run(_cal_store(), [_FAIL] * 3 + [_PASS] * 3, requested="bootstrap")
+    assert att.subject_identity is not None
+    return att.subject_identity
+
+
+_DET = _canonical_subject()
 
 
 class RestoreControllerTests(unittest.TestCase):
@@ -237,6 +264,69 @@ class RestoreControllerTests(unittest.TestCase):
         att = _run(c, [_FAIL] * 3 + [_PASS] * 3)  # a valid clean PASS
         s.transition("p1", PolicyState.ADVISORY, approval=_appr("g1", "g2", op="demote"))  # human demote
         self.assertIs(_controller(s, c).attempt_restore(att).result, RestoreResult.REFUSED_NOT_ENABLED)
+
+
+class V3GovernanceTargetTests(unittest.TestCase):
+    """v3 (board P1): measurement ≠ governance — a re-cal can only re-attest the policy's CURRENTLY
+    authorized subject. A clean PASS whose measured subject differs (or whose request targets a subject
+    the policy is not authorized for) must NOT re-bind the policy."""
+
+    def test_measurement_cannot_rebind_policy_to_a_different_subject(self) -> None:
+        c = _cal_store()
+        s = _policy_store_enabled(c.set_head("X"))  # authorized for subject A (== _DET)
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift"),
+                 fixture_id="b2", set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
+        other = _OtherEntrypoint([_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3)  # catches b1,b2; passes g1
+        # attack 1: request claims the authorized subject A, but the run MEASURED subject B.
+        att = _run(c, [], detector=other, requested=_DET)
+        self.assertIs(att.outcome, VerdictType.PASS)
+        self.assertNotEqual(att.subject_identity, _DET)              # measured B != authorized A
+        self.assertIs(_controller(s, c).attempt_restore(att).result,
+                      RestoreResult.REFUSED_SUBJECT_MISMATCH)         # measured != requested
+        # attack 2: request matches the measured B, but B is not the policy's authorized target A.
+        subject_b = att.subject_identity
+        assert subject_b is not None
+        att2 = _run(c, [], detector=_OtherEntrypoint([_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3),
+                    requested=subject_b, nonce="n2")
+        self.assertEqual(att2.subject_identity, subject_b)
+        self.assertIs(_controller(s, c).attempt_restore(att2).result,
+                      RestoreResult.REFUSED_SUBJECT_MISMATCH)         # requested != policy's authorized target
+
+    def test_reattest_refuses_when_authorized_subject_moved(self) -> None:
+        # v4 P1-b: the authorized-subject check is ATOMIC with the head CAS (under the store lock). If the
+        # policy's authorized target no longer equals what the restore verified, reattest raises
+        # ReAttestConflict — closing the read-authorized-then-CAS-on-head-only race. Guard = the
+        # expect_authorized_subject check inside reattest; remove it and this re-attests a stale subject.
+        from gate.policy_store import ReAttestConflict
+        c = _cal_store()
+        s = _policy_store_enabled(c.set_head("X"))  # authorized target == _DET, bound to ref "cal-0"
+        cap = ReAttestCapability(s)
+        with self.assertRaises(ReAttestConflict):
+            cap.reattest(
+                "p1", calibration_result_ref="cal-0", pinned_set_version=c.set_head("X"),
+                detector_identity=_DET, job_id="j", nonce="n", expect_policy_head=s.policy_head("p1"),
+                expect_authorized_subject="a-DIFFERENT-authorized-subject")  # != current -> conflict
+
+    def test_store_get_rejects_a_tampered_row(self) -> None:
+        # v3 (board P2): the store binds the lookup key to content — a row whose bytes were tampered
+        # recomputes to a different ref, so get() refuses it.
+        from gate.attestation import AttestationError
+        store = _att_store()
+        ref = store.persist(_run(_cal_store(), [_FAIL] * 3 + [_PASS] * 3))
+        store._conn().execute(  # type: ignore[attr-defined]
+            "UPDATE measurement_attestation SET signature=? WHERE ref=?", ("00" * 64, ref))
+        with self.assertRaises(AttestationError):
+            store.get(ref)
+
+    def test_store_persist_rejects_conflicting_bytes_for_a_ref(self) -> None:
+        from gate.attestation import AttestationError
+        store = _att_store()
+        att = _run(_cal_store(), [_FAIL] * 3 + [_PASS] * 3)
+        ref = store.persist(att)
+        store._conn().execute(  # type: ignore[attr-defined]
+            "UPDATE measurement_attestation SET signature=? WHERE ref=?", ("00" * 64, ref))
+        with self.assertRaises(AttestationError):
+            store.persist(att)  # same computed ref, but the stored bytes now differ -> reject
 
 
 class RestoreControllerStructuralTests(unittest.TestCase):

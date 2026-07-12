@@ -47,13 +47,12 @@ from typing import Callable
 from core import ResourceBudget, Sandbox
 from gate import signing
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
-from core.chain import content_digest
-from core.identity import DetectorManifest, identity_for
+from core.chain import canonical_digest, content_digest
 from engine.calibration import (
     DEFAULT_CALIBRATION_TRIALS,
     BackendGuard,
+    BundleResolver,
     CalibrationResult,
-    DetectorResolver,
     calibrate,
 )
 from gate.authority import AuthorityDomain, GovernanceApproval
@@ -170,25 +169,44 @@ class BlindHoldoutStore:
 
 # ---- the signed acceptance report ----------------------------------------------------------------
 
+CALIBRATION_ENVELOPE_VERSION = 1
+_ENVELOPE_DOMAIN = "gated.acceptance-envelope"
+
+
 @dataclass(frozen=True)
 class AcceptanceReport:
     """The signed receipt. Records the two-sided outcomes, the holdout generalisation, the confound
     closures (short_circuit OFF, sandbox config hash, coverage counts), the honest claim, and who
     signed it (a CALIBRATION_GOVERNANCE principal the detector author is not). Leaks NO fixture id or
-    content — only counts + booleans + digests."""
+    content — only counts + booleans + digests.
+
+    3.5-close P1-3: the DETECTOR identity the receipt binds is the ``resolved_profile_digest`` — the
+    ``ResolvedDetectorProfile.digest()`` the TRUSTED REGISTRY returned for the honest detector id (module
+    bytes + entrypoint + trusted behavioral_config), NOT a caller-supplied ``DetectorManifest``. A caller
+    can no longer sign-A-run-B by describing detector A while the resolver runs detector B: the signed id
+    comes only from what the registry actually resolved. The ENVIRONMENT is bound separately as the
+    ``measured_execution_identity`` — the parent-measured 4-tuple identity digest of the lanes that
+    actually ran (never a probe, never a caller string). The signed payload is a domain-separated,
+    schema-validated ``CalibrationEnvelope`` (``canonical_digest`` — rejects floats/type-confusion), so
+    the receipt's identity is cross-language reproducible and tamper-evident on every field."""
 
     accepted: bool
-    honest_passes: bool         # an honest detector PASSES the visible two-sided set
-    refuses_on_fn: bool         # a known-bad-missing detector is REFUSED
-    refuses_on_fp: bool         # a known-good-blocking detector is REFUSED
-    generalises: bool           # the honest detector PASSES the blind holdout (not memorisation)
-    short_circuit: bool         # asserted OFF
-    detector_identity: str      # the 4-tuple execution identity of the HONEST detector under test
-    visible_corpus_digest: str  # digest of the exact visible fixtures (id+label+payload)
-    holdout_corpus_digest: str  # digest of the exact blind-holdout fixtures
-    trials: int                 # trials per fixture (the run's statistical depth)
-    image_ref: str              # the PINNED sandbox image (a digest, not a mutable tag)
-    sandbox_config_hash: str    # computed from the REAL sandbox isolation level + image_ref
+    honest_passes: bool           # an honest detector PASSES the visible two-sided set
+    refuses_on_fn: bool           # a known-bad-missing detector is REFUSED
+    refuses_on_fp: bool           # a known-good-blocking detector is REFUSED
+    generalises: bool             # the honest detector PASSES the blind holdout (not memorisation)
+    short_circuit: bool           # asserted OFF
+    resolved_profile_digest: str  # P1-3: the HONEST detector's RESOLVER-DERIVED profile digest (trusted)
+    fn_control_profile_digest: str  # v3: the FN-deficient control's profile digest (which control refused)
+    fp_control_profile_digest: str  # v3: the FP-happy control's profile digest (which control refused)
+    measured_execution_identity: str  # parent-measured lane identity digest (env; not a caller string)
+    trust_policy_id: str          # which observation trust policy governed the run (P1-5 content-addresses it)
+    visible_corpus_digest: str    # digest of the exact visible fixtures (id+label+payload)
+    holdout_corpus_digest: str    # digest of the exact blind-holdout fixtures
+    trials: int                   # trials per fixture (the run's statistical depth)
+    budget_wall_clock_ms: int     # the calibration wall-clock budget (ms; canonical — no float in the envelope)
+    image_ref: str                # the PINNED sandbox image (a digest, not a mutable tag)
+    sandbox_config_hash: str      # computed from the REAL sandbox isolation level + image_ref
     visible_coverage: int
     holdout_coverage: int
     signer_principal: str
@@ -196,17 +214,33 @@ class AcceptanceReport:
     issued_at: float
     signature: str = ""
 
-    def _payload(self) -> dict[str, object]:
+    def _envelope(self) -> dict[str, object]:
+        """The CalibrationEnvelope — the SIGNED content, EXCLUDING ``signature``. Four domain groups:
+        the resolver-derived detector identity, the calibration inputs, the measured execution identity,
+        and the outcome/coverage. Every field except the signature is inside it, so a signature covers the
+        whole receipt. Float-free (``issued_at`` is bound as integer ms) so ``canonical_digest`` accepts
+        it — the schema validation is the point, not a workaround."""
         return {
-            "accepted": self.accepted, "honest_passes": self.honest_passes,
-            "refuses_on_fn": self.refuses_on_fn, "refuses_on_fp": self.refuses_on_fp,
-            "generalises": self.generalises, "short_circuit": self.short_circuit,
-            "detector_identity": self.detector_identity,
-            "visible_corpus_digest": self.visible_corpus_digest,
-            "holdout_corpus_digest": self.holdout_corpus_digest, "trials": self.trials,
-            "image_ref": self.image_ref, "sandbox_config_hash": self.sandbox_config_hash,
-            "visible_coverage": self.visible_coverage, "holdout_coverage": self.holdout_coverage,
-            "signer_principal": self.signer_principal, "claim": self.claim, "issued_at": self.issued_at,
+            "resolved_profile_digest": self.resolved_profile_digest,
+            "calibration_inputs": {
+                "visible_corpus_digest": self.visible_corpus_digest,
+                "holdout_corpus_digest": self.holdout_corpus_digest,
+                "trials": self.trials,
+                "budget_wall_clock_ms": self.budget_wall_clock_ms,
+                "trust_policy_id": self.trust_policy_id,
+                "fn_control_profile_digest": self.fn_control_profile_digest,
+                "fp_control_profile_digest": self.fp_control_profile_digest,
+            },
+            "measured_execution_identity": self.measured_execution_identity,
+            "outcome_and_coverage": {
+                "accepted": self.accepted, "honest_passes": self.honest_passes,
+                "refuses_on_fn": self.refuses_on_fn, "refuses_on_fp": self.refuses_on_fp,
+                "generalises": self.generalises, "short_circuit": self.short_circuit,
+                "visible_coverage": self.visible_coverage, "holdout_coverage": self.holdout_coverage,
+                "image_ref": self.image_ref, "sandbox_config_hash": self.sandbox_config_hash,
+                "signer_principal": self.signer_principal, "claim": self.claim,
+                "issued_at_ms": int(round(self.issued_at * 1000)),
+            },
         }
 
 
@@ -230,19 +264,26 @@ def _content_hashes(cset: CalibrationSet) -> set[str]:
     return {hashlib.sha256(f.payload).hexdigest() for f in (*cset.known_bad, *cset.known_good)}
 
 
+def _envelope_digest(report: AcceptanceReport) -> str:
+    """The domain-separated, schema-validated digest of the CalibrationEnvelope — what gets signed. Uses
+    ``canonical_digest`` (NFC-normalised, float-rejecting, domain-tagged, versioned), so the signed bytes
+    are cross-language reproducible and a type-confusion cannot collide two distinct receipts."""
+    return canonical_digest(_ENVELOPE_DOMAIN, report._envelope(), version=CALIBRATION_ENVELOPE_VERSION)
+
+
 def _sign_report(unsigned: AcceptanceReport, signer: signing.Signer) -> AcceptanceReport:
     from dataclasses import replace
 
-    canonical = json.dumps(unsigned._payload(), sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return replace(unsigned, signature=signer.sign(canonical).hex())
+    return replace(unsigned, signature=signer.sign(_envelope_digest(unsigned).encode("utf-8")).hex())
 
 
 def verify_report(report: AcceptanceReport, *, verifier: signing.Verifier) -> bool:
     """True iff the report's Ed25519 signature is valid under the CALIBRATION_GOVERNANCE ``Verifier``
-    (3.5-close #1.4: a ``Verifier`` OBJECT holding only the public key — it cannot forge a receipt)."""
-    canonical = json.dumps(report._payload(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    (3.5-close #1.4: a ``Verifier`` OBJECT holding only the public key — it cannot forge a receipt). The
+    signature is over the domain-separated CalibrationEnvelope digest, so any tampered field (including the
+    resolver-derived detector identity) invalidates it."""
     try:
-        return verifier.verify(canonical, bytes.fromhex(report.signature))
+        return verifier.verify(_envelope_digest(report).encode("utf-8"), bytes.fromhex(report.signature))
     except ValueError:
         return False
 
@@ -253,9 +294,8 @@ def run_acceptance_anchor(
     honest_detector_id: str,
     fn_deficient_detector_id: str,
     fp_happy_detector_id: str,
-    resolve: DetectorResolver,
-    detector_manifest: DetectorManifest,
-    host_closure_digest: str,
+    resolve: BundleResolver,
+    trust_policy_id: str,
     visible_set: CalibrationSet,
     blind_holdout_store: BlindHoldoutStore,
     holdout_key: bytes,
@@ -280,10 +320,17 @@ def run_acceptance_anchor(
     the anchor refuses (an anchor whose lanes ran in different environments proves nothing). The removed
     ``make_sandbox()`` probe was a SEPARATE construction an adversarial factory could answer differently
     from the sandboxes that ran the fixtures; the identity now comes only from the sandboxes that DID run
-    them. The detector's 4-tuple identity is then COMPUTED (``core.identity.identity_for``) from the
-    content-addressed ``detector_manifest`` + ``host_closure_digest`` + that attested image; the
-    ``sandbox_config_hash`` is computed from the attested isolation + image. Also refuses if the visible +
-    holdout corpora share any content (a holdout that duplicates the visible set proves memorisation)."""
+    them.
+
+    3.5-close P1-3 — the DETECTOR identity is RESOLVER-DERIVED, not caller-supplied: the receipt binds
+    ``resolved_profile_digest = resolve_profile(honest_detector_id).digest()`` — the trusted registry's
+    ``ResolvedDetectorProfile`` for the honest detector (module bytes + entrypoint + trusted
+    behavioral_config), which ALSO revalidates that the resolved detector has not drifted. The caller no
+    longer passes a ``DetectorManifest`` or ``host_closure_digest`` at all, so it cannot describe one
+    detector while the resolver runs another (sign-A-run-B). The ENVIRONMENT is bound separately as the
+    parent-measured lane identity (``measured_execution_identity``); the ``sandbox_config_hash`` is
+    computed from the attested isolation + image. Also refuses if the visible + holdout corpora share any
+    content (a holdout that duplicates the visible set proves memorisation)."""
     if not signer_approval.meets(1, domain=AuthorityDomain.CALIBRATION_GOVERNANCE):
         raise AcceptanceError(
             "the acceptance report must be signed by a CALIBRATION_GOVERNANCE principal — the detector "
@@ -335,10 +382,25 @@ def run_acceptance_anchor(
     assert identity is not None  # narrowed by the guard above (all four are non-None and equal)
     image_ref = identity.image_ref
     sandbox_config_hash = sandbox_config_digest(isolation=identity.isolation_level, image=image_ref)
-    detector_identity = identity_for(
-        detector_manifest, host_closure_digest=host_closure_digest,
-        artifact_image_digest=content_digest({"image": image_ref}),
-    )
+    measured_execution_identity = identity.digest()
+    # P1-3 v3 (atomicity): the DETECTOR identity comes from the SAME calibration op that ran it — the
+    # honest lane's ``resolved_profile_digest`` (carried out of ``calibrate`` via the atomic bundle),
+    # NOT a separate post-hoc resolution. The FN/FP control profile digests are bound too, so the receipt
+    # records exactly WHICH controls established its refusal claims (board HOLD).
+    resolved_profile_digest = honest.resolved_profile_digest
+    if (resolved_profile_digest is None or fn.resolved_profile_digest is None
+            or fp.resolved_profile_digest is None or gen.resolved_profile_digest is None):
+        raise AcceptanceError(
+            "a calibration lane did not carry a resolved-profile digest — the detector was not resolved "
+            "through a profile-bearing registry, so the receipt cannot bind a trusted detector identity")
+    # v4 P1-d: the VISIBLE-honest and HOLDOUT-honest lanes MUST resolve the SAME detector profile — else an
+    # alternating resolver could grade the blind holdout with a DIFFERENT detector than the visible set, so
+    # the receipt's single signed identity would not describe what actually judged the holdout.
+    if gen.resolved_profile_digest != resolved_profile_digest:
+        raise AcceptanceError(
+            "the visible-honest and holdout-honest lanes resolved DIFFERENT detector profiles "
+            f"({resolved_profile_digest} vs {gen.resolved_profile_digest}) — the honest detector must be "
+            "the SAME across both lanes; refusing to sign (an alternating resolver cannot be trusted)")
 
     honest_passes = honest.passed
     refuses_on_fn = (not fn.passed) and len(fn.fn_failures) > 0
@@ -349,9 +411,14 @@ def run_acceptance_anchor(
     unsigned = AcceptanceReport(
         accepted=accepted, honest_passes=honest_passes, refuses_on_fn=refuses_on_fn,
         refuses_on_fp=refuses_on_fp, generalises=generalises, short_circuit=False,
-        detector_identity=detector_identity, visible_corpus_digest=visible_corpus_digest,
-        holdout_corpus_digest=holdout_corpus_digest, trials=trials, image_ref=image_ref,
-        sandbox_config_hash=sandbox_config_hash,
+        resolved_profile_digest=resolved_profile_digest,
+        fn_control_profile_digest=fn.resolved_profile_digest,
+        fp_control_profile_digest=fp.resolved_profile_digest,
+        measured_execution_identity=measured_execution_identity, trust_policy_id=trust_policy_id,
+        visible_corpus_digest=visible_corpus_digest,
+        holdout_corpus_digest=holdout_corpus_digest, trials=trials,
+        budget_wall_clock_ms=int(round(budget.wall_clock_seconds * 1000)),
+        image_ref=image_ref, sandbox_config_hash=sandbox_config_hash,
         visible_coverage=len(visible_set.known_good) + len(visible_set.known_bad),
         holdout_coverage=len(holdout.known_good) + len(holdout.known_bad),
         signer_principal=signer_principal, claim=_HONEST_CLAIM, issued_at=now,

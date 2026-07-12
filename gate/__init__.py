@@ -47,8 +47,10 @@ from .detector_registry import (
     DetectorResolver,
     RegistrableDetector,
     RegistrationError,
+    ResolvedDetectorProfile,
     UnregisteredDetectorError,
     content_address,
+    profile_of,
     registration_binding,
 )
 from .executor import (
@@ -183,6 +185,8 @@ __all__ = [
     "RegistrationError",
     "content_address",
     "registration_binding",
+    "ResolvedDetectorProfile",
+    "profile_of",
     "UntrustedBackendError",
     "trusted_sandbox_factory",
     "trusted_backend_guard",

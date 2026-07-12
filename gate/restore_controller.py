@@ -62,6 +62,13 @@ class ReAttestCapability:
     def policy_head(self, policy_id: str) -> str:
         return self._store.policy_head(policy_id)
 
+    def authorized_subject_identity(self, policy_id: str) -> str | None:
+        """v3 (board P2): the subject identity the policy is CURRENTLY authorized for (its live
+        calibration binding). Restore requires the re-cal's requested subject to equal THIS — so a
+        measurement for a different (even globally-trusted) subject can never re-bind the policy."""
+        att = self._store.current_attestation(policy_id)
+        return None if att is None else att[2]
+
     def record_calibration_pass(self, ref: str, *, policy_id: str, pinned_set_version: str,
                                 detector_identity: str, set_id: str) -> None:
         self._store.record_calibration_pass(
@@ -69,17 +76,20 @@ class ReAttestCapability:
             detector_identity=detector_identity, set_id=set_id)
 
     def reattest(self, policy_id: str, *, calibration_result_ref: str, pinned_set_version: str,
-                 detector_identity: str, job_id: str, nonce: str, expect_policy_head: str) -> int:
+                 detector_identity: str, job_id: str, nonce: str, expect_policy_head: str,
+                 expect_authorized_subject: str) -> int:
         return self._store.reattest(
             policy_id, grant=_REATTEST_GRANT, calibration_result_ref=calibration_result_ref,
             pinned_set_version=pinned_set_version, detector_identity=detector_identity,
-            job_id=job_id, nonce=nonce, expect_policy_head=expect_policy_head)
+            job_id=job_id, nonce=nonce, expect_policy_head=expect_policy_head,
+            expect_authorized_subject=expect_authorized_subject)
 
 
 class RestoreResult(Enum):
     RESTORED = "restored"                    # a RE_ATTESTATION was appended; the policy is attestable
     REFUSED_NOT_CLEAN_PASS = "not_clean_pass"  # FAIL/ERROR/short-circuit -> no-op on governance state
     REFUSED_UNTRUSTED = "untrusted"          # bad signature / issuer / revoked detector identity
+    REFUSED_SUBJECT_MISMATCH = "subject_mismatch"  # measured != requested, or requested != policy's target
     REFUSED_ORACLE_STALE = "oracle_stale"    # signed head != live set_head (a newer re-cal will handle)
     REFUSED_NOT_ENABLED = "not_enabled"      # policy not ENABLED (asymmetry: must re-ratify)
     REFUSED_CAS_EXHAUSTED = "cas_exhausted"  # lost the policy-head CAS too many times
@@ -137,11 +147,23 @@ class RestoreController:
                 f"coverage={len(att.fixture_coverage)}) is not a clean restore basis — no state change",
             )
 
-        # 3. IDENTITY STILL TRUSTED.
-        if not self._identity_trusted(att.detector_identity):
+        # 3. IDENTITY STILL TRUSTED. P1-3: the identity is the measurement-derived calibrated-SUBJECT
+        # identity (H(resolved_profile, measured environment)); is_clean_pass guarantees it is non-None.
+        assert att.subject_identity is not None  # narrowed by the is_clean_pass gate above
+        if not self._identity_trusted(att.subject_identity):
             return RestoreOutcome(
                 RestoreResult.REFUSED_UNTRUSTED,
-                f"detector identity {att.detector_identity!r} is no longer trusted",
+                f"subject identity {att.subject_identity!r} is no longer trusted",
+            )
+
+        # 3b. MEASUREMENT ≠ GOVERNANCE (v3, board P1): the MEASURED subject must equal what governance
+        # REQUESTED this run to measure. A clean PASS whose measured subject differs from the request
+        # cannot re-attest — measurement never selects the subject, it only confirms the requested one.
+        if att.subject_identity != att.requested_subject_identity:
+            return RestoreOutcome(
+                RestoreResult.REFUSED_SUBJECT_MISMATCH,
+                f"measured subject {att.subject_identity!r} != requested "
+                f"{att.requested_subject_identity!r} — measurement cannot re-bind a different subject",
             )
 
         # board blocker #3: persist the signed measurement DURABLY + immutably BEFORE re-attesting, so
@@ -168,16 +190,32 @@ class RestoreController:
                     f"{att.policy_id} is not ENABLED — a demoted policy must re-ratify, never "
                     "auto-restore (tier asymmetry)",
                 )
+            # the requested subject MUST equal the policy's CURRENTLY AUTHORIZED target (v3, board P1):
+            # a re-cal can only re-attest the SAME subject the policy is already enabled for, never rebind
+            # it to a different one — even a globally-trusted measured subject. Measurement ≠ governance.
+            authorized = self._cap.authorized_subject_identity(att.policy_id)
+            if authorized is None or att.requested_subject_identity != authorized:
+                return RestoreOutcome(
+                    RestoreResult.REFUSED_SUBJECT_MISMATCH,
+                    f"requested subject {att.requested_subject_identity!r} != the policy's authorized "
+                    f"target {authorized!r} — restore cannot rebind the policy's subject",
+                )
             policy_head = self._cap.policy_head(att.policy_id)
             # persist the pass the re-attest binds to (idempotent; ref binds the immutable signed att).
+            # the policy store's generic ``detector_identity`` field carries the calibrated-subject
+            # identity value (P1-3) — the identity the future enforcement match compares.
             self._cap.record_calibration_pass(
                 ref, policy_id=att.policy_id, pinned_set_version=att.oracle_head,
-                detector_identity=att.detector_identity, set_id=att.set_id)
+                detector_identity=att.subject_identity, set_id=att.set_id)
             try:
                 seq = self._cap.reattest(
                     att.policy_id, calibration_result_ref=ref, pinned_set_version=att.oracle_head,
-                    detector_identity=att.detector_identity, job_id=att.run_id, nonce=att.nonce,
-                    expect_policy_head=policy_head)
+                    detector_identity=att.subject_identity, job_id=att.run_id, nonce=att.nonce,
+                    expect_policy_head=policy_head,
+                    # v4 P1-b: bind the authorized-subject check ATOMICALLY with the head CAS. If governance
+                    # moved the authorized target since we read it, reattest raises ReAttestConflict -> the
+                    # loop re-reads authorized above and refuses (REFUSED_SUBJECT_MISMATCH) on the retry.
+                    expect_authorized_subject=authorized)
             except ReAttestConflict:
                 continue  # the policy head moved; re-read and retry the whole CAS
             return RestoreOutcome(RestoreResult.RESTORED, "re-attested to the current oracle head", seq)

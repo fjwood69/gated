@@ -1,5 +1,15 @@
 """core/identity.py — 3.4 close-2: the 4-tuple execution identity binding.
 
+.. deprecated:: 3.5-close P1-3 — NON-AUTHORITATIVE LEGACY.
+   ``identity_for`` / ``bind_identity`` compose a 4-tuple identity from a CALLER-supplied
+   ``DetectorManifest`` (``detector_build_digest`` + ``eval_profile_digest``) + caller host/image digests.
+   Because the build/eval coordinates are caller-derived, this is exactly the sign-A-run-B surface P1-3
+   closes: the authoritative identity is now the MEASUREMENT-DERIVED calibrated-subject identity
+   (``gate.attestation.calibrated_subject_identity`` = H(trusted resolved-profile digest, parent-measured
+   execution identity)). These helpers are retained only for the gatekeeper's scheme-agnostic exact-match
+   plumbing and its tests; do NOT use them to derive a SIGNED or ENFORCED identity. They are not exported
+   at the package level (``core.__init__``) and must not become an attractive caller-derived identity API.
+
 The transitive-dependency spoof (verified against ``engine/runner.py``): ``assert_invariant`` runs
 on the TRUSTED HOST, after the artifact ran in the sandbox. So content-addressing the detector's own
 source, or the artifact IMAGE alone, does NOT close the detector's dependencies — a shared helper the
@@ -84,7 +94,10 @@ def identity_for(
 ) -> str:
     """Convenience: derive the execution identity from a manifest + the host/image digests. The
     manifest supplies detector_build_digest + eval_profile_digest; the caller supplies the host
-    closure (pinned lockfile) and the content-addressed image."""
+    closure (pinned lockfile) and the content-addressed image.
+
+    .. deprecated:: 3.5-close P1-3 — NON-AUTHORITATIVE. The manifest is caller-supplied (sign-A-run-B).
+       Use ``gate.attestation.calibrated_subject_identity`` for any signed/enforced identity."""
     return bind_identity(
         detector_build_digest=manifest.build_digest(),
         host_closure_digest=host_closure_digest,

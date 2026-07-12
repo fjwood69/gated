@@ -37,6 +37,7 @@ from .pipeline import (
     make_check_updater,
     run_engine_check,
 )
+from .preflight import ConfigurationError
 from .queue import GatingEvent, InMemoryOverrideSink
 from .ratelimit import RateLimitBudget, TokenBucketRateLimiter
 from .secret import EnvSecretSource
@@ -48,6 +49,11 @@ _log = logging.getLogger("gated.gate.live")
 CHECK_NAME = os.environ.get("GATED_CHECK_NAME", "promotion-gate/retry")
 IMAGE = os.environ.get("GATED_IMAGE", "localhost/mori:local")
 DETECTOR_ID = os.environ.get("GATED_DETECTOR_ID", "retry")  # 3.5-close #1.3: the accepted detector id
+# 3.5-close P1-3: the ACCEPTED profile digest is the output of an INDEPENDENT acceptance ceremony and
+# MUST be supplied externally. Production must NOT self-compute it (a hash of the current bytes vs the
+# current bytes is circular and enforces nothing). ``required_accepted_profile_digest`` fails boot closed
+# when it is unset — see below.
+ACCEPTED_PROFILE_DIGEST = os.environ.get("GATED_ACCEPTED_PROFILE_DIGEST")
 KEY_PATH = os.environ.get("GATED_APP_KEY_PATH", "app-private-key.pem")
 TRIALS = int(os.environ.get("GATED_TRIALS", "2"))
 WATCHDOG_TIMEOUT = float(os.environ.get("GATED_WATCHDOG_SECONDS", "900"))
@@ -92,9 +98,23 @@ class _LoggingTrialReportSink:
         )
 
 
+def required_accepted_profile_digest() -> str:
+    """3.5-close P1-3: production REQUIRES an externally-supplied accepted profile digest — the output of
+    an INDEPENDENT acceptance ceremony — so the live gate enforces the EXACT detector profile that was
+    accepted. Refuse to self-compute it in production (current-bytes-vs-a-hash-of-current-bytes is
+    circular and enforces nothing). Fail boot CLOSED when ``GATED_ACCEPTED_PROFILE_DIGEST`` is unset."""
+    digest = (ACCEPTED_PROFILE_DIGEST or "").strip()
+    if not digest:
+        raise ConfigurationError(
+            "production gate requires GATED_ACCEPTED_PROFILE_DIGEST (the output of an independent "
+            "acceptance ceremony); refusing to self-compute the accepted detector identity in production")
+    return digest
+
+
 def build(
     db_path: Path,
 ) -> tuple[WebhookReceiver, Executor, Watchdog, InstallationTokenProvider, Callable[[], int]]:
+    accepted_profile_digest = required_accepted_profile_digest()  # P1-3: fail boot if unset (no self-compute)
     app_id = int(os.environ["GATED_APP_ID"])
     installs = frozenset(
         int(x) for x in os.environ.get("GATED_INSTALLATION_IDS", "").split(",") if x
@@ -152,7 +172,10 @@ def build(
     # 3.5-close #1.3: the enforced detector is resolved by NAME through the trusted registry (enforced ==
     # accepted). Boot assertion — fail HERE if the accepted detector does not resolve, not per-PR.
     detector_registry = default_detector_registry(
-        detector_id=DETECTOR_ID, entrypoint=("python3", "/artifact/main.py"))
+        detector_id=DETECTOR_ID, entrypoint=("python3", "/artifact/main.py"),
+        accepted_profile_digest=accepted_profile_digest)  # P1-3: enforce the externally-accepted profile
+    # boot assertion: resolve revalidates the resolved profile against the accepted digest — a mismatch
+    # (wrong ceremony output, or a drifted live detector) fails boot here, not per-PR.
     assert_detector_registered(detector_registry.resolve, DETECTOR_ID)
 
     def job_runner(event: GatingEvent) -> Verdict:
@@ -163,7 +186,7 @@ def build(
             artifact = artifact_source(event, ws)
             try:
                 return run_engine_check(
-                    artifact, image=IMAGE, resolve=detector_registry.resolve, detector_id=DETECTOR_ID,
+                    artifact, image=IMAGE, resolve=detector_registry.resolve_bundle, detector_id=DETECTOR_ID,
                     trials=TRIALS, first_fail=SHORT_CIRCUIT, report_sink=report_sink,
                 )
             except DetectorResolutionError:

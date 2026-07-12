@@ -44,6 +44,7 @@ _NAME = "gated/retry"
 _IMAGE = "localhost/mori:local"
 _REGISTRY = default_detector_registry()   # 3.5-close #1.3: the accepted "retry" detector, registered
 _RESOLVE = _REGISTRY.resolve
+_RESOLVE_BUNDLE = _REGISTRY.resolve_bundle  # v5: the live path takes a BundleResolver
 _DETECTOR_ID = "retry"
 
 
@@ -193,7 +194,7 @@ class IntegrityMismatchMappingTests(unittest.TestCase):
         def source(_: GatingEvent, ws: Path) -> ArtifactSpec:
             return ArtifactSpec(path=ws, tree_hash="sha256:whatever")
 
-        job = make_job_runner(source, image=_IMAGE, resolve=_RESOLVE, detector_id=_DETECTOR_ID)
+        job = make_job_runner(source, image=_IMAGE, resolve=_RESOLVE_BUNDLE, detector_id=_DETECTOR_ID)
         with mock.patch(
             "gate.pipeline.run_engine_check",
             side_effect=ArtifactHashMismatchError("swap"),
@@ -215,6 +216,30 @@ class DetectorRegistryEnforcementTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             assert_detector_registered(_RESOLVE, "not-the-accepted-detector")
 
+    def test_boot_fails_against_a_mismatched_accepted_profile_digest(self) -> None:
+        # P1-3 (neg 1): a registry bound to a WRONG externally-supplied accepted profile digest must fail
+        # the boot assertion — resolve revalidates the resolved profile and refuses the mismatch, so a
+        # bad acceptance-ceremony output (or a drifted live detector) is caught at boot, not per-PR.
+        from gate.preflight import ConfigurationError
+        registry = default_detector_registry(
+            detector_id="retry", accepted_profile_digest="not-the-accepted-profile-digest")
+        with self.assertRaises(ConfigurationError):
+            assert_detector_registered(registry.resolve, "retry")
+
+    def test_production_boot_requires_external_accepted_profile_digest(self) -> None:
+        # P1-3: production must NOT self-compute the accepted profile digest (circular). The live gate
+        # reads GATED_ACCEPTED_PROFILE_DIGEST and fails boot CLOSED when it is unset; a real value passes.
+        import importlib
+        from gate.preflight import ConfigurationError
+        with mock.patch.dict("os.environ", {"GATED_ACCEPTED_PROFILE_DIGEST": ""}, clear=False):
+            live_app = importlib.reload(importlib.import_module("gate.live_app"))
+            with self.assertRaises(ConfigurationError):
+                live_app.required_accepted_profile_digest()
+        with mock.patch.dict("os.environ", {"GATED_ACCEPTED_PROFILE_DIGEST": "profile-digest-xyz"}, clear=False):
+            live_app = importlib.reload(importlib.import_module("gate.live_app"))
+            self.assertEqual(live_app.required_accepted_profile_digest(), "profile-digest-xyz")
+        importlib.reload(importlib.import_module("gate.live_app"))  # restore module-level default
+
     # ---- adversarial (finding F): an unresolvable detector -> BLOCK (ERROR), never runs ----
     def test_job_runner_blocks_when_detector_does_not_resolve(self) -> None:
         from gate.detector_registry import DetectorRegistry
@@ -224,13 +249,13 @@ class DetectorRegistryEnforcementTests(unittest.TestCase):
         # refuses -> the job-runner must BLOCK with DETECTOR_UNRESOLVED, never run an unverified detector.
         drifted = DetectorRegistry()
         drifted.register("retry", lambda: RetryCheck(("python3", "/artifact/main.py")),
-                         content_hash="accepted-addr-that-will-not-match")
+                         accepted_profile_digest="accepted-addr-that-will-not-match")
 
         def source(_: GatingEvent, ws: Path) -> ArtifactSpec:
             # the detector resolves (and fails) before any sandbox runs, so the artifact is never used.
             return ArtifactSpec(path=ws, tree_hash="sha256:unused")
 
-        job = make_job_runner(source, image=_IMAGE, resolve=drifted.resolve, detector_id="retry")
+        job = make_job_runner(source, image=_IMAGE, resolve=drifted.resolve_bundle, detector_id="retry")
         verdict = job(_event())
         self.assertIs(verdict.status, VerdictType.ERROR)
         self.assertIs(verdict.reason, Reason.DETECTOR_UNRESOLVED)
@@ -308,7 +333,7 @@ class RealEngineHandshakeTests(unittest.TestCase):
         def source(_: GatingEvent, ws: Path) -> ArtifactSpec:
             return extract_to_spec(tar, ws)
 
-        job = make_job_runner(source, image=_IMAGE, resolve=_RESOLVE, detector_id=_DETECTOR_ID, trials=2)
+        job = make_job_runner(source, image=_IMAGE, resolve=_RESOLVE_BUNDLE, detector_id=_DETECTOR_ID, trials=2)
         verdict = job(_event())
         self.assertIs(verdict.status, VerdictType.PASS)
 

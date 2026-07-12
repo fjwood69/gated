@@ -13,6 +13,7 @@ import unittest
 
 from core import Command, Fixtures, Reason, Verdict, VerdictType
 from gate.detector_registry import (
+    profile_of,
     DetectorIntegrityError,
     DetectorRegistry,
     RegistrationError,
@@ -43,7 +44,7 @@ class _Detector:
 
 # the accepted content-address of a _Detector = a hash of THIS test module's bytes (§1.2 computes it
 # from the module file, not the self-declared content_id). Constant across _Detector instances here.
-_ADDR = content_address(_Detector())
+_ADDR = profile_of("d", _Detector()).digest()
 
 
 class RegistryTests(unittest.TestCase):
@@ -55,7 +56,7 @@ class RegistryTests(unittest.TestCase):
     def test_resolve_returns_the_registered_detector(self) -> None:
         reg = DetectorRegistry()
         det = _Detector()
-        reg.register("d", lambda: det, content_hash=_ADDR)
+        reg.register("d", lambda: det, accepted_profile_digest=_ADDR)
         self.assertIs(reg.resolve("d"), det)
 
     def test_content_address_is_computed_from_module_bytes_not_self_declared(self) -> None:
@@ -70,9 +71,55 @@ class RegistryTests(unittest.TestCase):
         # the deployed detector's computed address != the accepted (registered) one -> DRIFT -> refused
         # (a self-declared content_id cannot rescue it; the registry recomputes from the bytes).
         reg = DetectorRegistry()
-        reg.register("d", lambda: _Detector("declares-the-accepted-hash"), content_hash="accepted-addr")
+        reg.register("d", lambda: _Detector("declares-the-accepted-hash"), accepted_profile_digest="accepted-addr")
         with self.assertRaises(DetectorIntegrityError):
             reg.resolve("d")
+
+    def test_bundle_profile_is_cached_not_re_read_from_disk(self) -> None:
+        # v3 (board P1, atomicity): the (assertion, profile) pair is computed ONCE and cached; a later
+        # module-file swap on disk (modelled by patching content_address AFTER first resolve) must NOT
+        # change the resolved profile digest — the runnable object and its hashed bytes can never diverge
+        # across calls. Guard = caching the pair; remove it and resolve would re-read (patched) and drift.
+        reg = DetectorRegistry()
+        det = _Detector()
+        reg.register("d", lambda: det, accepted_profile_digest=_ADDR)
+        first = reg.resolve_bundle("d").profile_digest
+        import gate.detector_registry as dr
+        orig = dr.content_address
+        dr.content_address = lambda _det: "blake2b:SWAPPED-ON-DISK-AFTER-RESOLVE"  # type: ignore[assignment]
+        try:
+            second = reg.resolve_bundle("d").profile_digest
+            via_profile = reg.resolve_profile("d").digest()
+        finally:
+            dr.content_address = orig
+        self.assertEqual(first, second)       # cached, not re-read from (swapped) disk
+        self.assertEqual(first, via_profile)  # resolve/resolve_profile/resolve_bundle share ONE computation
+
+    def test_behavioral_config_is_frozen_at_registration(self) -> None:
+        # v4 P1-c: the registry deep-freezes a snapshot of behavioral_config at registration and caches the
+        # VALIDATED digest string; mutating the caller's original config dict afterwards must NOT change the
+        # resolved digest. Guard = deep-copy-at-register + cached digest string; remove it and d2 drifts.
+        reg = DetectorRegistry()
+        det = _Detector()
+        cfg = {"k": "v"}
+        accepted = profile_of("d", det, {"k": "v"}).digest()
+        reg.register("d", lambda: det, accepted_profile_digest=accepted, behavioral_config=cfg)
+        d1 = reg.resolve_bundle("d").profile_digest
+        cfg["k"] = "MUTATED-AFTER-REGISTRATION"  # mutate the caller's original mapping
+        d2 = reg.resolve_bundle("d").profile_digest
+        self.assertEqual(d1, d2)  # frozen snapshot -> post-registration mutation has no effect
+
+    def test_command_is_captured_once_and_frozen(self) -> None:
+        # v4 P1-c: the entrypoint command is captured ONCE at resolution and returned frozen on every
+        # resolve — security-relevant paths execute THIS, never a fresh entrypoint() a stateful detector
+        # could answer differently. Guard = capture-once + cache; remove it and the two commands differ.
+        reg = DetectorRegistry()
+        det = _Detector()
+        reg.register("d", lambda: det, accepted_profile_digest=_ADDR)
+        cmd1 = reg.resolve_bundle("d").command
+        cmd2 = reg.resolve_bundle("d").command
+        self.assertEqual(cmd1.argv, ("true",))
+        self.assertIs(cmd1, cmd2)  # same frozen command object, captured once at first resolve
 
     def test_resolve_caches_one_instance_per_id(self) -> None:
         # a stateless detector graded across visible + holdout lanes must be the SAME instance.
@@ -83,7 +130,7 @@ class RegistryTests(unittest.TestCase):
             builds["n"] += 1
             return _Detector()
 
-        reg.register("d", build, content_hash=_ADDR)
+        reg.register("d", build, accepted_profile_digest=_ADDR)
         first = reg.resolve("d")
         second = reg.resolve("d")
         self.assertIs(first, second)
@@ -92,14 +139,14 @@ class RegistryTests(unittest.TestCase):
     def test_registration_is_write_once(self) -> None:
         reg = DetectorRegistry()
         det = _Detector()
-        reg.register("d", lambda: det, content_hash=_ADDR)
+        reg.register("d", lambda: det, accepted_profile_digest=_ADDR)
         with self.assertRaises(RegistrationError):
-            reg.register("d", lambda: det, content_hash=_ADDR)  # no silent rebind
+            reg.register("d", lambda: det, accepted_profile_digest=_ADDR)  # no silent rebind
 
     def test_empty_content_hash_is_refused(self) -> None:
         reg = DetectorRegistry()
         with self.assertRaises(RegistrationError):
-            reg.register("d", lambda: _Detector(), content_hash="")
+            reg.register("d", lambda: _Detector(), accepted_profile_digest="")
 
 
 class SignedRegistryTests(unittest.TestCase):
@@ -111,14 +158,14 @@ class SignedRegistryTests(unittest.TestCase):
         det = _Detector()
         # no signature -> refused.
         with self.assertRaises(RegistrationError):
-            reg.register("d", lambda: det, content_hash=_ADDR)
+            reg.register("d", lambda: det, accepted_profile_digest=_ADDR)
         # a signature over the WRONG binding -> refused.
         wrong = sign(registration_binding("other-id", _ADDR), self._SEED)
         with self.assertRaises(RegistrationError):
-            reg.register("d", lambda: det, content_hash=_ADDR, signature=wrong)
+            reg.register("d", lambda: det, accepted_profile_digest=_ADDR, signature=wrong)
         # a valid signature over (id, content_hash) -> accepted, and resolves.
         good = sign(registration_binding("d", _ADDR), self._SEED)
-        reg.register("d", lambda: det, content_hash=_ADDR, signature=good)
+        reg.register("d", lambda: det, accepted_profile_digest=_ADDR, signature=good)
         self.assertIs(reg.resolve("d"), det)
 
     def test_signature_by_the_wrong_key_is_refused(self) -> None:
@@ -126,7 +173,7 @@ class SignedRegistryTests(unittest.TestCase):
         det = _Detector()
         forged = sign(registration_binding("d", _ADDR), bytes(range(96, 128)))  # other seed
         with self.assertRaises(RegistrationError):
-            reg.register("d", lambda: det, content_hash=_ADDR, signature=forged)
+            reg.register("d", lambda: det, accepted_profile_digest=_ADDR, signature=forged)
 
 
 class EntryPointContractTests(unittest.TestCase):

@@ -38,6 +38,7 @@ from typing import Callable, Iterator
 
 from core import (
     ArtifactSpec,
+    Command,
     IsolationLevel,
     Reason,
     ResourceBudget,
@@ -58,6 +59,29 @@ DEFAULT_CALIBRATION_TRIALS = 5
 # object — the only way an id becomes runnable code is a TRUSTED registry (gate-side). Defined here,
 # engine-side, as a plain Callable so the engine need not import the gate (engine⊥gate preserved).
 DetectorResolver = Callable[[str], RuntimeAssertion]
+
+
+@dataclass(frozen=True)
+class ResolvedDetector:
+    """3.5-close P1-3 v3 (board HOLD, atomicity): the ATOMIC result of resolving a detector id — the
+    runnable ``assertion`` AND its ``profile_digest``, produced by ONE resolution so code and profile are
+    inseparable. The old two-call seam (``resolve`` then a separate ``resolve_profile``/``digest``) could
+    reference different registries or let the module drift between calls (a TOCTOU); a single
+    ``BundleResolver`` returning this closes it. ``calibrate`` carries ``profile_digest`` straight into the
+    ``CalibrationResult``, so the signed identity binds exactly the detector that ran."""
+
+    assertion: RuntimeAssertion
+    profile_digest: str
+    command: Command  # v4 P1-c: the FROZEN entrypoint command captured AT RESOLUTION and part of the
+    # profile — security-relevant paths EXECUTE this, never re-call ``assertion.entrypoint()`` (a stateful
+    # detector could otherwise resolve one command and run another, separating the signed profile from the
+    # executed command).
+
+
+# The engine-side resolver contract for calibration: a name -> (assertion, profile_digest) bundle. A
+# plain Callable so the engine need not import the gate; the gate registry's ``resolve_bundle`` is the
+# production implementation.
+BundleResolver = Callable[[str], ResolvedDetector]
 
 # 3.5-close #1.6: an INJECTED guard that raises if the RETURNED sandbox is not an audited backend.
 # The engine calls it (dependency inversion) but cannot mint the trusted-backend token — the gate holds
@@ -129,6 +153,12 @@ class CalibrationResult:
     # its bound image/identity from THIS (the real calibration environment), never a separate probe.
     execution_identity: ExecutionIdentity | None = None
     identity_consistent: bool = True
+    # 3.5-close P1-3 (v2 attestation): the resolved-profile digest of the detector that ACTUALLY ran,
+    # captured from the SAME calibration operation (the injected ``resolved_profile_digest_of`` at the
+    # point of resolution) — NOT a separate post-hoc resolution, which would open a fresh sign-A/run-B
+    # window. None when no digest source was injected, or on the inadequate-set early return (no detector
+    # was resolved). The recalibration attestation binds its ``resolved_profile_digest`` from THIS.
+    resolved_profile_digest: str | None = None
 
     def report(self) -> str:
         """The human-facing calibration report — FR3.1's 'theatre of verification' language,
@@ -213,7 +243,7 @@ def _materialised(fixture: Fixture) -> Iterator[ArtifactSpec]:
 def calibrate(
     make_sandbox: Callable[[], Sandbox],
     detector_id: str,
-    resolve: DetectorResolver,
+    resolve: BundleResolver,
     calibration_set: CalibrationSet,
     budget: ResourceBudget,
     *,
@@ -254,15 +284,21 @@ def calibrate(
             passed=False, inadequate=True, fn_failures=(), fp_failures=(), flaky=(),
             harness_errors=(), outcomes=(), execution_identity=None, identity_consistent=True,
         )
-    detector = resolve(detector_id)  # trusted registry only — an unregistered id is refused here
+    # P1-3 v3 (atomicity): ONE resolution yields BOTH the runnable assertion and its profile digest — the
+    # digest binds exactly the detector object that runs (no second resolution / disk re-read seam).
+    bundle = resolve(detector_id)  # trusted registry only — an unregistered id is refused here
+    detector = bundle.assertion
+    resolved_profile_digest = bundle.profile_digest
 
     outcomes: list[FixtureOutcome] = []
+    # v4 P1-c: execute the FROZEN resolved command (bundle.command), not a fresh detector.entrypoint().
     for fixture in (*calibration_set.known_bad, *calibration_set.known_good):
         capture = _TrialReportCapture()
         with _materialised(fixture) as artifact:
             verdict = run_check(
                 factory, detector, artifact, budget,
                 trials=trials, first_fail=False, report_sink=capture, detector_id=detector_id,
+                command=bundle.command,
             )
         outcomes.append(
             FixtureOutcome(
@@ -295,6 +331,7 @@ def calibrate(
         passed=passed, inadequate=False, fn_failures=fn, fp_failures=fp, flaky=flaky,
         harness_errors=errs, outcomes=tuple(outcomes),
         execution_identity=execution_identity, identity_consistent=identity_consistent,
+        resolved_profile_digest=resolved_profile_digest,
     )
 
 
@@ -307,6 +344,8 @@ __all__ = [
     "CalibrationResult",
     "CalibrationConfigError",
     "DetectorResolver",
+    "ResolvedDetector",
+    "BundleResolver",
     "calibrate",
     "DEFAULT_CALIBRATION_TRIALS",
 ]

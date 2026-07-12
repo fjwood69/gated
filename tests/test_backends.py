@@ -99,11 +99,11 @@ class GuardedCalibrationTests(unittest.TestCase):
 
         from core.calibration import CalibrationSet, Fixture, FixtureLabel
         from engine.calibration import calibrate
-        from gate.detector_registry import DetectorRegistry, content_address
+        from gate.detector_registry import DetectorRegistry, profile_of
 
         det = _AlwaysPass()
         reg = DetectorRegistry()
-        reg.register("d", lambda: det, content_hash=content_address(det))
+        reg.register("d", lambda: det, accepted_profile_digest=profile_of("d", det).digest())
         cset = CalibrationSet(
             known_good=(Fixture("g", FixtureLabel.KNOWN_GOOD, b"x"),),
             known_bad=(Fixture("b", FixtureLabel.KNOWN_BAD, b"y"),),
