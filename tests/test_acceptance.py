@@ -178,6 +178,29 @@ class AcceptanceAnchorTests(unittest.TestCase):
             _run(store, honest=_honest(),
                  fn=_ScriptedDetector([_PASS] * 6), fp=_ScriptedDetector([_FAIL] * 6))
 
+    def test_lanes_without_one_attested_identity_are_refused(self) -> None:
+        # board #3 (tightened): the receipt's environment is DERIVED from the lanes that actually ran.
+        # A sandbox that drifts identity across trials leaves every lane unattestable -> the anchor
+        # refuses to sign, rather than binding a probed-but-unrun environment.
+        store = _holdout()
+        n = {"i": 0}
+
+        def drift() -> _HermeticNoOp:
+            sb = _HermeticNoOp()
+            sb.image = f"img-{n['i']}"  # type: ignore[attr-defined]
+            n["i"] += 1
+            return sb
+
+        with self.assertRaises(AcceptanceError):
+            run_acceptance_anchor(
+                make_sandbox=drift, honest_detector=_honest(),
+                fn_deficient_detector=_ScriptedDetector([_PASS] * 6),
+                fp_happy_detector=_ScriptedDetector([_FAIL] * 6),
+                detector_manifest=_MANIFEST, host_closure_digest=_HOST_CLOSURE,
+                visible_set=_VISIBLE, blind_holdout_store=store, holdout_key=_HOLDOUT_KEY,
+                signer_seed=_SIGNER_SEED, signer_principal="cal-gov-1",
+                signer_approval=_cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3)
+
     def test_self_grading_closure_requires_calibration_governance_signer(self) -> None:
         store = _holdout()
         gov_signer = GovernanceApproval(principals=("author",), purpose="p", rationale="r",

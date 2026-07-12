@@ -48,7 +48,7 @@ from core import (
     tree_hash,
 )
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
-from engine.runner import TrialReport, run_check
+from engine.runner import ExecutionIdentity, TrialReport, run_check
 
 # The default number of trials a calibration run exercises per fixture. Short-circuit is always
 # OFF for calibration, so all TRIALS run and the full distribution (flaky vs consistent) is seen.
@@ -112,6 +112,13 @@ class CalibrationResult:
     flaky: tuple[str, ...]            # fixtures the detector was non-deterministic on
     harness_errors: tuple[str, ...]   # fixtures that ERRORed (inconclusive)
     outcomes: tuple[FixtureOutcome, ...]
+    # 3.5 #3: the single PARENT-MEASURED execution identity every fixture in this run shared (the
+    # environment the detector was actually calibrated in), or None if the fixtures did NOT all run
+    # under ONE identity — an unattestable run, which forces ``passed`` False. Never self-reported by
+    # a fixture; measured by the runner from the sandbox it constructed. The acceptance receipt DERIVES
+    # its bound image/identity from THIS (the real calibration environment), never a separate probe.
+    execution_identity: ExecutionIdentity | None = None
+    identity_consistent: bool = True
 
     def report(self) -> str:
         """The human-facing calibration report — FR3.1's 'theatre of verification' language,
@@ -141,6 +148,11 @@ class CalibrationResult:
         if self.harness_errors:
             parts.append(
                 f"calibration inconclusive — harness ERROR on {list(self.harness_errors)}"
+            )
+        if not self.identity_consistent:
+            parts.append(
+                "the fixtures did not all run under ONE parent-measured execution identity — the "
+                "calibration environment is not attestable, so the run cannot be trusted"
             )
         if parts:
             return "REFUSED: " + "; ".join(parts)
@@ -195,6 +207,7 @@ def calibrate(
     budget: ResourceBudget,
     *,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
+    pin_image: Callable[[str], str] | None = None,
 ) -> CalibrationResult:
     """Run ``detector`` against every fixture in ``calibration_set`` and return whether it earns
     enablement. Two-sided (FR3.1 + marker-1): refuse on any missed known-bad OR false-positived
@@ -209,7 +222,7 @@ def calibrate(
     if not calibration_set.is_adequate:
         return CalibrationResult(
             passed=False, inadequate=True, fn_failures=(), fp_failures=(), flaky=(),
-            harness_errors=(), outcomes=(),
+            harness_errors=(), outcomes=(), execution_identity=None, identity_consistent=True,
         )
 
     outcomes: list[FixtureOutcome] = []
@@ -218,7 +231,7 @@ def calibrate(
         with _materialised(fixture) as artifact:
             verdict = run_check(
                 make_sandbox, detector, artifact, budget,
-                trials=trials, first_fail=False, report_sink=capture,
+                trials=trials, first_fail=False, report_sink=capture, pin_image=pin_image,
             )
         outcomes.append(
             FixtureOutcome(
@@ -234,10 +247,23 @@ def calibrate(
     fp = tuple(o.fixture_id for o in outcomes if o.classification is FixtureClass.FALSE_POSITIVE)
     flaky = tuple(o.fixture_id for o in outcomes if o.classification is FixtureClass.FLAKY)
     errs = tuple(o.fixture_id for o in outcomes if o.classification is FixtureClass.HARNESS_ERROR)
-    passed = not (fn or fp or flaky or errs)
+    # 3.5 #3: the whole calibration must have run under ONE parent-measured execution identity. Each
+    # fixture's identity is measured by the runner FROM THE SANDBOX (never fixture-reported); a fixture
+    # whose own trials drifted has a None identity (the runner already fail-closed it to ERROR above).
+    # If the identities are absent or disagree ACROSS fixtures, the calibration environment is not
+    # attestable -> refuse (fail-closed), and the receipt has no honest environment to bind.
+    identities = [o.trials.execution_identity for o in outcomes if o.trials is not None]
+    identity_consistent = (
+        len(identities) == len(outcomes)
+        and all(i is not None for i in identities)
+        and len({i.digest() for i in identities if i is not None}) == 1
+    )
+    execution_identity = identities[0] if (identity_consistent and identities) else None
+    passed = not (fn or fp or flaky or errs) and identity_consistent
     return CalibrationResult(
         passed=passed, inadequate=False, fn_failures=fn, fp_failures=fp, flaky=flaky,
         harness_errors=errs, outcomes=tuple(outcomes),
+        execution_identity=execution_identity, identity_consistent=identity_consistent,
     )
 
 

@@ -159,6 +159,38 @@ class DistributionAndReproducibilityTests(unittest.TestCase):
             self.assertNotIn("import gate", src)
 
 
+class ExecutionIdentityTests(unittest.TestCase):
+    """3.5 #3 — a calibration run carries the single PARENT-MEASURED identity all its fixtures shared,
+    and refuses (fail-closed) if the fixtures did not all run under ONE attestable environment."""
+
+    def test_consistent_run_carries_one_execution_identity(self) -> None:
+        b1, g1 = _fx(FixtureLabel.KNOWN_BAD, "b1"), _fx(FixtureLabel.KNOWN_GOOD, "g1")
+        r = _cal([b1], [g1], [[_FAIL] * 3, [_PASS] * 3])
+        self.assertTrue(r.passed)
+        self.assertTrue(r.identity_consistent)
+        self.assertIsNotNone(r.execution_identity)
+        self.assertEqual(r.execution_identity.isolation_level, "hermetic")  # type: ignore[union-attr]
+        self.assertEqual(r.execution_identity.image_ref, "<_HermeticNoOp>")  # type: ignore[union-attr]
+
+    def test_mixed_identity_across_fixtures_refuses_fail_closed(self) -> None:
+        # a factory whose sandbox image DRIFTS every construction -> each fixture's run is itself mixed
+        # -> the calibration is unattestable -> passed False + identity None + report says so.
+        n = {"i": 0}
+
+        def drift() -> _HermeticNoOp:
+            sb = _HermeticNoOp()
+            sb.image = f"img-{n['i']}"  # type: ignore[attr-defined]
+            n["i"] += 1
+            return sb
+
+        b1, g1 = _fx(FixtureLabel.KNOWN_BAD, "b1"), _fx(FixtureLabel.KNOWN_GOOD, "g1")
+        r = _cal([b1], [g1], [[_FAIL] * 3, [_PASS] * 3], factory=drift)
+        self.assertFalse(r.passed)
+        self.assertFalse(r.identity_consistent)
+        self.assertIsNone(r.execution_identity)
+        self.assertIn("not attestable", r.report())
+
+
 class OracleInvariantTests(unittest.TestCase):
     """3.2 — the Oracle-invariant properties the calibrator must hold."""
 

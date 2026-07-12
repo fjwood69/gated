@@ -231,16 +231,6 @@ def verify_report(report: AcceptanceReport, *, verify_key: bytes) -> bool:
         return False
 
 
-def _sandbox_image_ref(sandbox: Sandbox, pin_image: Callable[[str], str] | None) -> str:
-    """DERIVE the image reference from the ACTUAL sandbox (board #3 — not a caller string). OCI-style
-    sandboxes expose ``.image``; ``pin_image`` (deploy-provided, e.g. ``podman image inspect``) resolves
-    that tag to an immutable digest. A sandbox with no image (NoOp) reports its type."""
-    tag = getattr(sandbox, "image", None)
-    if tag is None:
-        return f"<{type(sandbox).__name__}>"
-    return pin_image(tag) if pin_image is not None else str(tag)
-
-
 def run_acceptance_anchor(
     *,
     make_sandbox: Callable[[], Sandbox],
@@ -266,13 +256,17 @@ def run_acceptance_anchor(
     (must PASS), FN-deficient (must be REFUSED), FP-happy (must be REFUSED), honest detector on the blind
     holdout (must PASS — generalisation). ``accepted`` iff all four hold.
 
-    The receipt binds WHAT was tested, DERIVED FROM EXECUTION not caller strings (board #3 + #8): the
-    detector's 4-tuple identity is COMPUTED (``core.identity.identity_for``) from the content-addressed
-    ``detector_manifest`` + ``host_closure_digest`` + the image the sandbox ACTUALLY ran; the ``image_ref``
-    is DERIVED from the real sandbox (``.image``) and pinned to a digest via ``pin_image``; the
-    ``sandbox_config_hash`` is computed HERE from the real sandbox isolation + pinned image. Nothing that
-    describes the run is a free-form caller claim. Also refuses if the visible + holdout corpora are
-    IDENTICAL (a holdout that duplicates the visible set proves memorisation, not generalisation)."""
+    The receipt binds WHAT was tested, DERIVED FROM THE REAL RUN not caller strings and not a probe
+    (board #3, tightened): the ``image_ref`` / isolation / backend come from the PARENT-MEASURED
+    ``execution_identity`` of the ACTUAL calibration lanes (measured by the runner from the sandbox it
+    constructed, per trial — never fixture-reported), and ALL FOUR lanes must agree on that identity or
+    the anchor refuses (an anchor whose lanes ran in different environments proves nothing). The removed
+    ``make_sandbox()`` probe was a SEPARATE construction an adversarial factory could answer differently
+    from the sandboxes that ran the fixtures; the identity now comes only from the sandboxes that DID run
+    them. The detector's 4-tuple identity is then COMPUTED (``core.identity.identity_for``) from the
+    content-addressed ``detector_manifest`` + ``host_closure_digest`` + that attested image; the
+    ``sandbox_config_hash`` is computed from the attested isolation + image. Also refuses if the visible +
+    holdout corpora share any content (a holdout that duplicates the visible set proves memorisation)."""
     if not signer_approval.meets(1, domain=AuthorityDomain.CALIBRATION_GOVERNANCE):
         raise AcceptanceError(
             "the acceptance report must be signed by a CALIBRATION_GOVERNANCE principal — the detector "
@@ -295,20 +289,36 @@ def run_acceptance_anchor(
             "the blind holdout must be two-sided (>=1 known-bad AND >=1 known-good) to prove "
             "generalisation on both sides"
         )
-    # image + isolation DERIVED from the REAL sandbox (not caller strings); identity COMPUTED from the
-    # content-addressed manifest + the image the sandbox actually ran.
-    probe = make_sandbox()
-    image_ref = _sandbox_image_ref(probe, pin_image)
-    sandbox_config_hash = sandbox_config_digest(isolation=probe.isolation_level.value, image=image_ref)
+    honest = calibrate(make_sandbox, honest_detector, visible_set, budget,
+                       trials=trials, pin_image=pin_image)
+    fn = calibrate(make_sandbox, fn_deficient_detector, visible_set, budget,
+                   trials=trials, pin_image=pin_image)
+    fp = calibrate(make_sandbox, fp_happy_detector, visible_set, budget,
+                   trials=trials, pin_image=pin_image)
+    gen = calibrate(make_sandbox, honest_detector, holdout, budget,
+                    trials=trials, pin_image=pin_image)
+
+    # image + isolation DERIVED from the PARENT-MEASURED identity of the lanes that ACTUALLY ran (no
+    # probe): every lane must have produced ONE attestable identity and all four must AGREE — else the
+    # receipt has no honest environment to bind and the anchor refuses (fail-closed, board #3).
+    lane_identities = [honest.execution_identity, fn.execution_identity,
+                       fp.execution_identity, gen.execution_identity]
+    if any(i is None for i in lane_identities) or len({
+        i.digest() for i in lane_identities if i is not None
+    }) != 1:
+        raise AcceptanceError(
+            "the acceptance lanes did not all run under ONE parent-measured execution identity — the "
+            "run's environment is not attestable (a mixed or unmeasured sandbox), so no honest receipt "
+            "can be signed. Every lane must run in the same pinned sandbox."
+        )
+    identity = honest.execution_identity
+    assert identity is not None  # narrowed by the guard above (all four are non-None and equal)
+    image_ref = identity.image_ref
+    sandbox_config_hash = sandbox_config_digest(isolation=identity.isolation_level, image=image_ref)
     detector_identity = identity_for(
         detector_manifest, host_closure_digest=host_closure_digest,
         artifact_image_digest=content_digest({"image": image_ref}),
     )
-
-    honest = calibrate(make_sandbox, honest_detector, visible_set, budget, trials=trials)
-    fn = calibrate(make_sandbox, fn_deficient_detector, visible_set, budget, trials=trials)
-    fp = calibrate(make_sandbox, fp_happy_detector, visible_set, budget, trials=trials)
-    gen = calibrate(make_sandbox, honest_detector, holdout, budget, trials=trials)
 
     honest_passes = honest.passed
     refuses_on_fn = (not fn.passed) and len(fn.fn_failures) > 0

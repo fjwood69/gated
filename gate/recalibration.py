@@ -48,10 +48,12 @@ def deterministic_job_id(
 
 
 def _outcome_of(result: CalibrationResult) -> VerdictType:
-    """Map a CalibrationResult to the measurement outcome. An INADEQUATE set or any HARNESS ERROR is
-    ERROR (inconclusive — not a PASS, not a clean FAIL); a real miss/false-positive/flake is FAIL;
-    only a clean two-sided pass is PASS."""
-    if result.inadequate or result.harness_errors:
+    """Map a CalibrationResult to the measurement outcome. An INADEQUATE set, any HARNESS ERROR, or an
+    UNATTESTABLE environment (the fixtures did not all run under one parent-measured execution identity)
+    is ERROR (inconclusive — not a PASS, and not a clean FAIL that would mis-attribute an environment
+    problem to the detector); a real miss/false-positive/flake is FAIL; only a clean two-sided pass in a
+    single attested environment is PASS."""
+    if result.inadequate or result.harness_errors or not result.identity_consistent:
         return VerdictType.ERROR
     return VerdictType.PASS if result.passed else VerdictType.FAIL
 
