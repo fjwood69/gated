@@ -34,7 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from core import ResourceBudget, RuntimeAssertion, Sandbox, ed25519
+from core import ResourceBudget, RuntimeAssertion, Sandbox
+from gate import signing
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from core.chain import content_digest
 from core.identity import DetectorManifest, identity_for
@@ -217,7 +218,7 @@ def _sign_report(unsigned: AcceptanceReport, signing_seed: bytes) -> AcceptanceR
     from dataclasses import replace
 
     canonical = json.dumps(unsigned._payload(), sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return replace(unsigned, signature=ed25519.sign(canonical, signing_seed).hex())
+    return replace(unsigned, signature=signing.sign(canonical, signing_seed).hex())
 
 
 def verify_report(report: AcceptanceReport, *, verify_key: bytes) -> bool:
@@ -225,7 +226,7 @@ def verify_report(report: AcceptanceReport, *, verify_key: bytes) -> bool:
     A verifier holds only the public key, so it cannot forge a receipt."""
     canonical = json.dumps(report._payload(), sort_keys=True, separators=(",", ":")).encode("utf-8")
     try:
-        return ed25519.verify(canonical, bytes.fromhex(report.signature), verify_key)
+        return signing.verify(canonical, bytes.fromhex(report.signature), verify_key)
     except ValueError:
         return False
 

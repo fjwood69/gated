@@ -16,7 +16,7 @@ import subprocess
 
 from core import Command, Fixtures, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
-from core.ed25519 import public_key
+from gate.signing import public_key
 from core.identity import DetectorManifest
 
 from gate.acceptance import (

@@ -17,7 +17,7 @@ from pathlib import Path
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from core.chain import content_digest
-from core.ed25519 import public_key
+from gate.signing import public_key
 from core.identity import DetectorManifest, identity_for
 from gate.acceptance import (
     AcceptanceError,

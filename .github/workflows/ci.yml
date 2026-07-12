@@ -8,12 +8,12 @@ on:
 
 # Reuses the shape of the mori CI (sterility + ruff lint), adapted for the
 # ENGINE tree: the load-bearing extra job is `typecheck` — `mypy --strict` is
-# gated's signature quality bar — and `test` runs the zero-dependency
-# unittest suite on a Python matrix. Podman-gated tests (OCI / observed /
-# demo-regression) self-skip when no runtime/image is present, so they are
-# green-by-skip on hosted runners; the boundary mechanism is verified on real
-# podman on the NUC, not here. Dormant until gated is extracted to its own
-# public repo (only root .github/workflows runs in Actions).
+# gated's signature quality bar — and `test` runs the unittest suite on a Python
+# matrix. The suite is STDLIB-ONLY except for ONE vetted dependency on the
+# security path: PyNaCl (libsodium Ed25519) — one does not roll one's own crypto
+# (see gate/signing.py). Podman-gated tests (OCI / observed / demo-regression)
+# self-skip when no runtime/image is present, so they are green-by-skip on hosted
+# runners; the boundary mechanism is verified on real podman on the NUC, not here.
 
 jobs:
   sterility:
@@ -65,5 +65,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       # Zero third-party deps: the suite is stdlib-only. Podman-gated tests skip.
+      - name: Install the one vetted security dependency (PyNaCl / libsodium Ed25519)
+        run: pip install "pynacl==1.5.0"
       - name: unittest discover
         run: python -m unittest discover -s tests -v

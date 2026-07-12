@@ -29,7 +29,8 @@ import json
 from dataclasses import dataclass, field, replace
 from typing import Mapping
 
-from core import VerdictType, ed25519
+from core import VerdictType
+from gate import signing
 from core.chain import content_digest
 
 
@@ -103,7 +104,7 @@ def sign_measurement(unsigned: MeasurementAttestation, *, signing_seed: bytes) -
     runner's 32-byte PRIVATE measurement seed — held by the measurement side only. The restore
     controller never sees it (it holds the matching public key), so a measurement signature confers no
     power to mutate a tier AND cannot be forged by the verifier (measurement ≠ governance, cryptographic)."""
-    return replace(unsigned, signature=ed25519.sign(_canonical(unsigned._payload()), signing_seed).hex())
+    return replace(unsigned, signature=signing.sign(_canonical(unsigned._payload()), signing_seed).hex())
 
 
 def verify_measurement(attestation: MeasurementAttestation, *, verify_key: bytes) -> None:
@@ -115,7 +116,7 @@ def verify_measurement(attestation: MeasurementAttestation, *, verify_key: bytes
         sig = bytes.fromhex(attestation.signature)
     except ValueError:
         raise AttestationError("measurement signature is not valid hex") from None
-    if not ed25519.verify(_canonical(attestation._payload()), sig, verify_key):
+    if not signing.verify(_canonical(attestation._payload()), sig, verify_key):
         raise AttestationError("measurement signature invalid — payload tampered or wrong key")
 
 
