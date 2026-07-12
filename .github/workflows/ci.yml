@@ -29,6 +29,10 @@ jobs:
       # naming and env prefixes, so a de-baptism miss fails the build.
       - name: Content sterility (scripts/check-sterility.py)
         run: python scripts/check-sterility.py
+      # 3.5-close #1.7: the scoped overclaim guard — fails CI if unsuppressed absolute-safety /
+      # execution-assurance / guarantee language survives in shipped code strings or key docs.
+      - name: Overclaim lint (scripts/check-overclaim.py)
+        run: python scripts/check-overclaim.py
 
   lint:
     name: Lint (ruff)

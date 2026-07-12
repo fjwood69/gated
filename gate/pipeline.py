@@ -33,11 +33,18 @@ from core import (
     Verdict,
     VerdictType,
 )
+from engine.calibration import DetectorResolver
 from engine.retry import RetryCheck
-from engine.runner import TrialReportSink, run_check
+from engine.runner import TrialReport, TrialReportSink, run_check
 from sandbox.observed import ObservedOCISandbox
 
 from .artifact import build_artifact_spec, extraction_workspace, safe_extract_tarball
+from .detector_registry import (
+    DetectorRegistry,
+    DetectorResolutionError,
+    content_address,
+)
+from .preflight import ConfigurationError
 from .checkrun import (
     CheckConclusion,
     CheckOutput,
@@ -93,27 +100,61 @@ def extract_to_spec(tar_path: Path, workspace: Path) -> ArtifactSpec:
     return build_artifact_spec(dest)
 
 
+def default_detector_registry(
+    *, detector_id: str = "retry", entrypoint: tuple[str, ...] = DEFAULT_ENTRYPOINT
+) -> DetectorRegistry:
+    """Build a ``DetectorRegistry`` with the accepted first-party detector (``RetryCheck``) registered
+    under ``detector_id``, bound to its ACCEPTED content-address (3.5-close #1.3). A DEPLOYMENT pins the
+    address from the acceptance receipt so the live gate enforces the exact detector that was accepted;
+    the in-process reference pins the current ``RetryCheck`` bytes. ``resolve`` then refuses an
+    unregistered id or a detector whose content-address drifted (bad rollout / rollback)."""
+    registry = DetectorRegistry()
+    accepted = content_address(RetryCheck(entrypoint))
+    registry.register(detector_id, lambda: RetryCheck(entrypoint), content_hash=accepted)
+    return registry
+
+
+def assert_detector_registered(resolve: DetectorResolver, detector_id: str) -> None:
+    """3.5-close #1.3 boot assertion: the enforced detector must RESOLVE (registered + its content-address
+    matches the accepted one) at STARTUP — fail at boot, not per-PR. A misconfigured / drifted live
+    detector otherwise ERRORs on every PR (a fail-closed availability incident); catch it at boot."""
+    try:
+        resolve(detector_id)
+    except DetectorResolutionError as exc:
+        raise ConfigurationError(
+            f"live detector {detector_id!r} does not resolve at boot (unregistered or drifted from the "
+            f"accepted content-address): {exc}"
+        ) from exc
+
+
 def run_engine_check(
     artifact: ArtifactSpec,
     *,
     image: str,
-    entrypoint: tuple[str, ...] = DEFAULT_ENTRYPOINT,
+    resolve: DetectorResolver,
+    detector_id: str,
     trials: int = DEFAULT_TRIALS,
     budget: ResourceBudget = DEFAULT_ENGINE_BUDGET,
     first_fail: bool = True,
     report_sink: TrialReportSink | None = None,
 ) -> Verdict:
-    """Run the REAL hermetic engine (ObservedOCISandbox + RetryCheck, multi-trial) and
-    return the aggregated Verdict. The sandbox verifies the SHA-bind; a mismatch raises
-    and propagates (-> ERROR at the executor). ``first_fail`` short-circuits the FAIL
-    path (C1); ``report_sink`` records the TrialReport (the gate wires the audit here)."""
+    """Run the REAL hermetic engine (ObservedOCISandbox + multi-trial) and return the aggregated Verdict.
+
+    3.5-close #1.3: the detector is resolved through the SAME trusted registry calibration uses
+    (enforced == accepted). The registry refuses an unregistered id or a detector whose content-address
+    DRIFTED from the accepted one, so the live gate cannot enforce an unauthorized / rolled-back detector.
+    (Single accepted detector; per-policy detector SELECTION + full anti-rollback is a named-next
+    increment — see ARCHITECTURE.md.) A resolution failure raises ``DetectorResolutionError``, caught by
+    the job-runner and mapped to a blocking ERROR (never run an unverified detector). The sandbox verifies
+    the SHA-bind; a mismatch raises + propagates. ``first_fail`` short-circuits the FAIL path (C1)."""
+    detector = resolve(detector_id)  # trusted registry: unregistered / drifted -> raises -> ERROR
 
     def make_sandbox() -> ObservedOCISandbox:
         return ObservedOCISandbox(image=image, runtime="podman")
 
     return run_check(
-        make_sandbox, RetryCheck(entrypoint), artifact, budget,
-        trials=trials, first_fail=first_fail, report_sink=report_sink,
+        make_sandbox, detector, artifact, budget,
+        trials=trials, first_fail=first_fail, report_sink=report_sink, detector_id=detector_id,
     )
 
 
@@ -121,7 +162,8 @@ def make_job_runner(
     artifact_source: ArtifactSource,
     *,
     image: str,
-    entrypoint: tuple[str, ...] = DEFAULT_ENTRYPOINT,
+    resolve: DetectorResolver,
+    detector_id: str,
     trials: int = DEFAULT_TRIALS,
     budget: ResourceBudget = DEFAULT_ENGINE_BUDGET,
     first_fail: bool = True,
@@ -130,14 +172,15 @@ def make_job_runner(
     """Build the executor's ``job_runner``: fetch+extract inside a RAII workspace, then
     run the real engine. The workspace wraps the run so the artifact is on disk while the
     sandbox mounts it, and is purged on every exit path. ``report_sink`` carries the C1
-    trial-report audit up to the gate."""
+    trial-report audit up to the gate. 3.5-close #1.3: the detector is resolved by NAME through the
+    trusted registry (enforced == accepted); a resolution failure blocks (ERROR), never runs."""
 
     def run(event: GatingEvent) -> Verdict:
         with extraction_workspace() as ws:
             artifact = artifact_source(event, ws)
             try:
                 return run_engine_check(
-                    artifact, image=image, entrypoint=entrypoint, trials=trials,
+                    artifact, image=image, resolve=resolve, detector_id=detector_id, trials=trials,
                     budget=budget, first_fail=first_fail, report_sink=report_sink,
                 )
             except ArtifactHashMismatchError:
@@ -145,13 +188,36 @@ def make_job_runner(
                 # differing from its verified hash — a possible TOCTOU tamper. Blocks
                 # (ERROR -> action_required) AND surfaces as a distinct security event.
                 return Verdict(VerdictType.ERROR, Reason.ARTIFACT_INTEGRITY_MISMATCH)
+            except DetectorResolutionError:
+                # 3.5-close #1.3: the enforced detector is unregistered or has DRIFTED from the accepted
+                # identity -> refuse to run it (block), never enforce an unauthorized / rolled-back detector.
+                return Verdict(VerdictType.ERROR, Reason.DETECTOR_UNRESOLVED)
 
     return run
 
 
-def make_check_updater(client: GitHubCheckClient, *, name: str) -> CheckUpdater:
-    """Build the executor's ``updater``: drive the Check Run queued->in_progress->
-    completed with the mapped (fail-closed) conclusion and the out-of-band summary."""
+class CapturingTrialReportSink:
+    """A ``TrialReportSink`` that keeps the LAST report so the Check Run updater can render the attested
+    ``detector_id`` + ``image_digest`` (3.5-close #1.5). Single-writer: the executor runs job_runner then
+    updater on ONE thread per job (max_workers=1 in the live app), so ``last`` is this job's report. A
+    multi-worker executor would need a per-event capture; documented, not assumed."""
+
+    def __init__(self) -> None:
+        self.last: TrialReport | None = None
+
+    def record(self, report: TrialReport) -> None:
+        self.last = report
+
+
+def make_check_updater(
+    client: GitHubCheckClient, *, name: str,
+    report_capture: CapturingTrialReportSink | None = None,
+) -> CheckUpdater:
+    """Build the executor's ``updater``: drive the Check Run queued->in_progress->completed with the
+    mapped (fail-closed) conclusion and the out-of-band summary. 3.5-close #1.5: if a ``report_capture``
+    is wired (the same sink the job-runner records to), the summary carries the ATTESTED ``detector_id``
+    + resolved ``image_digest`` — non-repudiation of {which detector, which image} on the existing
+    merge-blocking path (not a new heavy signed local receipt)."""
     lifecycle = CheckRunLifecycle(client, name=name)
 
     def update(event: GatingEvent, verdict: Verdict) -> None:
@@ -161,7 +227,15 @@ def make_check_updater(client: GitHubCheckClient, *, name: str) -> CheckUpdater:
         lifecycle.mark_in_progress(
             repo_full_name=event.repo_full_name, check_run_id=check_run_id
         )
-        summary = render_check_summary(verdict, name).summary
+        detector_id: str | None = None
+        image_digest: str | None = None
+        if report_capture is not None and report_capture.last is not None:
+            report = report_capture.last
+            detector_id = report.detector_id
+            image_digest = (report.execution_identity.image_ref
+                            if report.execution_identity is not None else None)
+        summary = render_check_summary(
+            verdict, name, detector_id=detector_id, image_digest=image_digest).summary
         lifecycle.complete(
             repo_full_name=event.repo_full_name,
             check_run_id=check_run_id,
@@ -223,8 +297,11 @@ __all__ = [
     "ArtifactSource",
     "extract_to_spec",
     "run_engine_check",
+    "default_detector_registry",
+    "assert_detector_registered",
     "make_job_runner",
     "make_check_updater",
+    "CapturingTrialReportSink",
     "make_static_poster",
     "dispatch_gated",
     "StaticPoster",

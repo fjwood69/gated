@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from core import ArtifactSpec, Verdict
+from core import ArtifactSpec, Reason, Verdict, VerdictType
 from engine.runner import TrialReport
 
 from .dedup import InMemoryDeliveryLog
@@ -29,7 +29,14 @@ from http.server import ThreadingHTTPServer
 
 from .http_server import _handler_factory  # reuse the transport handler
 from .ledger import OverrideLedger, VerdictRow, capture_override, render_ledger_line
-from .pipeline import extract_to_spec, make_check_updater, run_engine_check
+from .pipeline import (
+    CapturingTrialReportSink,
+    assert_detector_registered,
+    default_detector_registry,
+    extract_to_spec,
+    make_check_updater,
+    run_engine_check,
+)
 from .queue import GatingEvent, InMemoryOverrideSink
 from .ratelimit import RateLimitBudget, TokenBucketRateLimiter
 from .secret import EnvSecretSource
@@ -40,6 +47,7 @@ _log = logging.getLogger("gated.gate.live")
 
 CHECK_NAME = os.environ.get("GATED_CHECK_NAME", "promotion-gate/retry")
 IMAGE = os.environ.get("GATED_IMAGE", "localhost/mori:local")
+DETECTOR_ID = os.environ.get("GATED_DETECTOR_ID", "retry")  # 3.5-close #1.3: the accepted detector id
 KEY_PATH = os.environ.get("GATED_APP_KEY_PATH", "app-private-key.pem")
 TRIALS = int(os.environ.get("GATED_TRIALS", "2"))
 WATCHDOG_TIMEOUT = float(os.environ.get("GATED_WATCHDOG_SECONDS", "900"))
@@ -129,20 +137,41 @@ def build(
         download_tarball(fetch_repo, event.head_sha, str(ws / "head.tar"), token)
         return extract_to_spec(ws / "head.tar", ws)
 
-    report_sink = _LoggingTrialReportSink()
+    # 3.5-close #1.5: capture the trial report so the Check Run summary carries the attested detector_id
+    # + image_digest. Fan out to the audit log too. Single-writer safe (Executor max_workers=1 below).
+    _log_sink = _LoggingTrialReportSink()
+    report_capture = CapturingTrialReportSink()
+
+    class _FanoutSink:
+        def record(self, report: object) -> None:
+            _log_sink.record(report)       # type: ignore[arg-type]
+            report_capture.record(report)  # type: ignore[arg-type]
+
+    report_sink = _FanoutSink()
+
+    # 3.5-close #1.3: the enforced detector is resolved by NAME through the trusted registry (enforced ==
+    # accepted). Boot assertion — fail HERE if the accepted detector does not resolve, not per-PR.
+    detector_registry = default_detector_registry(
+        detector_id=DETECTOR_ID, entrypoint=("python3", "/artifact/main.py"))
+    assert_detector_registered(detector_registry.resolve, DETECTOR_ID)
 
     def job_runner(event: GatingEvent) -> Verdict:
         from .artifact import extraction_workspace
+        from .detector_registry import DetectorResolutionError
 
         with extraction_workspace() as ws:
             artifact = artifact_source(event, ws)
-            return run_engine_check(
-                artifact, image=IMAGE, entrypoint=("python3", "/artifact/main.py"),
-                trials=TRIALS, first_fail=SHORT_CIRCUIT, report_sink=report_sink,
-            )
+            try:
+                return run_engine_check(
+                    artifact, image=IMAGE, resolve=detector_registry.resolve, detector_id=DETECTOR_ID,
+                    trials=TRIALS, first_fail=SHORT_CIRCUIT, report_sink=report_sink,
+                )
+            except DetectorResolutionError:
+                # enforced detector unregistered / drifted -> block (never enforce an unverified detector).
+                return Verdict(VerdictType.ERROR, Reason.DETECTOR_UNRESOLVED)
 
     client = RealGitHubCheckClient(provider, next(iter(installs)), budget=budget)
-    updater = make_check_updater(client, name=CHECK_NAME)
+    updater = make_check_updater(client, name=CHECK_NAME, report_capture=report_capture)
 
     executor = Executor(store, job_runner, updater, max_workers=1)
     watchdog = Watchdog(store, updater, timeout_seconds=WATCHDOG_TIMEOUT)

@@ -36,6 +36,7 @@ from gate.attestation import (
     verify_measurement,
 )
 from gate.attestation_store import MeasurementAttestationStore
+from gate.signing import KeyVerifier
 from gate.policy_state import PolicyState
 from gate.policy_store import PolicyStore, ReAttestConflict, ReAttestGrant
 
@@ -122,7 +123,7 @@ class RestoreController:
         if key is None:
             return RestoreOutcome(RestoreResult.REFUSED_UNTRUSTED, f"issuer {att.issuer!r} not allowed")
         try:
-            verify_measurement(att, verify_key=key)
+            verify_measurement(att, verifier=KeyVerifier(key))
         except AttestationError as exc:
             return RestoreOutcome(RestoreResult.REFUSED_UNTRUSTED, f"measurement not verifiable: {exc}")
 

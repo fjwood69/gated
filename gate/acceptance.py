@@ -26,8 +26,8 @@ blindness against a detector the author supplies is therefore impossible. This a
 the detectors arrive by NAME through a TRUSTED, content-addressed registry (``gate.detector_registry``),
 never as caller objects — so the graded code is the detector-maintainer's, not the (untrusted) policy
 author's. A deployment closes the residual channel by running each detector in its own container with
-AGGREGATE-ONLY output (the ~1 bit/fixture pattern never returns to the author). "Genuinely blind" below
-means "blind under this trusted-detector model", not unconditionally.
+AGGREGATE-ONLY output (the ~1 bit/fixture pattern never returns to the author). Any "blind" claim below
+holds ONLY under this trusted-detector model, never unconditionally.
 
 Gate-side; imports engine (it RUNS the real calibrator) + core + the calibration/authority types.
 Encryption here is a stdlib HMAC-keystream reference construction (encrypt-then-MAC); a deployment binds
@@ -49,7 +49,13 @@ from gate import signing
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from core.chain import content_digest
 from core.identity import DetectorManifest, identity_for
-from engine.calibration import DEFAULT_CALIBRATION_TRIALS, DetectorResolver, calibrate
+from engine.calibration import (
+    DEFAULT_CALIBRATION_TRIALS,
+    BackendGuard,
+    CalibrationResult,
+    DetectorResolver,
+    calibrate,
+)
 from gate.authority import AuthorityDomain, GovernanceApproval
 
 
@@ -224,19 +230,19 @@ def _content_hashes(cset: CalibrationSet) -> set[str]:
     return {hashlib.sha256(f.payload).hexdigest() for f in (*cset.known_bad, *cset.known_good)}
 
 
-def _sign_report(unsigned: AcceptanceReport, signing_seed: bytes) -> AcceptanceReport:
+def _sign_report(unsigned: AcceptanceReport, signer: signing.Signer) -> AcceptanceReport:
     from dataclasses import replace
 
     canonical = json.dumps(unsigned._payload(), sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return replace(unsigned, signature=signing.sign(canonical, signing_seed).hex())
+    return replace(unsigned, signature=signer.sign(canonical).hex())
 
 
-def verify_report(report: AcceptanceReport, *, verify_key: bytes) -> bool:
-    """True iff the report's Ed25519 signature is valid under the CALIBRATION_GOVERNANCE PUBLIC key.
-    A verifier holds only the public key, so it cannot forge a receipt."""
+def verify_report(report: AcceptanceReport, *, verifier: signing.Verifier) -> bool:
+    """True iff the report's Ed25519 signature is valid under the CALIBRATION_GOVERNANCE ``Verifier``
+    (3.5-close #1.4: a ``Verifier`` OBJECT holding only the public key — it cannot forge a receipt)."""
     canonical = json.dumps(report._payload(), sort_keys=True, separators=(",", ":")).encode("utf-8")
     try:
-        return signing.verify(canonical, bytes.fromhex(report.signature), verify_key)
+        return verifier.verify(canonical, bytes.fromhex(report.signature))
     except ValueError:
         return False
 
@@ -253,16 +259,16 @@ def run_acceptance_anchor(
     visible_set: CalibrationSet,
     blind_holdout_store: BlindHoldoutStore,
     holdout_key: bytes,
-    signer_seed: bytes,
+    signer: signing.Signer,
     signer_principal: str,
     signer_approval: GovernanceApproval,
     now: float,
     budget: ResourceBudget,
-    pin_image: Callable[[str], str] | None = None,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
+    backend_guard: BackendGuard | None = None,
 ) -> AcceptanceReport:
     """Conduct the two-sided acceptance run against REAL fixtures + a REAL sandbox and return a SIGNED,
-    FULLY-BOUND report. Self-grading closure: ``signer_approval`` must be a CALIBRATION_GOVERNANCE
+    identity-bound report. Self-grading closure: ``signer_approval`` must be a CALIBRATION_GOVERNANCE
     principal (the author cannot own the grader). Runs, in order: honest detector on the visible set
     (must PASS), FN-deficient (must be REFUSED), FP-happy (must be REFUSED), honest detector on the blind
     holdout (must PASS — generalisation). ``accepted`` iff all four hold.
@@ -303,14 +309,14 @@ def run_acceptance_anchor(
     # every detector arrives by NAME and is resolved ONLY through the trusted registry (``resolve``);
     # the anchor never accepts a detector object, so an author cannot smuggle in a holdout-gaming
     # detector. The honest id is graded on BOTH the visible and holdout lanes (same trusted build).
-    honest = calibrate(make_sandbox, honest_detector_id, resolve, visible_set, budget,
-                       trials=trials, pin_image=pin_image)
-    fn = calibrate(make_sandbox, fn_deficient_detector_id, resolve, visible_set, budget,
-                   trials=trials, pin_image=pin_image)
-    fp = calibrate(make_sandbox, fp_happy_detector_id, resolve, visible_set, budget,
-                   trials=trials, pin_image=pin_image)
-    gen = calibrate(make_sandbox, honest_detector_id, resolve, holdout, budget,
-                    trials=trials, pin_image=pin_image)
+    def _cal(did: str, cset: CalibrationSet) -> CalibrationResult:  # thread the §1.6 guard uniformly
+        return calibrate(make_sandbox, did, resolve, cset, budget,
+                         trials=trials, backend_guard=backend_guard)
+
+    honest = _cal(honest_detector_id, visible_set)
+    fn = _cal(fn_deficient_detector_id, visible_set)
+    fp = _cal(fp_happy_detector_id, visible_set)
+    gen = _cal(honest_detector_id, holdout)
 
     # image + isolation DERIVED from the PARENT-MEASURED identity of the lanes that ACTUALLY ran (no
     # probe): every lane must have produced ONE attestable identity and all four must AGREE — else the
@@ -350,7 +356,7 @@ def run_acceptance_anchor(
         holdout_coverage=len(holdout.known_good) + len(holdout.known_bad),
         signer_principal=signer_principal, claim=_HONEST_CLAIM, issued_at=now,
     )
-    return _sign_report(unsigned, signer_seed)
+    return _sign_report(unsigned, signer)
 
 
 def sandbox_config_digest(**config: object) -> str:

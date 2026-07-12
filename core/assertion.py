@@ -40,6 +40,14 @@ class Reason(Enum):
     OBSERVATION_INCOMPLETE = "some trials un-observable, no fail seen"  # ERROR
     # integrity (the SHA-bind) — a distinct SECURITY reason, not a generic infra fault
     ARTIFACT_INTEGRITY_MISMATCH = "mounted tree != verified hash — possible tampering"  # ERROR
+    # image identity (3.5-close #1.1) — the run's image digest could not be resolved before
+    # execution (image absent / GC'd between inspect and run). A FATAL identity error: an
+    # unresolvable image is an UNATTESTABLE run, never a silent pass (the detector did not "not fire").
+    IMAGE_UNRESOLVED = "image digest unresolved before run — unattestable, fail-closed"  # ERROR
+    # detector identity (3.5-close #1.3) — the enforced detector is unregistered, or its content-address
+    # DRIFTED from the accepted one. Refuse to run it (block) — never enforce an unauthorized/rolled-back
+    # detector at the merge boundary.
+    DETECTOR_UNRESOLVED = "enforced detector unregistered or drifted from accepted — fail-closed"  # ERROR
 
 
 @dataclass(frozen=True)

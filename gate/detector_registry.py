@@ -37,7 +37,10 @@ deployment hardens; the in-process mechanism alone is not a security boundary.
 """
 from __future__ import annotations
 
+import hashlib
+import inspect
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Protocol
 
 from core import Command, Fixtures, RuntimeAssertion, Verdict
@@ -62,15 +65,35 @@ class RegistrationError(RuntimeError):
 
 
 class RegistrableDetector(Protocol):
-    """A ``RuntimeAssertion`` that ALSO declares its trusted content address (``content_id``). Only a
-    detector built by the trusted process — which stamps a ``content_id`` over the exact impl it shipped
-    — is registrable; a caller's ad-hoc object has no honest ``content_id`` to match a registration."""
+    """A registrable detector is just a ``RuntimeAssertion``. Its content-address is COMPUTED from its
+    module bytes at registration/resolution (``content_address``), NOT self-declared (3.5-close #1.2) —
+    a caller's ad-hoc object is still refused because its computed address won't match a registration."""
 
     fixtures: Fixtures
-    content_id: str
 
     def entrypoint(self) -> Command: ...
     def assert_invariant(self, result: object) -> Verdict: ...
+
+
+def content_address(detector: object) -> str:
+    """The deterministic content-address of a detector = a hash of the EXACT bytes of the module file
+    that defines it (the packaged/installed artifact) — NOT a self-declared attribute, NOT an AST, and
+    NOT EOL-normalized (normalization would hide real byte differences; board amendment 2).
+
+    3.5-close #1.2 — an ANTI-DRIFT / config-integrity coordinate: it detects the deployed detector
+    drifting from the accepted bytes (bad rollout, partial revert, cache corruption, registry
+    mis-selection). It is NOT anti-smuggling against a malicious deployer — whoever can edit the module
+    can recompute and re-sign the address. It becomes AUTHORITY only under separation of duties
+    (source-signer != image-builder), a deploy-tier property; in the in-process reference it is hygiene
+    (see ARCHITECTURE.md). A deployment's real content-address is the detector's immutable CONTAINER
+    IMAGE digest."""
+    try:
+        src_file = inspect.getfile(type(detector))
+    except TypeError as exc:  # builtins / C-extensions / dynamically-defined types have no source file
+        raise DetectorIntegrityError(
+            f"cannot content-address {type(detector).__name__} — no source file to hash"
+        ) from exc
+    return "blake2b:" + hashlib.blake2b(Path(src_file).read_bytes()).hexdigest()
 
 
 def registration_binding(detector_id: str, content_hash: str) -> bytes:
@@ -82,7 +105,7 @@ def registration_binding(detector_id: str, content_hash: str) -> bytes:
 @dataclass(frozen=True)
 class _Entry:
     content_hash: str
-    build: Callable[[], RegistrableDetector]
+    build: Callable[[], RuntimeAssertion]
 
 
 class DetectorRegistry:
@@ -99,14 +122,16 @@ class DetectorRegistry:
     def register(
         self,
         detector_id: str,
-        build: Callable[[], RegistrableDetector],
+        build: Callable[[], RuntimeAssertion],
         *,
         content_hash: str,
         signature: bytes | None = None,
     ) -> None:
-        """Register a trusted detector under ``detector_id``, bound to ``content_hash`` (its declared
-        ``content_id``). On a SIGNED registry (``verify_key`` set) a valid registrar ``signature`` over
-        the binding is REQUIRED. Ids are write-once — re-registration is refused (no silent rebind)."""
+        """Register a trusted detector under ``detector_id``, bound to ``content_hash`` — the ACCEPTED
+        content-address (``content_address`` of the detector's module bytes, pinned at build/acceptance
+        time). ``resolve`` recomputes the address and refuses on drift. On a SIGNED registry
+        (``verify_key`` set) a valid registrar ``signature`` over the binding is REQUIRED. Ids are
+        write-once — re-registration is refused (no silent rebind)."""
         if detector_id in self._entries:
             raise RegistrationError(f"detector id {detector_id!r} is already registered (write-once)")
         if not content_hash:
@@ -123,8 +148,9 @@ class DetectorRegistry:
 
     def resolve(self, detector_id: str) -> RuntimeAssertion:
         """Return the trusted detector for ``detector_id``. Refuses an unregistered id, and refuses a
-        built detector whose ``content_id`` does not match the registration (content-address integrity).
-        This bound method IS the ``DetectorResolver`` injected into the entry points."""
+        built detector whose COMPUTED content-address (``content_address`` — a hash of its module bytes,
+        §1.2) does not match the registration — i.e. the deployed detector has DRIFTED from the accepted
+        bytes. This bound method IS the ``DetectorResolver`` injected into the entry points."""
         cached = self._cache.get(detector_id)
         if cached is not None:
             return cached
@@ -135,11 +161,12 @@ class DetectorRegistry:
                 "unregistered code (only trusted, content-addressed detectors may judge)"
             )
         detector = entry.build()
-        actual = getattr(detector, "content_id", None)
+        actual = content_address(detector)  # COMPUTED from the built detector's module bytes (§1.2)
         if actual != entry.content_hash:
             raise DetectorIntegrityError(
-                f"detector {detector_id!r} built with content_id {actual!r} != registered "
-                f"{entry.content_hash!r} — the code does not match its signed registration"
+                f"detector {detector_id!r} resolved to content-address {actual} != registered "
+                f"{entry.content_hash} — the deployed detector has DRIFTED from the accepted bytes "
+                "(bad rollout / revert / cache corruption), refused"
             )
         self._cache[detector_id] = detector
         return detector
@@ -159,5 +186,6 @@ __all__ = [
     "UnregisteredDetectorError",
     "DetectorIntegrityError",
     "RegistrationError",
+    "content_address",
     "registration_binding",
 ]

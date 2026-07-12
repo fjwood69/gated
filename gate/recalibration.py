@@ -32,12 +32,14 @@ from core import ResourceBudget, Sandbox, VerdictType
 from core.chain import content_digest
 from engine.calibration import (
     DEFAULT_CALIBRATION_TRIALS,
+    BackendGuard,
     CalibrationResult,
     DetectorResolver,
     calibrate,
 )
 from gate.attestation import MeasurementAttestation, sign_measurement
 from gate.calibration_store import CalibrationStore
+from gate.signing import Signer
 
 
 def deterministic_job_id(
@@ -77,8 +79,9 @@ def run_recalibration(
     issuer: str,
     nonce: str,
     now: float,
-    signing_seed: bytes,
+    signer: Signer,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
+    backend_guard: BackendGuard | None = None,
 ) -> MeasurementAttestation:
     """Seal the set (snapshot-isolated), run the batch calibrator against the frozen fixtures, and
     return a SIGNED measurement. Emits — never enforces. ``detector_identity`` is the caller's 4-tuple
@@ -91,7 +94,8 @@ def run_recalibration(
     go stale on any unrelated policy append and thrash re-runs)."""
     sealed = calibration_store.seal_set(set_id)  # one consistent snapshot; released on return
     # the detector arrives by NAME, resolved only through the trusted registry (never a caller object).
-    result = calibrate(make_sandbox, detector_id, resolve, sealed.calibration_set, budget, trials=trials)
+    result = calibrate(make_sandbox, detector_id, resolve, sealed.calibration_set, budget,
+                       trials=trials, backend_guard=backend_guard)
     job_id = deterministic_job_id(
         policy_id=policy_id, set_id=set_id, oracle_head=sealed.oracle_head,
         detector_identity=detector_identity,
@@ -105,7 +109,7 @@ def run_recalibration(
         fn_failures=result.fn_failures, fp_failures=result.fp_failures, flaky=result.flaky,
         harness_errors=result.harness_errors,
     )
-    return sign_measurement(unsigned, signing_seed=signing_seed)
+    return sign_measurement(unsigned, signer=signer)
 
 
 __all__ = ["deterministic_job_id", "run_recalibration"]

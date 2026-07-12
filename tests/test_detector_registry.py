@@ -16,8 +16,9 @@ from gate.detector_registry import (
     DetectorIntegrityError,
     DetectorRegistry,
     RegistrationError,
-    UnregisteredDetectorError,
+    content_address,
     registration_binding,
+    UnregisteredDetectorError,
 )
 from gate.signing import public_key, sign
 
@@ -25,17 +26,24 @@ _PASS = Verdict(VerdictType.PASS, Reason.EGRESS_GE_2)
 
 
 class _Detector:
-    """A minimal RegistrableDetector: a RuntimeAssertion that declares a trusted content_id."""
+    """A minimal RegistrableDetector (a RuntimeAssertion). Its content-address is COMPUTED from this
+    module's bytes by the registry (§1.2) — the ``content_id`` attribute below is DELIBERATELY ignored
+    by the registry (proving self-declaration is not trusted)."""
 
-    def __init__(self, content_id: str = "detector-v1") -> None:
+    def __init__(self, content_id: str = "self-declared-IGNORED") -> None:
         self.fixtures = Fixtures()
-        self.content_id = content_id
+        self.content_id = content_id  # a lie the registry does not read
 
     def entrypoint(self) -> Command:
         return Command(argv=("true",))
 
     def assert_invariant(self, result: object) -> Verdict:
         return _PASS
+
+
+# the accepted content-address of a _Detector = a hash of THIS test module's bytes (§1.2 computes it
+# from the module file, not the self-declared content_id). Constant across _Detector instances here.
+_ADDR = content_address(_Detector())
 
 
 class RegistryTests(unittest.TestCase):
@@ -47,14 +55,22 @@ class RegistryTests(unittest.TestCase):
     def test_resolve_returns_the_registered_detector(self) -> None:
         reg = DetectorRegistry()
         det = _Detector()
-        reg.register("d", lambda: det, content_hash=det.content_id)
+        reg.register("d", lambda: det, content_hash=_ADDR)
         self.assertIs(reg.resolve("d"), det)
 
-    def test_content_integrity_mismatch_is_refused(self) -> None:
-        # the factory builds a detector whose content_id != the registered hash -> code does not match
-        # its registration -> refused (a swapped factory cannot silently return different code).
+    def test_content_address_is_computed_from_module_bytes_not_self_declared(self) -> None:
+        # §1.2: the address is a hash of THIS module's bytes, NOT the self-declared content_id.
+        import hashlib
+        from pathlib import Path
+        expected = "blake2b:" + hashlib.blake2b(Path(__file__).read_bytes()).hexdigest()
+        self.assertEqual(content_address(_Detector("a-lie")), expected)
+        self.assertEqual(content_address(_Detector("another-lie")), expected)  # content_id ignored
+
+    def test_drift_from_accepted_address_is_refused(self) -> None:
+        # the deployed detector's computed address != the accepted (registered) one -> DRIFT -> refused
+        # (a self-declared content_id cannot rescue it; the registry recomputes from the bytes).
         reg = DetectorRegistry()
-        reg.register("d", lambda: _Detector("ACTUALLY-DIFFERENT"), content_hash="registered-hash")
+        reg.register("d", lambda: _Detector("declares-the-accepted-hash"), content_hash="accepted-addr")
         with self.assertRaises(DetectorIntegrityError):
             reg.resolve("d")
 
@@ -67,7 +83,7 @@ class RegistryTests(unittest.TestCase):
             builds["n"] += 1
             return _Detector()
 
-        reg.register("d", build, content_hash="detector-v1")
+        reg.register("d", build, content_hash=_ADDR)
         first = reg.resolve("d")
         second = reg.resolve("d")
         self.assertIs(first, second)
@@ -76,9 +92,9 @@ class RegistryTests(unittest.TestCase):
     def test_registration_is_write_once(self) -> None:
         reg = DetectorRegistry()
         det = _Detector()
-        reg.register("d", lambda: det, content_hash=det.content_id)
+        reg.register("d", lambda: det, content_hash=_ADDR)
         with self.assertRaises(RegistrationError):
-            reg.register("d", lambda: det, content_hash=det.content_id)  # no silent rebind
+            reg.register("d", lambda: det, content_hash=_ADDR)  # no silent rebind
 
     def test_empty_content_hash_is_refused(self) -> None:
         reg = DetectorRegistry()
@@ -95,22 +111,22 @@ class SignedRegistryTests(unittest.TestCase):
         det = _Detector()
         # no signature -> refused.
         with self.assertRaises(RegistrationError):
-            reg.register("d", lambda: det, content_hash=det.content_id)
+            reg.register("d", lambda: det, content_hash=_ADDR)
         # a signature over the WRONG binding -> refused.
-        wrong = sign(registration_binding("other-id", det.content_id), self._SEED)
+        wrong = sign(registration_binding("other-id", _ADDR), self._SEED)
         with self.assertRaises(RegistrationError):
-            reg.register("d", lambda: det, content_hash=det.content_id, signature=wrong)
+            reg.register("d", lambda: det, content_hash=_ADDR, signature=wrong)
         # a valid signature over (id, content_hash) -> accepted, and resolves.
-        good = sign(registration_binding("d", det.content_id), self._SEED)
-        reg.register("d", lambda: det, content_hash=det.content_id, signature=good)
+        good = sign(registration_binding("d", _ADDR), self._SEED)
+        reg.register("d", lambda: det, content_hash=_ADDR, signature=good)
         self.assertIs(reg.resolve("d"), det)
 
     def test_signature_by_the_wrong_key_is_refused(self) -> None:
         reg = DetectorRegistry(verify_key=self._PUB)
         det = _Detector()
-        forged = sign(registration_binding("d", det.content_id), bytes(range(96, 128)))  # other seed
+        forged = sign(registration_binding("d", _ADDR), bytes(range(96, 128)))  # other seed
         with self.assertRaises(RegistrationError):
-            reg.register("d", lambda: det, content_hash=det.content_id, signature=forged)
+            reg.register("d", lambda: det, content_hash=_ADDR, signature=forged)
 
 
 class EntryPointContractTests(unittest.TestCase):

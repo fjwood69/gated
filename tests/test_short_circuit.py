@@ -19,6 +19,7 @@ from typing import Iterator
 from core import (
     ArtifactSpec,
     Command,
+    ExecutionResult,
     Fixtures,
     IsolationLevel,
     Reason,
@@ -92,8 +93,11 @@ class _RecordingSandbox:
     def __init__(self, events: list[str]) -> None:
         self._events = events
 
-    def run(self, handle: object, entrypoint: Command, budget: ResourceBudget) -> object:
-        return object()  # result ignored (the check is scripted)
+    def run(self, handle: object, entrypoint: Command, budget: ResourceBudget) -> ExecutionResult:
+        # the check is scripted, but the runner reads result.image_digest for the identity coordinate,
+        # so return a conformant ExecutionResult (no image -> None digest).
+        return ExecutionResult(outcome="completed", exit_code=0,
+                               isolation_level=self.isolation_level, artifact_hash="scripted")
 
     @contextmanager
     def session(self, artifact: ArtifactSpec, fixtures: Fixtures) -> Iterator[object]:

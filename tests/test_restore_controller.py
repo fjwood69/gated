@@ -15,7 +15,7 @@ from pathlib import Path
 
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import FixtureLabel
-from gate.signing import public_key
+from gate.signing import KeyVerifier, SeedSigner, public_key
 from gate.attestation_store import MeasurementAttestationStore
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
@@ -107,7 +107,7 @@ def _run(c: CalibrationStore, verdicts: list[Verdict], *, tier_gen: str = "tg", 
     return run_recalibration(
         policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(),
         detector_id="d", resolve=lambda _id: det, detector_identity=_DET, tier_generation=tier_gen,
-        budget=_BUDGET, issuer=_ISSUER, nonce=nonce, now=100.0, signing_seed=_SEED, trials=3)
+        budget=_BUDGET, issuer=_ISSUER, nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3)
 
 
 class RestoreControllerTests(unittest.TestCase):
@@ -205,7 +205,7 @@ class RestoreControllerTests(unittest.TestCase):
         self.assertTrue(store.exists(ref))                       # durably persisted
         stored = store.get(ref)
         assert stored is not None
-        verify_measurement(stored, verify_key=_PUB)    # the stored copy is the signed one
+        verify_measurement(stored, verifier=KeyVerifier(_PUB))    # the stored copy is the signed one
         self.assertEqual(stored.oracle_head, att.oracle_head)
 
     def test_restore_succeeds_when_other_policies_exist(self) -> None:

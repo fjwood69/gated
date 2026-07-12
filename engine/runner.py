@@ -35,6 +35,8 @@ from typing import Callable, Protocol, Sequence
 
 from core import (
     ArtifactSpec,
+    ExecutionResult,
+    ImageResolutionError,
     Reason,
     ResourceBudget,
     RuntimeAssertion,
@@ -49,11 +51,13 @@ _log = logging.getLogger("gated.engine")
 
 @dataclass(frozen=True)
 class ExecutionIdentity:
-    """3.5 #3: the PARENT-MEASURED identity of the environment a trial actually ran in. Measured by the
-    runner FROM THE SANDBOX OBJECT IT CONSTRUCTED — never self-reported by the child/run (a child can
-    lie about its own image). Binds backend, the (optionally digest-pinned) image ref, the isolation
-    level, and an observer/config hash. The calibration + acceptance receipt attest THIS, and reject a
-    run whose trials do not all share it (a sandbox that changed environment mid-run)."""
+    """The PARENT-MEASURED identity of the environment a trial actually ran in (3.5 #3 + 3.5-close #1.1).
+    Backend, isolation level and observer-config hash are read parent-side from the trusted sandbox
+    OBJECT; ``image_ref`` is the IMMUTABLE digest the sandbox resolved before run and executed (the bytes
+    that ran, not the mutable tag) — never self-reported by the artifact/child. This is an IDENTITY /
+    ANTI-DRIFT coordinate (which environment), NOT runtime-behaviour assurance (a compromised host could
+    match the digest and run something else — the unattested-TCB ceiling, ARCHITECTURE.md). The
+    calibration + acceptance receipt attest THIS and reject a run whose trials do not all share it."""
 
     backend: str
     image_ref: str
@@ -67,11 +71,16 @@ class ExecutionIdentity:
         })
 
 
-def _raw_identity(sandbox: Sandbox) -> tuple[str, object, str, str]:
-    """The cheap per-trial identity tuple read PARENT-SIDE from the sandbox object (no image pin)."""
+def _raw_identity(sandbox: Sandbox, result: ExecutionResult) -> tuple[str, object, str, str]:
+    """The per-trial identity tuple. Backend + isolation + observer-config are read PARENT-SIDE from the
+    trusted sandbox object; the IMAGE coordinate is the immutable digest the sandbox resolved before run
+    and RECORDED in the result (3.5-close #1.1 — the bytes that ran, not the mutable tag). A None
+    image_digest = a backend with no image (NoOp/Subprocess); an AUDITED HERMETIC backend that could not
+    resolve raises ImageResolutionError before reaching here (§1.6 confines security-relevant calibration
+    to audited backends, so a None digest is never a security-relevant attested run)."""
     return (
-        type(sandbox).__name__, getattr(sandbox, "image", None),
-        sandbox.isolation_level.value, str(getattr(sandbox, "observer_config_hash", "") or ""),
+        type(sandbox).__name__, result.image_digest,
+        result.isolation_level.value, str(getattr(sandbox, "observer_config_hash", "") or ""),
     )
 
 
@@ -90,6 +99,11 @@ class TrialReport:
     short_circuited: bool
     aggregate: Verdict
     execution_identity: ExecutionIdentity | None = None
+    # 3.5-close #1.1 (board amendment 3): the NAME of the detector that judged these trials. Lives HERE
+    # (enforcement metadata), NOT on ExecutionResult — the sandbox produces facts about the run and does
+    # not know which detector judged its result. Set by the caller (calibration / live enforcement) that
+    # resolved the detector through the trusted registry; carried into the Check Run payload (§1.5).
+    detector_id: str | None = None
 
     @property
     def trials_run(self) -> int:
@@ -115,7 +129,12 @@ def aggregate(verdicts: Sequence[Verdict]) -> Verdict:
         )
         return Verdict(VerdictType.FAIL, reason)
     if VerdictType.ERROR in statuses:
-        return Verdict(VerdictType.ERROR, Reason.OBSERVATION_INCOMPLETE)
+        # preserve a UNANIMOUS specific ERROR reason (IMAGE_UNRESOLVED, ARTIFACT_INTEGRITY_MISMATCH,
+        # TELEMETRY_MISSING) — a distinct fatal cause is more actionable than the generic multi-trial
+        # OBSERVATION_INCOMPLETE, which is reserved for mixed/partial un-observability.
+        error_reasons = {v.reason for v in verdicts if v.status is VerdictType.ERROR}
+        reason = error_reasons.pop() if len(error_reasons) == 1 else Reason.OBSERVATION_INCOMPLETE
+        return Verdict(VerdictType.ERROR, reason)
     return Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
 
 
@@ -128,44 +147,58 @@ def run_check(
     *,
     first_fail: bool = True,
     report_sink: TrialReportSink | None = None,
-    pin_image: Callable[[str], str] | None = None,
+    detector_id: str | None = None,
 ) -> Verdict:
     """Run ``check`` on ``artifact`` across up to ``trials`` isolated trials -> one
     Verdict. ``make_sandbox`` is a factory so each trial gets a fresh sandbox instance
     (and, via its prepare(), a fresh network/proxy/container).
 
     ``first_fail`` (default True) stops after the first FAIL (see module docstring).
-    ``report_sink`` receives a ``TrialReport`` (the audit record of what ran).
+    ``report_sink`` receives a ``TrialReport`` (the audit record of what ran). ``detector_id`` (the
+    trusted-registry name of ``check``) is recorded on the report for the Check Run payload (§1.5).
 
-    3.5 #3: the runner PARENT-MEASURES each trial's execution identity from the sandbox object it
-    constructed and asserts all trials SHARE it. A mixed-identity run (a sandbox whose environment
-    changed between trials — image/backend/isolation drift) is fail-closed to ERROR, and the attested
-    identity is None. ``pin_image`` (optional) resolves the sandbox's image tag to an immutable digest
-    (deploy: ``podman image inspect``); it is called ONCE for the attested identity, not per trial."""
+    3.5 #3 + 3.5-close #1.1: the runner PARENT-MEASURES each trial's execution identity — backend +
+    isolation + observer-config from the trusted sandbox object, and the IMMUTABLE image digest the
+    sandbox resolved-before-run and recorded in the result (the bytes that ran, not the tag). It asserts
+    all trials SHARE one identity; a mixed-identity run is fail-closed to ERROR with a None attested
+    identity. An image that cannot be resolved before run (absent / GC'd) raises ``ImageResolutionError``
+    -> ``Verdict(ERROR, IMAGE_UNRESOLVED)`` for that trial, NEVER a silent pass."""
     verdicts: list[Verdict] = []
-    raws: list[tuple[str, object, str, str]] = []
+    raws: list[tuple[str, object, str, str] | None] = []
     for _ in range(trials):
         sb = make_sandbox()
-        raws.append(_raw_identity(sb))  # parent-measured, before running the artifact
-        with sb.session(artifact, check.fixtures) as handle:
-            result = sb.run(handle, check.entrypoint(), budget)
+        try:
+            with sb.session(artifact, check.fixtures) as handle:
+                result = sb.run(handle, check.entrypoint(), budget)
+        except ImageResolutionError:
+            # 3.5-close #1.1 (finding A): the image digest could not be resolved BEFORE run -> the run
+            # is UNATTESTABLE -> fail-closed ERROR, never a silent pass / "the detector did not fire".
+            # No identity for this trial (a None raw -> the run is not consistently attestable -> ERROR).
+            verdicts.append(Verdict(VerdictType.ERROR, Reason.IMAGE_UNRESOLVED))
+            raws.append(None)
+            if first_fail:
+                break  # re-attempting an unresolvable image gains nothing
+            continue
         verdict = check.assert_invariant(result)
         verdicts.append(verdict)
+        raws.append(_raw_identity(sb, result))  # image coord = the digest the sandbox actually ran
         if first_fail and verdict.status is VerdictType.FAIL:
             break  # unanimity: a FAIL is unrescuable — the rest are pure waste
 
-    consistent = len(set(raws)) <= 1
+    # attestable ONLY if every trial produced an identity AND they all agree. A None raw (resolution
+    # failure) or differing raws -> not consistently attestable -> the run's identity is None.
+    consistent = bool(raws) and all(r is not None for r in raws) and len(set(raws)) <= 1
     identity: ExecutionIdentity | None = None
-    if raws and consistent:
-        backend, image, iso, obs = raws[0]
-        image_ref = (pin_image(str(image)) if (pin_image and image is not None)
-                     else str(image) if image is not None else f"<{backend}>")
-        identity = ExecutionIdentity(backend=backend, image_ref=image_ref,
-                                     isolation_level=iso, observer_config_hash=obs)
+    if consistent:
+        backend, image, iso, obs = raws[0]  # type: ignore[misc]
+        image_ref = str(image) if image is not None else f"<{backend}>"
+        identity = ExecutionIdentity(backend=str(backend), image_ref=image_ref,
+                                     isolation_level=str(iso), observer_config_hash=str(obs))
     result_verdict = aggregate(verdicts)
-    if not consistent:
-        # 3.5 #3: trials ran in DIFFERENT environments -> the run's identity is not attestable ->
-        # fail-closed (a downstream calibration/acceptance must not trust a mixed-identity run).
+    if not consistent and result_verdict.status is not VerdictType.ERROR:
+        # trials ran in DIFFERENT environments but none ERRORed (e.g. all PASS on drifting images) ->
+        # the run's identity is not attestable -> fail-closed. A resolution failure already ERRORs
+        # (IMAGE_UNRESOLVED) and is preserved; this only covers the mixed-identity-but-all-observed case.
         result_verdict = Verdict(VerdictType.ERROR, Reason.OBSERVATION_INCOMPLETE)
     if report_sink is not None:
         report = TrialReport(
@@ -174,6 +207,7 @@ def run_check(
             short_circuited=len(verdicts) < trials,
             aggregate=result_verdict,
             execution_identity=identity,
+            detector_id=detector_id,
         )
         # The audit sink is an OBSERVER — it must never crash the engine or suppress the
         # Verdict (the merge gate's source of truth). Emit-failure is logged, not

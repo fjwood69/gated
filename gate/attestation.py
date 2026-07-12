@@ -99,24 +99,29 @@ def _canonical(payload: Mapping[str, object]) -> bytes:
     return json.dumps(dict(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def sign_measurement(unsigned: MeasurementAttestation, *, signing_seed: bytes) -> MeasurementAttestation:
-    """Return a signed copy of ``unsigned`` (Ed25519 signature recomputed). ``signing_seed`` is the
-    runner's 32-byte PRIVATE measurement seed — held by the measurement side only. The restore
-    controller never sees it (it holds the matching public key), so a measurement signature confers no
-    power to mutate a tier AND cannot be forged by the verifier (measurement ≠ governance, cryptographic)."""
-    return replace(unsigned, signature=signing.sign(_canonical(unsigned._payload()), signing_seed).hex())
+def sign_measurement(
+    unsigned: MeasurementAttestation, *, signer: signing.Signer
+) -> MeasurementAttestation:
+    """Return a signed copy of ``unsigned`` (Ed25519 signature recomputed). 3.5-close #1.4: takes a
+    ``Signer`` OBJECT, not a raw seed — the measurement side holds the signer (a ``SeedSigner`` in the
+    reference, a KMS/HSM signer in deployment); the restore controller holds only the matching
+    ``Verifier``, so a measurement signature confers no power to mutate a tier AND cannot be forged by
+    the verifier (measurement ≠ governance, cryptographic). Routing through the object is what makes the
+    KMS swap real — no raw seed reaches this layer."""
+    return replace(unsigned, signature=signer.sign(_canonical(unsigned._payload())).hex())
 
 
-def verify_measurement(attestation: MeasurementAttestation, *, verify_key: bytes) -> None:
-    """Raise ``AttestationError`` unless the Ed25519 signature is valid under ``verify_key`` (the
-    issuer's 32-byte PUBLIC key). Integrity/authenticity only — freshness is the restore controller's
-    value-currency CAS (a PASS whose identity / oracle-head still match the world is still true, no
-    matter its age; one whose values drifted is refused there). The verifier cannot forge: it has no seed."""
+def verify_measurement(
+    attestation: MeasurementAttestation, *, verifier: signing.Verifier
+) -> None:
+    """Raise ``AttestationError`` unless the Ed25519 signature is valid under ``verifier`` (a ``Verifier``
+    OBJECT holding only the issuer's PUBLIC key — 3.5-close #1.4). Integrity/authenticity only — freshness
+    is the restore controller's value-currency CAS. The verifier cannot forge: it holds no signing key."""
     try:
         sig = bytes.fromhex(attestation.signature)
     except ValueError:
         raise AttestationError("measurement signature is not valid hex") from None
-    if not signing.verify(_canonical(attestation._payload()), sig, verify_key):
+    if not verifier.verify(_canonical(attestation._payload()), sig):
         raise AttestationError("measurement signature invalid — payload tampered or wrong key")
 
 

@@ -16,7 +16,7 @@ import subprocess
 
 from core import Command, Fixtures, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
-from gate.signing import public_key
+from gate.signing import KeyVerifier, SeedSigner, public_key
 from core.identity import DetectorManifest
 
 from gate.acceptance import (
@@ -25,7 +25,8 @@ from gate.acceptance import (
     verify_report,
 )
 from gate.authority import AuthorityDomain, GovernanceApproval
-from gate.detector_registry import DetectorRegistry
+from gate.backends import trusted_backend_guard, trusted_sandbox_factory
+from gate.detector_registry import DetectorRegistry, content_address
 from sandbox.oci import OCISandbox
 
 IMAGE = "localhost/mori:local"
@@ -121,17 +122,20 @@ class AcceptanceAnchorOnRealPodmanTests(unittest.TestCase):
         # detectors arrive by NAME through a trusted content-addressed registry, never as objects.
         registry = DetectorRegistry()
         honest, fn, fp = _ExitCodeDetector(), _AlwaysPass(), _AlwaysFail()
-        registry.register("honest", lambda: honest, content_hash=honest.content_id)
-        registry.register("fn", lambda: fn, content_hash=fn.content_id)
-        registry.register("fp", lambda: fp, content_hash=fp.content_id)
+        registry.register("honest", lambda: honest, content_hash=content_address(honest))
+        registry.register("fn", lambda: fn, content_hash=content_address(fn))
+        registry.register("fp", lambda: fp, content_hash=content_address(fp))
         report = run_acceptance_anchor(
-            make_sandbox=lambda: OCISandbox(image=IMAGE),
+            # §1.6: the AUDITED backend built through the trusted factory (token-stamped) + the guard.
+            make_sandbox=trusted_sandbox_factory("oci", IMAGE), backend_guard=trusted_backend_guard,
             honest_detector_id="honest", fn_deficient_detector_id="fn", fp_happy_detector_id="fp",
             resolve=registry.resolve, detector_manifest=manifest,
             host_closure_digest="host-closure-oci-v1", visible_set=visible,
-            blind_holdout_store=holdout, holdout_key=_HOLDOUT_KEY, signer_seed=_SIGNER_SEED,
+            blind_holdout_store=holdout, holdout_key=_HOLDOUT_KEY, signer=SeedSigner(_SIGNER_SEED),
             signer_principal="cal-gov-1", signer_approval=_cal_gov("cal-gov-1"),
-            pin_image=_pin_image, now=100.0, budget=_BUDGET, trials=2)
+            now=100.0, budget=_BUDGET, trials=2)
+        # the sandbox resolves the local .Id itself (3.5-close #1.1); _pin_image computes the SAME
+        # expected digest independently, so the receipt's image_ref must equal it.
         image_digest = _pin_image(IMAGE)
 
         self.assertTrue(report.honest_passes, "honest exit-code detector must pass the visible set")
@@ -142,7 +146,7 @@ class AcceptanceAnchorOnRealPodmanTests(unittest.TestCase):
         self.assertFalse(report.short_circuit)
         self.assertEqual(report.visible_coverage, 2)
         self.assertEqual(report.holdout_coverage, 2)
-        self.assertTrue(verify_report(report, verify_key=_SIGNER_PUB))
+        self.assertTrue(verify_report(report, verifier=KeyVerifier(_SIGNER_PUB)))
         # the receipt binds a PINNED image digest (derived from the real sandbox), a disjoint holdout
         # (blind under the trusted-detector model), and the real sandbox hash — nothing is a caller string.
         self.assertEqual(report.image_ref, image_digest)

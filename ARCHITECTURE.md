@@ -141,6 +141,80 @@ content-addressed, signed artifact store** (e.g. signed OCI images), and signing
 None of these are TEE/MPC-grade requirements — they are ordinary container hygiene the reference
 deliberately defers. (3.5 #4 / Option B, 2026-07.)
 
+## 3.5-close hardening — exactly what it binds, and what it does NOT
+
+The close increment narrows every claim to what the in-process reference *establishes* — **identity /
+anti-drift / config-integrity** — and names the deploy-tier controls that would buy more. What it binds:
+
+- **Execution identity is the bytes that ran, not a tag (§1.1).** An OCI backend resolves the local
+  image `.Id` at the top of `prepare()` and executes *that immutable digest* (artifact + proxy +
+  escape-probe), recording the same variable in `ExecutionResult.image_digest`; an image absent/GC'd
+  before run is a **fatal `IMAGE_UNRESOLVED` ERROR, never a silent pass**. This closes the tag-TOCTOU.
+  It is **identity, not runtime-behaviour assurance**: a compromised host could match the digest and run
+  something else — that is the unattested-TCB ceiling below. `observer_config_hash` additionally binds
+  the **bind-mounted proxy source + sealed-network flags + escape-probe** (the image digest does not
+  cover the host-mounted observer, so observer drift would otherwise be invisible).
+- **Detector content-address is anti-drift, not anti-smuggling, and is SoD-conditional (§1.2).** The
+  registry computes the address from the detector's **module bytes** (not a self-declared attribute, not
+  an AST, not EOL-normalized) and refuses a drifted detector. For *first-party* detector code this is a
+  **configuration-integrity / anti-drift** control (it catches a bad rollout / revert / mis-selection),
+  **not** a boundary against a malicious deployer — whoever can edit the module can re-sign the address.
+  It becomes *authorization* only under **separation of duties** (source-signer ≠ image-builder), a
+  deploy-tier property; in the reference it is **hygiene, not authorization**.
+- **Enforced == accepted (§1.3).** The live gate resolves its detector through the *same* registry
+  calibration uses; an unregistered or drifted detector **blocks (`DETECTOR_UNRESOLVED`)**, and a
+  **boot assertion** fails at startup (not per-PR) if the accepted detector does not resolve. This is
+  single-detector identity continuity; **per-policy `accepted_detector_id` selection is named-next**.
+- **The signing seam is real (§1.4).** Acceptance + measurement receipts sign/verify through injected
+  `Signer` / `Verifier` **objects**, never raw seeds — so a deployment swaps a KMS/HSM behind the seam.
+- **Non-repudiation on the existing blocking path (§1.5).** The Check Run summary carries the attested
+  `detector_id` + `image_digest` (engine-measured identity, never artifact output). No heavy local
+  signed enforcement receipt is built: the **Check Run + branch protection + C3 override ledger are
+  already the merge-blocking artifacts**, and a same-host signer would be false assurance.
+
+### Split the receipts (two threats, two moments)
+A single signature must not imply both claims. **Calibration acceptance receipt:** "detector X approved
+for policy Y" (`gate/acceptance.py`). **Enforcement runtime record:** "artifact A ran under detector X in
+image D → verdict V" (the trial report + the enriched Check Run). Keep them distinct.
+
+### The calibration-time TCB (two halves — both in-process-unproven, both deploy-hardened)
+- **(a) Trusted detectors.** An untrusted detector's `assert_invariant` runs **host-side** during
+  calibration and could `socket.connect()` to exfil the holdout (`--network=none` is sandbox-side, not
+  host-side). This is the concrete mechanism behind the narrowed blindness claim — blindness holds *under
+  the trusted-detector model* precisely because untrusted detector code could exfil host-side. Mitigated
+  by the registry/trusted-detector binding; a deployment adds **netns/firewall on the calibration host
+  process**.
+- **(b) Audited backends (§1.6).** `calibrate()` only *declared* `HERMETIC` before — a declaration, not
+  proof of no-egress / observer-isolation. The **trusted-backend construction guard** (`gate/backends.py`)
+  now confines security-relevant calibration to the **audited backends** (`OCISandbox`,
+  `ObservedOCISandbox`) via a module-private capability token, verifying the **returned object**. The
+  token is a within-runtime *construction guard*, **not authorization** against a malicious deployer —
+  real authority is a **build-time signed manifest of trusted-backend module hashes** (deploy-tier). So
+  claim no-egress / observer-isolation **only for the audited backends**, never the generic `Sandbox`
+  interface.
+
+### The 6th — unmeasured runtime TCB (the deploy ceiling)
+The host kernel, OCI runtime, egress observer, and verdict aggregator are a **trusted-but-unattested
+TCB**. Static identity binding ≠ runtime-behaviour assurance: a compromised host can verify the right
+digest and then run/mutate a different container, replay/suppress egress, or bypass the observed
+namespace. This is gated's documented deploy ceiling — hermetic sandbox + boundary observation is the
+in-process **floor**; **TEE/TPM measured-boot + eBPF signed observations** are the deploy hardening that
+closes it. **Named, not built** (building attestation into the reference would violate its scope).
+
+### 7c — closed by design (verified against code)
+Untrusted-telemetry parsing cannot reach the verdict: `sandbox/oci.py` and `sandbox/observed.py`
+`DEVNULL` the artifact's stdout+stderr, and `ExecutionResult` is typed facts only (exit-code int +
+host-observed egress counter) — there is no parse of artifact output, no `pickle`, no regex-DoS surface.
+Not a deferral; the architecture cannot be hit.
+
+### Named-next increments (deploy-bar — not dropped)
+- **`policy → accepted_detector_id` per-policy selection.** Migration alone lets the gate run any
+  *registered* detector; per-policy binding authorizes a specific detector for a specific policy.
+  **Anti-rollback is a hard prerequisite of this increment** — the moment multiple accepted detectors can
+  exist per policy, an older-but-valid one could be selected, so rollback protection must land with it.
+- **Runtime attestation** — TEE/TPM measured-boot + eBPF signed egress (the 6th) + netns isolation of the
+  calibration host process (calibration-TCB half (a)).
+
 ## The rule to hold — Apache-core purity
 
 Everything in `core/`, `sandbox/`, `engine/`, `observe/`, `cli/` is the open

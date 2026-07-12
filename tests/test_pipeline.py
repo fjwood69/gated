@@ -28,7 +28,10 @@ from unittest import mock
 from gate.checkrun import CheckConclusion, CheckStatus
 from gate.executor import Executor
 from gate.pipeline import (
+    CapturingTrialReportSink,
     assert_budget_fits_watchdog,
+    assert_detector_registered,
+    default_detector_registry,
     extract_to_spec,
     make_check_updater,
     make_job_runner,
@@ -39,6 +42,9 @@ from gate.summary import render_check_summary
 
 _NAME = "gated/retry"
 _IMAGE = "localhost/mori:local"
+_REGISTRY = default_detector_registry()   # 3.5-close #1.3: the accepted "retry" detector, registered
+_RESOLVE = _REGISTRY.resolve
+_DETECTOR_ID = "retry"
 
 
 def _event(delivery_id: str = "d1", sha: str = "a" * 40) -> GatingEvent:
@@ -77,11 +83,17 @@ class SummaryTests(unittest.TestCase):
 
     def test_summary_only_consumes_typed_verdict(self) -> None:
         # structural anti-spoofing: the renderer's ONLY input is the Verdict — it cannot
-        # reach artifact stdout/tmpfs even in principle.
+        # reach artifact stdout/tmpfs even in principle. The ONLY inputs are the typed Verdict, the
+        # check name, and (3.5-close #1.5) the ATTESTED detector_id + image_digest — engine-measured
+        # IDENTITY, never artifact output. No parameter is a log / stdout / tmpfs channel.
         import inspect
 
-        params = list(inspect.signature(render_check_summary).parameters)
-        self.assertEqual(params, ["verdict", "check_name"])
+        sig = inspect.signature(render_check_summary)
+        self.assertEqual(list(sig.parameters), ["verdict", "check_name", "detector_id", "image_digest"])
+        # the identity params are keyword-only and default to None (non-repudiation, not a data channel).
+        for p in ("detector_id", "image_digest"):
+            self.assertIs(sig.parameters[p].kind, inspect.Parameter.KEYWORD_ONLY)
+            self.assertIsNone(sig.parameters[p].default)
 
 
 class _FakeCheckClient:
@@ -181,7 +193,7 @@ class IntegrityMismatchMappingTests(unittest.TestCase):
         def source(_: GatingEvent, ws: Path) -> ArtifactSpec:
             return ArtifactSpec(path=ws, tree_hash="sha256:whatever")
 
-        job = make_job_runner(source, image=_IMAGE)
+        job = make_job_runner(source, image=_IMAGE, resolve=_RESOLVE, detector_id=_DETECTOR_ID)
         with mock.patch(
             "gate.pipeline.run_engine_check",
             side_effect=ArtifactHashMismatchError("swap"),
@@ -189,6 +201,65 @@ class IntegrityMismatchMappingTests(unittest.TestCase):
             verdict = job(_event())
         self.assertIs(verdict.status, VerdictType.ERROR)
         self.assertIs(verdict.reason, Reason.ARTIFACT_INTEGRITY_MISMATCH)
+
+
+class DetectorRegistryEnforcementTests(unittest.TestCase):
+    """3.5-close #1.3: the live gate resolves its detector through the trusted registry (enforced ==
+    accepted), and a boot assertion catches a mis-registered detector."""
+
+    def test_boot_assertion_passes_for_registered_detector(self) -> None:
+        assert_detector_registered(_RESOLVE, _DETECTOR_ID)  # does not raise
+
+    def test_boot_assertion_fails_for_unregistered_detector(self) -> None:
+        from gate.preflight import ConfigurationError
+        with self.assertRaises(ConfigurationError):
+            assert_detector_registered(_RESOLVE, "not-the-accepted-detector")
+
+    # ---- adversarial (finding F): an unresolvable detector -> BLOCK (ERROR), never runs ----
+    def test_job_runner_blocks_when_detector_does_not_resolve(self) -> None:
+        from gate.detector_registry import DetectorRegistry
+        from engine.retry import RetryCheck
+
+        # a registry whose "retry" is registered under a DRIFTED (wrong) content-address -> resolve
+        # refuses -> the job-runner must BLOCK with DETECTOR_UNRESOLVED, never run an unverified detector.
+        drifted = DetectorRegistry()
+        drifted.register("retry", lambda: RetryCheck(("python3", "/artifact/main.py")),
+                         content_hash="accepted-addr-that-will-not-match")
+
+        def source(_: GatingEvent, ws: Path) -> ArtifactSpec:
+            # the detector resolves (and fails) before any sandbox runs, so the artifact is never used.
+            return ArtifactSpec(path=ws, tree_hash="sha256:unused")
+
+        job = make_job_runner(source, image=_IMAGE, resolve=drifted.resolve, detector_id="retry")
+        verdict = job(_event())
+        self.assertIs(verdict.status, VerdictType.ERROR)
+        self.assertIs(verdict.reason, Reason.DETECTOR_UNRESOLVED)
+
+
+class CheckRunProvenanceTests(unittest.TestCase):
+    """3.5-close #1.5: the Check Run summary carries the ATTESTED detector_id + image_digest (non-
+    repudiation on the merge-blocking path), sourced from the captured TrialReport — never artifact output."""
+
+    def test_summary_carries_detector_and_image_when_captured(self) -> None:
+        from engine.runner import ExecutionIdentity, TrialReport
+        capture = CapturingTrialReportSink()
+        capture.record(TrialReport(
+            trials=(Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS),), trials_configured=1,
+            short_circuited=False, aggregate=Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS),
+            execution_identity=ExecutionIdentity(backend="ObservedOCISandbox",
+                                                 image_ref="sha256:cafef00d", isolation_level="hermetic"),
+            detector_id="retry"))
+        client = _FakeCheckClient()
+        make_check_updater(client, name=_NAME, report_capture=capture)(
+            _event(), Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS))
+        self.assertIn("detector=retry", client.final_summary or "")
+        self.assertIn("image=sha256:cafef00d", client.final_summary or "")
+
+    def test_summary_omits_provenance_when_uncaptured(self) -> None:
+        client = _FakeCheckClient()
+        make_check_updater(client, name=_NAME)(  # no report_capture
+            _event(), Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS))
+        self.assertNotIn("detector=", client.final_summary or "")
 
 
 class ExtractToSpecTests(unittest.TestCase):
@@ -237,7 +308,7 @@ class RealEngineHandshakeTests(unittest.TestCase):
         def source(_: GatingEvent, ws: Path) -> ArtifactSpec:
             return extract_to_spec(tar, ws)
 
-        job = make_job_runner(source, image=_IMAGE, trials=2)
+        job = make_job_runner(source, image=_IMAGE, resolve=_RESOLVE, detector_id=_DETECTOR_ID, trials=2)
         verdict = job(_event())
         self.assertIs(verdict.status, VerdictType.PASS)
 

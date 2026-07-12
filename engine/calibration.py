@@ -59,6 +59,11 @@ DEFAULT_CALIBRATION_TRIALS = 5
 # engine-side, as a plain Callable so the engine need not import the gate (engine⊥gate preserved).
 DetectorResolver = Callable[[str], RuntimeAssertion]
 
+# 3.5-close #1.6: an INJECTED guard that raises if the RETURNED sandbox is not an audited backend.
+# The engine calls it (dependency inversion) but cannot mint the trusted-backend token — the gate holds
+# ``gate.backends.trusted_backend_guard``; engine ⊥ gate preserved (a plain Callable over core.Sandbox).
+BackendGuard = Callable[[Sandbox], None]
+
 
 class CalibrationConfigError(RuntimeError):
     """The calibration harness is mis-configured (e.g. a non-HERMETIC sandbox). Engine-side (the
@@ -213,7 +218,7 @@ def calibrate(
     budget: ResourceBudget,
     *,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
-    pin_image: Callable[[str], str] | None = None,
+    backend_guard: BackendGuard | None = None,
 ) -> CalibrationResult:
     """Resolve ``detector_id`` through the injected trusted ``resolve`` and run that detector against
     every fixture in ``calibration_set``, returning whether it earns enablement. Two-sided (FR3.1 +
@@ -230,7 +235,20 @@ def calibrate(
     (1a); the detector has NO channel to choose which fixtures it faces — the caller injects the
     set, `calibrate` runs ALL of it (1d). Short-circuit ALWAYS OFF (full distribution). No
     tier-granting (3.3). Reproducible from the pinned detector + pinned fixtures (NFR6)."""
-    _require_hermetic(make_sandbox)
+    # 3.5-close #1.6: if a trusted-backend guard is injected, wrap the factory so EVERY constructed
+    # sandbox (including _require_hermetic's probe and each trial) has its RETURNED object verified to
+    # be an audited backend. Without a guard the engine cannot know "audited" (engine ⊥ gate) — the
+    # gate entry points wire the real guard; a guard-less call is a LOGIC path (documented, tests).
+    factory = make_sandbox
+    if backend_guard is not None:
+        _base = make_sandbox
+
+        def factory() -> Sandbox:
+            sb = _base()
+            backend_guard(sb)
+            return sb
+
+    _require_hermetic(factory)
     if not calibration_set.is_adequate:
         return CalibrationResult(
             passed=False, inadequate=True, fn_failures=(), fp_failures=(), flaky=(),
@@ -243,8 +261,8 @@ def calibrate(
         capture = _TrialReportCapture()
         with _materialised(fixture) as artifact:
             verdict = run_check(
-                make_sandbox, detector, artifact, budget,
-                trials=trials, first_fail=False, report_sink=capture, pin_image=pin_image,
+                factory, detector, artifact, budget,
+                trials=trials, first_fail=False, report_sink=capture, detector_id=detector_id,
             )
         outcomes.append(
             FixtureOutcome(

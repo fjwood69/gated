@@ -14,7 +14,7 @@ from pathlib import Path
 
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import FixtureLabel
-from gate.signing import public_key
+from gate.signing import KeyVerifier, SeedSigner, public_key
 from gate.attestation import verify_measurement
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
@@ -73,7 +73,7 @@ def _run(c: CalibrationStore, det: _ScriptedDetector, *, nonce: str = "n1"):  # 
         policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(),
         detector_id="d", resolve=lambda _id: det,  # detector by NAME through a trusted resolver
         detector_identity="det-1", tier_generation="tier-h", budget=_BUDGET, issuer="cal-gov-1",
-        nonce=nonce, now=100.0, signing_seed=_SEED, trials=3,
+        nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3,
     )
 
 
@@ -81,7 +81,7 @@ class RunnerOutcomeTests(unittest.TestCase):
     def test_clean_two_sided_pass(self) -> None:
         c = _store_with_set()
         att = _run(c, _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3))  # catches b1, passes g1
-        verify_measurement(att, verify_key=_PUB)
+        verify_measurement(att, verifier=KeyVerifier(_PUB))
         self.assertIs(att.outcome, VerdictType.PASS)
         self.assertTrue(att.is_clean_pass)
         self.assertFalse(att.short_circuit)

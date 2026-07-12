@@ -44,6 +44,14 @@ class SandboxLeakError(Exception):
     This is the one sanctioned case of teardown raising."""
 
 
+class ImageResolutionError(Exception):
+    """A backend could not resolve its mutable image tag to an immutable local digest before run
+    (image absent, or GC'd/pruned between resolve and run). 3.5-close #1.1: a FATAL identity error
+    — an unresolvable image is an UNATTESTABLE run, mapped by the engine runner to ``Verdict(ERROR,
+    IMAGE_UNRESOLVED)``, NEVER a silent pass. Core-side (like ``ArtifactHashMismatchError``) so the
+    engine can catch it without importing a backend (engine ⊥ sandbox impl)."""
+
+
 class IsolationLevel(Enum):
     """How strongly a backend isolates the artifact from the host and the check."""
 
@@ -174,6 +182,15 @@ class ExecutionResult:
     sandbox — never a value the artifact could write. A typed, named field, not an
     untyped stats bag (that would be a channel for artifact-influenced data to
     reach the verdict). None when no boundary observer ran."""
+    image_digest: str | None = None
+    """The IMMUTABLE image identity the trial ACTUALLY ran on (3.5-close #1.1). An OCI
+    backend resolves the local image to its content digest (``<runtime> inspect .Id`` ->
+    ``sha256:...``) BEFORE container start and executes THAT digest — never the mutable tag
+    — so the attested execution binds the bytes that ran, closing the tag-TOCTOU. This is an
+    ANTI-DRIFT / identity coordinate (which bytes), NOT runtime-behaviour assurance: a
+    compromised host could verify the digest and then run something else (the unattested-TCB
+    ceiling; see ARCHITECTURE.md). Measured host-side by the trusted sandbox object, never
+    self-reported by the artifact. None for backends with no image (NoOp/Subprocess)."""
 
 
 @runtime_checkable

@@ -33,6 +33,12 @@ from .checkrun import (
     upsert_check_run,
     verdict_to_conclusion,
 )
+from .backends import (
+    UntrustedBackendError,
+    approved_backends,
+    trusted_backend_guard,
+    trusted_sandbox_factory,
+)
 from .dedup import DeliveryLog, InMemoryDeliveryLog
 from .detector_registry import (
     DetectorIntegrityError,
@@ -42,6 +48,7 @@ from .detector_registry import (
     RegistrableDetector,
     RegistrationError,
     UnregisteredDetectorError,
+    content_address,
     registration_binding,
 )
 from .executor import (
@@ -67,7 +74,10 @@ from .github_auth import (
 )
 from .pipeline import (
     ArtifactSource,
+    CapturingTrialReportSink,
     assert_budget_fits_watchdog,
+    assert_detector_registered,
+    default_detector_registry,
     extract_to_spec,
     make_check_updater,
     make_job_runner,
@@ -152,8 +162,11 @@ __all__ = [
     "NullLifecycleSink",
     "ERROR_VERDICT",
     "run_engine_check",
+    "default_detector_registry",
+    "assert_detector_registered",
     "make_job_runner",
     "make_check_updater",
+    "CapturingTrialReportSink",
     "extract_to_spec",
     "assert_budget_fits_watchdog",
     "ArtifactSource",
@@ -168,5 +181,10 @@ __all__ = [
     "UnregisteredDetectorError",
     "DetectorIntegrityError",
     "RegistrationError",
+    "content_address",
     "registration_binding",
+    "UntrustedBackendError",
+    "trusted_sandbox_factory",
+    "trusted_backend_guard",
+    "approved_backends",
 ]

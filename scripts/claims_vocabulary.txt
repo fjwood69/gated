@@ -1,0 +1,22 @@
+# 3.5-close #1.7 — banned overclaim vocabulary (scoped, NARROW phrases only).
+# One phrase per line, case-insensitive substring match against Python STRING LITERALS (docstrings +
+# constants; comments are exempt) and the designated Markdown docs. Deliberately NOT common single
+# words ("verified" / "only" / "pinned") — those are legitimate almost everywhere; banning them would
+# force a huge suppressions file (the theatre this guard avoids). Only unambiguous absolute-safety /
+# execution-assurance / guarantee / un-bypassable / fully-bound claims belong here.
+every confound closed
+all confounds closed
+execution-assured
+execution assurance
+runtime-behaviour assured
+proven safe
+proven secure
+cryptographically unassailable
+un-bypassable
+unbypassable
+cannot be bypassed
+absolutely safe
+guarantees execution
+guaranteed safe
+fully-bound
+genuinely blind

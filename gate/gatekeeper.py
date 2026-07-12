@@ -36,6 +36,7 @@ from core import ResourceBudget, Sandbox
 from core.calibration import CalibrationSet
 from core.chain import content_digest
 from engine.calibration import (
+    BackendGuard,
     CalibrationResult,
     DEFAULT_CALIBRATION_TRIALS,
     DetectorResolver,
@@ -251,6 +252,7 @@ def run_calibration(
     approval: GovernanceApproval,
     set_id: str = "default",
     trials: int = DEFAULT_CALIBRATION_TRIALS,
+    backend_guard: BackendGuard | None = None,
 ) -> CalibrationOutcome:
     """Run the 3.2 BATCH calibrator (shadow-first — full fixture distribution, zero live-PR cost)
     against the out-of-band CalibrationSet, and record the state move. Records PENDING->CALIBRATING;
@@ -263,7 +265,8 @@ def run_calibration(
         pinned_set_version=calibration_chain_head,
     )
     # detector by NAME, resolved only through the trusted registry (never a caller-supplied object).
-    result = calibrate(make_sandbox, detector_id, resolve, calibration_set, budget, trials=trials)
+    result = calibrate(make_sandbox, detector_id, resolve, calibration_set, budget,
+                       trials=trials, backend_guard=backend_guard)
     breaking = (*result.fn_failures, *result.fp_failures, *result.flaky, *result.harness_errors)
     ref: str | None = None
     if result.passed:

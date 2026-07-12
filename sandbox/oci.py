@@ -49,6 +49,7 @@ from core import (
     Command,
     ExecutionResult,
     Fixtures,
+    ImageResolutionError,
     IsolationLevel,
     ResourceBudget,
     Sandbox,
@@ -71,12 +72,35 @@ class OCIRuntimeUnavailable(Exception):
     fail closed (no silent WEAK fallback outside explicit dev mode)."""
 
 
+def resolve_image_id(runtime: str, image: str) -> str:
+    """Resolve ``image`` (a possibly-mutable tag) to its IMMUTABLE local content id
+    (``<rt> inspect --format {{.Id}}`` -> ``sha256:...``) so the caller can execute the DIGEST,
+    not the tag (3.5-close #1.1 — closes the tag-remap TOCTOU). The FULL digest is returned (never
+    a short prefix — a short prefix reopens id ambiguity). Raises ``ImageResolutionError`` if the
+    image is absent or the runtime can't report an id."""
+    try:
+        out = subprocess.run(
+            [runtime, "image", "inspect", "--format", "{{.Id}}", image],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ImageResolutionError(f"could not inspect image {image!r}: {exc}") from exc
+    digest = out.stdout.strip()
+    if out.returncode != 0 or not digest:
+        raise ImageResolutionError(
+            f"image {image!r} has no resolvable local id (absent or GC'd before run): "
+            f"{out.stderr.strip() or 'no id'}"
+        )
+    return digest if digest.startswith("sha256:") else f"sha256:{digest}"
+
+
 @dataclass(frozen=True)
 class OCIHandle:
     id: str
     artifact_hash: str
     snapshot: Path   # host-side immutable snapshot (mounted read-only)
     container: str   # unique container name (teardown / reaper target)
+    image_id: str    # 3.5-close #1.1: the IMMUTABLE digest resolved at prepare(); run() executes THIS
 
 
 def _selinux_enforcing() -> bool:
@@ -150,6 +174,9 @@ class OCISandbox(BaseSandbox):
 
     # -- prepare: snapshot -> hash -> verify (TOCTOU-closed) --------------
     def prepare(self, artifact: ArtifactSpec, fixtures: Fixtures) -> SandboxHandle:
+        # 3.5-close #1.1: resolve the IMMUTABLE image digest at the TOP of prepare(), ONCE, before
+        # anything runs — run() then executes THIS digest, not the mutable tag (closes tag-remap).
+        image_id = resolve_image_id(self._runtime, self.image)
         snapshot = Path(tempfile.mkdtemp(prefix="moriverify-oci-"))
         try:
             if artifact.path.is_dir():
@@ -170,6 +197,7 @@ class OCISandbox(BaseSandbox):
             artifact_hash=artifact.tree_hash,
             snapshot=snapshot,
             container=f"moriverify-{uuid.uuid4().hex[:16]}",
+            image_id=image_id,
         )
 
     # -- run: hermetic container, our wall-clock timeout ------------------
@@ -192,7 +220,9 @@ class OCISandbox(BaseSandbox):
             "--mount", mount,          # verified artifact, read-only, private
             "--tmpfs", WORK_DIR,       # writable scratch (audit-only)
             "--workdir", WORK_DIR,
-            self.image, *entrypoint.argv,
+            # 3.5-close #1.1: execute the IMMUTABLE digest resolved in prepare() (single source of
+            # truth — the SAME h.image_id is recorded in the result), NEVER the mutable self.image tag.
+            h.image_id, *entrypoint.argv,
         ]
         # Sterile env: Popen(env=...) with a minimal dict — the container never
         # inherits the host runner's environment. podman itself needs a PATH.
@@ -280,6 +310,8 @@ class OCISandbox(BaseSandbox):
             isolation_level=self.isolation_level,
             artifact_hash=handle.artifact_hash,
             raw_return_code=raw,
+            # single source of truth: the SAME digest that was interpolated into the run argv.
+            image_digest=handle.image_id,
         )
 
     @staticmethod

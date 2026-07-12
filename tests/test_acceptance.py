@@ -17,7 +17,7 @@ from pathlib import Path
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from core.chain import content_digest
-from gate.signing import public_key
+from gate.signing import KeyVerifier, SeedSigner, public_key
 from core.identity import DetectorManifest, identity_for
 from gate.acceptance import (
     AcceptanceError,
@@ -27,7 +27,7 @@ from gate.acceptance import (
     verify_report,
 )
 from gate.authority import AuthorityDomain, GovernanceApproval
-from gate.detector_registry import DetectorRegistry
+from gate.detector_registry import DetectorRegistry, content_address
 from sandbox.noop import NoOpSandbox
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
@@ -68,7 +68,7 @@ def _registry(**detectors: object) -> DetectorRegistry:
     grades the SAME build). Exercises the real resolver the entry point calls."""
     reg = DetectorRegistry()
     for did, det in detectors.items():
-        reg.register(did, (lambda d=det: d), content_hash=det.content_id)  # type: ignore[attr-defined]
+        reg.register(did, (lambda d=det: d), content_hash=content_address(det))
     return reg
 
 
@@ -105,7 +105,7 @@ def _run(store: BlindHoldoutStore, *, honest, fn, fp, signer=None, make_sandbox=
         fn_deficient_detector_id="fn", fp_happy_detector_id="fp", resolve=resolve,
         detector_manifest=_MANIFEST, host_closure_digest=_HOST_CLOSURE,
         visible_set=_VISIBLE, blind_holdout_store=store, holdout_key=_HOLDOUT_KEY,
-        signer_seed=_SIGNER_SEED, signer_principal="cal-gov-1",
+        signer=SeedSigner(_SIGNER_SEED), signer_principal="cal-gov-1",
         signer_approval=signer or _cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3)
 
 
@@ -144,8 +144,8 @@ class AcceptanceAnchorTests(unittest.TestCase):
         # in-process blindness holds only for registry-resolved, not author-supplied, detectors).
         self.assertNotEqual(report.visible_corpus_digest, report.holdout_corpus_digest)
         self.assertTrue(report.sandbox_config_hash)            # computed from the real sandbox
-        self.assertTrue(verify_report(report, verify_key=_SIGNER_PUB))
-        self.assertFalse(verify_report(report, verify_key=public_key(bytes(range(2, 34)))))
+        self.assertTrue(verify_report(report, verifier=KeyVerifier(_SIGNER_PUB)))
+        self.assertFalse(verify_report(report, verifier=KeyVerifier(public_key(bytes(range(2, 34))))))
 
     def test_report_leaks_no_fixture_ids_or_content(self) -> None:
         store = _holdout()
@@ -198,12 +198,19 @@ class AcceptanceAnchorTests(unittest.TestCase):
         # board #3 (tightened): the receipt's environment is DERIVED from the lanes that actually ran.
         # A sandbox that drifts identity across trials leaves every lane unattestable -> the anchor
         # refuses to sign, rather than binding a probed-but-unrun environment.
+        from dataclasses import replace
         store = _holdout()
         n = {"i": 0}
 
-        def drift() -> _HermeticNoOp:
-            sb = _HermeticNoOp()
-            sb.image = f"img-{n['i']}"  # type: ignore[attr-defined]
+        class _DriftNoOp(_HermeticNoOp):
+            def __init__(self, digest: str) -> None:
+                self._digest = digest
+
+            def run(self, handle, entrypoint, budget):  # type: ignore[no-untyped-def]
+                return replace(super().run(handle, entrypoint, budget), image_digest=self._digest)
+
+        def drift() -> _DriftNoOp:
+            sb = _DriftNoOp(f"sha256:img-{n['i']}")
             n["i"] += 1
             return sb
 
@@ -296,7 +303,7 @@ class OperationalSeparationTests(unittest.TestCase):
         import inspect
         from gate.acceptance import run_acceptance_anchor
         params = inspect.signature(run_acceptance_anchor).parameters
-        for k in ("holdout_key", "signer_seed"):
+        for k in ("holdout_key", "signer"):
             self.assertIs(params[k].default, inspect.Parameter.empty)
 
 

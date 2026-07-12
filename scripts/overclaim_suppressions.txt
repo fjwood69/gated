@@ -1,0 +1,5 @@
+# 3.5-close #1.7 — REVIEWED overclaim suppressions. Format: <relpath>\t<phrase>\t<justification>.
+# Each line is a legitimate use (a NEGATED disclaimer or a qualifying meta-statement) of a banned
+# phrase. A GROWING list is a smell (fix the vocabulary or the claim). Reviewed at 3.5-close.
+gate/acceptance.py	proven safe	NEGATED honest disclaimer: a PASS resists the current corpus, never "proven safe".
+ARCHITECTURE.md	proven secure	NEGATED honest disclaimer: proven through the deployed path, NOT proven secure in every deployment.

@@ -28,6 +28,7 @@ detector: a known-bad (attempted exfil) the isolation must catch.
 """
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import tempfile
 import time
@@ -49,10 +50,16 @@ from core import (
     SandboxLeakError,
     tree_hash,
 )
+from core.chain import content_digest
 import shutil
 
 from sandbox.base import BaseSandbox
-from sandbox.oci import OCIRuntimeUnavailable, _make_snapshot_readable, _selinux_enforcing
+from sandbox.oci import (
+    OCIRuntimeUnavailable,
+    _make_snapshot_readable,
+    _selinux_enforcing,
+    resolve_image_id,
+)
 from sandbox.subprocess import _rmtree_resilient
 
 _Outcome = Literal["completed", "timeout", "error"]
@@ -87,6 +94,20 @@ sys.exit(0 if not leaks else ("LEAK:" + ",".join(leaks)))
 
 _PREFIX = "moriverify-"
 
+# 3.5-close #1.1 (board amendment 4): the container IMAGE digest does NOT cover the host-mounted
+# observer — ``_PROXY_SRC`` is bind-mounted into the proxy as ``/proxy.py``, and the sealed-network
+# flags + escape-probe script are host-side config. Bind those into an ``observer_config_hash`` so
+# OBSERVER DRIFT (a changed proxy, a loosened network, a weakened probe) is visible in the attested
+# execution identity even when the image digest is unchanged. Computed once from the on-disk observer.
+_SEALED_NETWORK_FLAGS = ("--internal", "--disable-dns")
+_OBSERVER_CONFIG_HASH = content_digest({
+    "proxy_src_sha256": hashlib.sha256(_PROXY_SRC.read_bytes()).hexdigest(),
+    "escape_probe_sha256": hashlib.sha256(_ESCAPE_SCRIPT.encode("utf-8")).hexdigest(),
+    "sealed_network_flags": list(_SEALED_NETWORK_FLAGS),
+    "proxy_port": PROXY_PORT,
+    "proxy_host": PROXY_HOST,
+})
+
 
 def reap_orphans(runtime: str = "podman") -> None:
     """Startup reaper (GLM mandate): force-remove any orphaned gated containers
@@ -119,12 +140,16 @@ class ObservedHandle:
     proxy: str       # proxy sidecar container name
     proxy_ip: str
     baseline: int    # proxy count after the escape probe (subtracted from the final)
+    image_id: str    # 3.5-close #1.1: the immutable digest resolved once at prepare()
 
 
 class ObservedOCISandbox(BaseSandbox):
     """HERMETIC isolation + out-of-process boundary observation of egress attempts."""
 
     isolation_level: IsolationLevel = IsolationLevel.HERMETIC
+    # 3.5-close #1.1: bound into the attested execution identity so observer drift (proxy source,
+    # sealed-network flags, escape-probe) is visible even when the container image digest is unchanged.
+    observer_config_hash: str = _OBSERVER_CONFIG_HASH
 
     def __init__(self, image: str, runtime: str | None = None) -> None:
         self.image = image
@@ -160,6 +185,10 @@ class ObservedOCISandbox(BaseSandbox):
 
     # -- prepare: snapshot+verify, then stand up the SEALED observed network -----
     def prepare(self, artifact: ArtifactSpec, fixtures: Fixtures) -> SandboxHandle:
+        # 3.5-close #1.1: resolve the IMMUTABLE image digest ONCE at the TOP of prepare(); the
+        # artifact, proxy and escape-probe containers ALL execute this same digest (one consistent
+        # snapshot — no swap between resolving the proxy and running the artifact).
+        image_id = resolve_image_id(self._runtime, self.image)
         snapshot = Path(tempfile.mkdtemp(prefix="moriverify-obs-"))
         rid = uuid.uuid4().hex[:16]
         network = f"moriverify-net-{rid}"
@@ -176,13 +205,13 @@ class ObservedOCISandbox(BaseSandbox):
             fault_mode = (fixtures.boundary_fault.mode.value
                           if fixtures.boundary_fault is not None else "fail_always")
             self._create_network(network)
-            proxy_ip = self._start_proxy(network, proxy, fault_mode)
-            self._escape_probe(network, proxy_ip)  # raises NetworkIsolationError on leak
+            proxy_ip = self._start_proxy(network, proxy, fault_mode, image_id)
+            self._escape_probe(network, proxy_ip, image_id)  # raises NetworkIsolationError on leak
             # The escape probe's reachability hit consumed the fail-once state and
             # bumped the counter; restart the proxy so the artifact faces a FRESH
             # observer (count 0, the first failure intact). Seal already validated.
             self._force_remove(proxy)
-            proxy_ip = self._start_proxy(network, proxy, fault_mode)
+            proxy_ip = self._start_proxy(network, proxy, fault_mode, image_id)
             baseline = 0
         except BaseException:
             self._teardown_infra(network, proxy)
@@ -191,7 +220,7 @@ class ObservedOCISandbox(BaseSandbox):
         return ObservedHandle(
             id=uuid.uuid4().hex, artifact_hash=artifact.tree_hash, snapshot=snapshot,
             container=f"moriverify-sbx-{rid}", network=network, proxy=proxy,
-            proxy_ip=proxy_ip, baseline=baseline,
+            proxy_ip=proxy_ip, baseline=baseline, image_id=image_id,
         )
 
     # -- run: hermetic container on the sealed net; read the count from OUTSIDE ---
@@ -207,7 +236,8 @@ class ObservedOCISandbox(BaseSandbox):
             self._runtime, "run", "--rm", "--init", "--name", h.container,
             "--network", h.network, "--add-host", f"{PROXY_HOST}:{h.proxy_ip}",
             "--mount", mount, "--tmpfs", WORK_DIR, "--workdir", WORK_DIR,
-            self.image, *entrypoint.argv,
+            # 3.5-close #1.1: run the immutable digest resolved in prepare() (recorded in the result).
+            h.image_id, *entrypoint.argv,
         ]
         try:
             proc = subprocess.Popen(
@@ -248,11 +278,11 @@ class ObservedOCISandbox(BaseSandbox):
         subprocess.run([self._runtime, "network", "create", "--internal",
                         "--disable-dns", name], capture_output=True, timeout=30, check=True)
 
-    def _start_proxy(self, network: str, name: str, mode: str) -> str:
+    def _start_proxy(self, network: str, name: str, mode: str, image_id: str) -> str:
         subprocess.run(
             [self._runtime, "run", "-d", "--network", network, "--name", name,
              "--mount", f"type=bind,source={_PROXY_SRC},target=/proxy.py,readonly",
-             self.image, "python3", "/proxy.py", str(PROXY_PORT), _COUNTFILE, mode],
+             image_id, "python3", "/proxy.py", str(PROXY_PORT), _COUNTFILE, mode],
             capture_output=True, timeout=60, check=True,
         )
         ip = subprocess.run(
@@ -269,10 +299,10 @@ class ObservedOCISandbox(BaseSandbox):
             time.sleep(0.1)
         return ip
 
-    def _escape_probe(self, network: str, proxy_ip: str) -> None:
+    def _escape_probe(self, network: str, proxy_ip: str, image_id: str) -> None:
         p = subprocess.run(
             [self._runtime, "run", "-i", "--rm", "--network", network,
-             "--add-host", f"{PROXY_HOST}:{proxy_ip}", self.image, "python3", "-"],
+             "--add-host", f"{PROXY_HOST}:{proxy_ip}", image_id, "python3", "-"],
             input=_ESCAPE_SCRIPT.encode(), capture_output=True, timeout=60,
         )
         if p.returncode != 0:
@@ -340,6 +370,7 @@ class ObservedOCISandbox(BaseSandbox):
         return ExecutionResult(
             outcome=outcome, exit_code=exit_code, isolation_level=self.isolation_level,
             artifact_hash=handle.artifact_hash, raw_return_code=raw, egress_attempts=egress,
+            image_digest=handle.image_id,  # single source of truth: the digest run() executed
         )
 
     @staticmethod

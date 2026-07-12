@@ -14,7 +14,7 @@ from pathlib import Path
 
 from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verdict, VerdictType
 from core.calibration import FixtureLabel
-from gate.signing import public_key
+from gate.signing import SeedSigner, public_key
 from gate.attestation_store import MeasurementAttestationStore
 from gate.authority import GovernanceApproval
 from gate.calibration_store import CalibrationStore, ChangeOp
@@ -170,7 +170,7 @@ class FullLoopTests(unittest.TestCase):
             policy_id="p1", set_id="X", calibration_store=c,
             make_sandbox=lambda: _HermeticNoOp(), detector_id="d", resolve=lambda _id: det,
             detector_identity=_DET, tier_generation="tg", budget=_BUDGET, issuer=_ISSUER,
-            nonce="n1", now=100.0, signing_seed=_SEED, trials=3)
+            nonce="n1", now=100.0, signer=SeedSigner(_SEED), trials=3)
 
     def test_proactive_trigger_to_restore_end_to_end(self) -> None:
         c = _cal()

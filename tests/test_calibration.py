@@ -184,13 +184,20 @@ class ExecutionIdentityTests(unittest.TestCase):
         self.assertEqual(r.execution_identity.image_ref, "<_HermeticNoOp>")  # type: ignore[union-attr]
 
     def test_mixed_identity_across_fixtures_refuses_fail_closed(self) -> None:
-        # a factory whose sandbox image DRIFTS every construction -> each fixture's run is itself mixed
-        # -> the calibration is unattestable -> passed False + identity None + report says so.
+        # a factory whose sandbox RECORDS a drifting image digest every construction -> each fixture's
+        # run is itself mixed -> the calibration is unattestable -> passed False + identity None.
+        from dataclasses import replace
         n = {"i": 0}
 
-        def drift() -> _HermeticNoOp:
-            sb = _HermeticNoOp()
-            sb.image = f"img-{n['i']}"  # type: ignore[attr-defined]
+        class _DriftNoOp(_HermeticNoOp):
+            def __init__(self, digest: str) -> None:
+                self._digest = digest
+
+            def run(self, handle, entrypoint, budget):  # type: ignore[no-untyped-def]
+                return replace(super().run(handle, entrypoint, budget), image_digest=self._digest)
+
+        def drift() -> _DriftNoOp:
+            sb = _DriftNoOp(f"sha256:img-{n['i']}")
             n["i"] += 1
             return sb
 
