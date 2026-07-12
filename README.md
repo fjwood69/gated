@@ -64,7 +64,9 @@ record.
 ## Quickstart
 
 ```bash
-# Run the test suite (stdlib only — zero third-party dependencies).
+# One vetted security dependency: PyNaCl (libsodium Ed25519 — one does not roll one's own crypto).
+pip install "pynacl==1.5.0"
+# Run the test suite.
 python -m unittest discover -s tests -v
 ```
 
@@ -77,7 +79,8 @@ documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Design & rigour
 
-- **Zero third-party runtime dependencies** — the core is stdlib-only and self-contained.
+- **One vetted security dependency** — the core is otherwise stdlib-only; the single exception is
+  **PyNaCl** (libsodium Ed25519) on the signing path, because one does not roll one's own crypto.
 - **`mypy --strict`** across every package, `ruff`-clean.
 - **`ARCHITECTURE.md`** — the layered design, trust boundaries, and the open-core boundary.
 - **`COMPLETENESS.md`** — the seven-prompt completeness gate every increment passes before it
@@ -85,12 +88,21 @@ documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Status
 
-Reference implementation. The boundary-observation mechanism is verified end-to-end on real
-podman, and the gate has **blocked real merges on real GitHub** — including a **pull request
-from a fork** (untrusted cross-repo code): the gate fetches the fork's code by its immutable
-commit SHA, runs it under observation, and blocks the merge on a violation. It also records
-an **admin override** of a failing gate in a tamper-evident audit ledger. Calibration mode
-(baseline gathering across full trial distributions) is on the roadmap.
+**Reference implementation — in-process mechanism, not security-complete.** The
+boundary-observation mechanism is verified end-to-end on real podman, and the gate has **blocked
+real merges on real GitHub** — including a **pull request from a fork** (untrusted cross-repo code):
+the gate fetches the fork's code by its immutable commit SHA, runs it under observation, and blocks
+the merge on a violation. It also records an **admin override** of a failing gate in a tamper-evident
+audit ledger.
+
+**Calibration mode** — the two-sided calibrator (a detector must catch every known-bad *and* pass
+every known-good), a blind-holdout acceptance anchor, and separated measurement/governance
+authorities — is **built and exercised on real podman**. It is a *reference*: as [`ARCHITECTURE.md`](ARCHITECTURE.md)
+sets out, its blindness holds only under the **trusted-detector model** (the verdict side-channel
+makes in-process blindness against author-supplied detectors impossible), signing is a seam for a
+**KMS/HSM**, and the stores are in-memory references for an external content-addressed one. Read
+"proven" as *proven through the path this repo runs* — **merge-ready ≠ security-complete ≠
+live-proven**. It is **not production-integrated and not upgrade-safe**.
 
 ## Licence
 

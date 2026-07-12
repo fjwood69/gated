@@ -4,6 +4,27 @@ The enforcement engine for the Promotion-Boundary Governance Framework
 ([moriapp.dev/pbgf](https://moriapp.dev/pbgf)). Everything in this tree is the
 **open Apache core**.
 
+> ## Scope — a reference implementation, not a finished product
+>
+> This tree proves the **mechanism** of a runtime promotion gate: a hermetic sandbox +
+> host-side out-of-band boundary observation + a calibration/acceptance spine with
+> separated authorities. The mechanism is exercised end-to-end on **real podman and real
+> GitHub**, and that is exactly what "proven" means here — *proven through the deployed
+> path this repo runs*, not *proven secure in every deployment*.
+>
+> It is an **in-process reference implementation and is NOT security-complete.** Several
+> controls are structural seams a real deployment must harden, not finished guarantees:
+> signing is a `Signer`/`Verifier` seam that must be backed by a **KMS/HSM** (the in-process
+> seed is reference-only); the calibration **verdict side-channel** is only closed by running
+> each detector in its **own container with aggregate-only output** (see the trusted-detector
+> invariant below); the detector/artifact/holdout stores are in-memory references for an
+> external **content-addressed, signed** store. It is **not production-integrated and not
+> upgrade-safe** — schemas and APIs may change with no migration path.
+>
+> Three distinct bars, kept separate throughout: **merge-ready ≠ security-complete ≠
+> live-proven.** The security engineering rules near the end of this document say which
+> claims are which.
+
 ## Layers
 
 | Layer | Role | Lands |
@@ -85,12 +106,74 @@ convincingly-instrumented bypass: a self-grading detector that promotes itself o
 measurement it authored. It is a standing rule across every calibration-mode increment
 (3.5, 2026-07), not a local note.
 
+## The load-bearing invariant — the detector that judges must be trusted, not caller-supplied
+
+**A calibration / acceptance entry point takes a detector by NAME plus an injected trusted
+resolver — NEVER a detector object, lambda, or path.** The four entry points (`calibrate`,
+`run_acceptance_anchor`, `run_recalibration`, `run_calibration`) accept a `detector_id` and a
+`DetectorResolver`; the only thing that turns a name into runnable code is a trusted,
+content-addressed **`DetectorRegistry`** (`gate/detector_registry.py`) that refuses unregistered
+ids, refuses a built detector whose declared `content_id` ≠ its (optionally Ed25519-signed)
+registration, and hands back trusted code. The gate holds the registry; the engine takes only a
+`Callable[[str], RuntimeAssertion]`, so `engine ⊥ gate` is preserved.
+
+**Why a name and not an object — the verdict side-channel (a fundamental in-process limit).** The
+blind holdout is encrypted at rest, which hides its *content*. But an **author-controlled detector
+needs no content**: it can encode holdout membership in the cross-fixture PASS/FAIL pattern it emits
+— roughly **one bit per fixture**. So in-process blindness against a detector the author supplies is
+*impossible*, no matter how well the holdout is encrypted. Everywhere this repo says "genuinely
+blind" it means **blind under the trusted-detector model** — blind because the graded detector is the
+maintainer's registered code, not the (untrusted) author's.
+
+**Trusted-detector boundary (name the TCB).** *Untrusted:* the policy author and the calibration
+caller — they may want a detector that games the holdout. *Trusted (the TCB):* the detector
+maintainer who registers content-addressed, signed detector code, and the gate host that holds the
+registry and the holdout key. Author-controlled code sharing a host process with a decrypted holdout
+is **not** isolated from it — stating the boundary precisely is the point.
+
+**Deploy target (what closes the residual channel).** The in-process registry proves the *structure*
+— named + trusted-only + verified-on-resolve + no caller code. A deployment closes the residual ~1
+bit/fixture side-channel and hardens the seam by running **each detector in its own container**, with
+**authenticated IPC**, **no network**, **read-only inputs**, **strict resource limits**, and — the
+key move — **aggregate-only output** (the harness returns only the final tallies, so the per-fixture
+PASS/FAIL pattern never travels back to the author). The registry itself is backed by an **external,
+content-addressed, signed artifact store** (e.g. signed OCI images), and signing by a **KMS/HSM**.
+None of these are TEE/MPC-grade requirements — they are ordinary container hygiene the reference
+deliberately defers. (3.5 #4 / Option B, 2026-07.)
+
 ## The rule to hold — Apache-core purity
 
 Everything in `core/`, `sandbox/`, `engine/`, `observe/`, `cli/` is the open
 Apache core: **no proprietary dependencies — no external gateway, broker, or memory
 service.** If a file needs those, it is private authoring tooling and belongs in a
 separate location, not this tree. This is the open-core / extraction boundary.
+
+## Security engineering rules (durable — apply to every increment)
+
+These are standing rules for any security-relevant change, learned the hard way on the 3.5 review.
+They decide which "proven" claims are real.
+
+1. **No custom cryptography on a security path.** Don't hand-roll — or even "repair" — a crypto
+   primitive for security use; a canonical-looking check still carries side-channel and
+   implementation-review risk. Use a vetted library (PyNaCl / `cryptography`) or a KMS/HSM. A
+   pure-stdlib primitive is educational/test code at most, explicitly labelled non-production, on **no**
+   security path. (An earlier pure-Python Ed25519 here accepted malleable `S+L` signatures and ran in
+   variable time — wrong by construction; it was deleted, replaced by PyNaCl behind a `Signer` seam.)
+2. **No Python type or "capability" object is an authorization boundary.** `isinstance(x, Capability)`
+   is forgeable by anyone who can call `Capability()` — it enforces a *convention* (optionally
+   CI-checked within one tree), not authority. Real authority is an authenticated service / DB boundary
+   the caller cannot mint by constructing an object. Don't sell a sole-constructor class as *security*.
+3. **Trace the actual execution before claiming a property is closed.** Attest from what really ran, not
+   a proxy. A single `make_sandbox()` probe does not describe the sandboxes each trial executed in —
+   derive execution identity from *every* real trial (image digest, backend, observer/config, isolation)
+   and fail-closed if they differ. "Derived from execution" must mean *each* execution. (3.5 #3.)
+4. **Every security property names its adversary AND its trusted process.** "Blind holdout" is
+   meaningless without "blind against whom, and what runs trusted." State it precisely — e.g. *policy
+   authors cannot read the holdout; the detector maintainer and the gate host can; blindness against
+   author-controlled detector code requires process isolation* (the trusted-detector invariant above).
+5. **"Proven" requires exercising the deployed call path.** A subsystem whose security logic the live app
+   never invokes is *mechanism-proven*, not proven. Keep the three bars distinct — **merge-ready ≠
+   security-complete ≠ live-proven** — and label reference-only mechanisms as such.
 
 ## Status
 
