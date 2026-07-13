@@ -90,7 +90,7 @@ def run_recalibration(
     now: float,
     signer: Signer,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
-    backend_guard: BackendGuard | None = None,
+    backend_guard: BackendGuard,
 ) -> MeasurementAttestation:
     """Seal the set (snapshot-isolated), run the batch calibrator against the frozen fixtures, and
     return a SIGNED measurement. Emits — never enforces.

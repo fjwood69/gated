@@ -22,6 +22,7 @@ from gate.calibration_store import AdmissionCapability
 from gate.detector_registry import DetectorRegistry, UnregisteredDetectorError, profile_of
 from gate.recalibration import deterministic_job_id, run_recalibration
 from sandbox.noop import NoOpSandbox
+from tests._backend_optout import allow_any_backend
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
 _SEED = bytes(range(32))
@@ -80,7 +81,7 @@ def _run(c: CalibrationStore, det: _ScriptedDetector, *, nonce: str = "n1",  # t
         policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(),
         detector_id="d", resolve=resolve or reg.resolve_bundle,
         requested_subject_identity=requested, tier_generation="tier-h", budget=_BUDGET, issuer="cal-gov-1",
-        nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3,
+        nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3, backend_guard=allow_any_backend
     )
 
 

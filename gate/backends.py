@@ -24,7 +24,7 @@ against a compromised gate.
 """
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Protocol
 
 from core import Sandbox
 from sandbox.oci import OCISandbox
@@ -95,9 +95,65 @@ def trusted_backend_guard(sandbox: Sandbox) -> None:
         )
 
 
+class BackendGuardPolicy(Protocol):
+    """Gate-side CONTRACT (B3 / D4): a NAMED, versioned guard policy. ``policy_id`` identifies it (name +
+    version); CALLING it applies the guard to a sandbox and RAISES on rejection — it never returns a bool
+    (an ignored return value would be a fail-open). It is structurally a ``BackendGuard``
+    (``Callable[[Sandbox], None]``), so the engine consumes ``__call__`` as a plain callable and never
+    learns this gate type (engine ⊥ gate). S2 establishes the contract + the injection point ONLY — the
+    ``policy_id`` is NOT written into any signed receipt / pass / snapshot yet; that authoritative binding
+    is deferred to S3's coordinated identity-plane bump (plumbing only, not yet attested)."""
+
+    policy_id: str
+
+    def __call__(self, sandbox: Sandbox) -> None: ...
+
+
+class _TrustedBackendGuardPolicy:
+    """The one approved guard policy in the reference: it applies ``trusted_backend_guard`` (the audited-
+    backend token check). ``policy_id`` names + versions it for the composition root + diagnostics only."""
+
+    __slots__ = ()
+    policy_id = "trusted-backend:v1"
+
+    def __call__(self, sandbox: Sandbox) -> None:
+        trusted_backend_guard(sandbox)
+
+
+# The CLOSED guard-policy registry — DISTINCT from the ``_APPROVED`` BACKEND registry (a backend is a
+# sandbox CONSTRUCTOR; a guard policy is a check applied to the constructed object). Not conflated: adding
+# either is a reviewed, security-relevant change to its own registry.
+_APPROVED_GUARD_POLICIES: dict[str, BackendGuardPolicy] = {
+    "trusted-backend": _TrustedBackendGuardPolicy(),
+}
+
+
+def approved_guard_policies() -> tuple[str, ...]:
+    return tuple(sorted(_APPROVED_GUARD_POLICIES))
+
+
+def guarded_backend(
+    backend_kind: str, image: str, *, guard_policy: str = "trusted-backend",
+) -> tuple[Callable[[], Sandbox], BackendGuardPolicy]:
+    """Production composition root (B3 / D3): select an approved BACKEND kind AND an approved GUARD POLICY
+    from the two DISTINCT closed registries, returning the guarded factory + the guard the entry points
+    now REQUIRE (no ``None`` default). An unknown backend kind or guard policy is refused — no arbitrary
+    factory, no arbitrary guard."""
+    if guard_policy not in _APPROVED_GUARD_POLICIES:
+        raise UntrustedBackendError(
+            f"guard policy {guard_policy!r} is not an approved guard policy "
+            f"{list(approved_guard_policies())}"
+        )
+    make = trusted_sandbox_factory(backend_kind, image)  # refuses an unapproved backend kind
+    return make, _APPROVED_GUARD_POLICIES[guard_policy]
+
+
 __all__ = [
     "UntrustedBackendError",
     "trusted_sandbox_factory",
     "trusted_backend_guard",
     "approved_backends",
+    "BackendGuardPolicy",
+    "approved_guard_policies",
+    "guarded_backend",
 ]

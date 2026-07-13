@@ -29,6 +29,7 @@ from engine.calibration import (
     calibrate,
 )
 from sandbox.noop import NoOpSandbox
+from tests._backend_optout import allow_any_backend
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
 _TRIALS = 3
@@ -98,7 +99,7 @@ def _cal(known_bad, known_good, per_fixture, factory=None, trials=_TRIALS):  # t
     flat = [v for lst in per_fixture for v in lst]
     cset = CalibrationSet(known_good=tuple(known_good), known_bad=tuple(known_bad))
     return calibrate(factory or _hermetic_factory(), _DID, _res(_ScriptedDetector(flat)),
-                     cset, _BUDGET, trials=trials)
+                     cset, _BUDGET, trials=trials, backend_guard=allow_any_backend)
 
 
 class TwoSidedCalibratorTests(unittest.TestCase):
@@ -144,7 +145,8 @@ class AdequacyGuardTests(unittest.TestCase):
     def test_empty_known_bad_refused_vacuously(self) -> None:
         g1 = _fx(FixtureLabel.KNOWN_GOOD, "g1")
         r = calibrate(_hermetic_factory(), _DID, _res(_ScriptedDetector([])),
-                      CalibrationSet(known_good=(g1,), known_bad=()), _BUDGET, trials=_TRIALS)
+                      CalibrationSet(known_good=(g1,), known_bad=()), _BUDGET, trials=_TRIALS,
+                      backend_guard=allow_any_backend)
         self.assertTrue(r.inadequate)
         self.assertIn("inadequate", r.report())
 
@@ -223,7 +225,7 @@ class OracleInvariantTests(unittest.TestCase):
         cset = CalibrationSet(known_good=(g1,), known_bad=(b1,))
         with self.assertRaises(CalibrationConfigError):
             calibrate(weak_factory, _DID, _res(_ScriptedDetector([_FAIL] * 6)), cset, _BUDGET,
-                      trials=_TRIALS)
+                      trials=_TRIALS, backend_guard=allow_any_backend)
 
     def test_1a_fixture_label_never_enters_materialised_artifact(self) -> None:
         # 1a: a fixture executing in the sandbox must not be able to read its own label. The
@@ -247,7 +249,7 @@ class OracleInvariantTests(unittest.TestCase):
         cset = CalibrationSet(known_good=(g1,), known_bad=(b1, b2))
         # detector catches b1 [FAIL], MISSES b2 [PASS], passes g1 [PASS] — and "prefers" only b1.
         detector = _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3 + [_PASS] * 3, preferred_fixtures=["b1"])
-        r = calibrate(_hermetic_factory(), _DID, _res(detector), cset, _BUDGET, trials=_TRIALS)
+        r = calibrate(_hermetic_factory(), _DID, _res(detector), cset, _BUDGET, trials=_TRIALS, backend_guard=allow_any_backend)
         self.assertFalse(r.passed)
         self.assertEqual(r.fn_failures, ("b2",))  # b2 was run despite the detector's preference
         self.assertEqual(len(r.outcomes), 3)       # ALL 3 fixtures evaluated

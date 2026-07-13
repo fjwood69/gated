@@ -248,7 +248,7 @@ def calibrate(
     budget: ResourceBudget,
     *,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
-    backend_guard: BackendGuard | None = None,
+    backend_guard: BackendGuard,
 ) -> CalibrationResult:
     """Resolve ``detector_id`` through the injected trusted ``resolve`` and run that detector against
     every fixture in ``calibration_set``, returning whether it earns enablement. Two-sided (FR3.1 +
@@ -265,18 +265,18 @@ def calibrate(
     (1a); the detector has NO channel to choose which fixtures it faces — the caller injects the
     set, `calibrate` runs ALL of it (1d). Short-circuit ALWAYS OFF (full distribution). No
     tier-granting (3.3). Reproducible from the pinned detector + pinned fixtures (NFR6)."""
-    # 3.5-close #1.6: if a trusted-backend guard is injected, wrap the factory so EVERY constructed
-    # sandbox (including _require_hermetic's probe and each trial) has its RETURNED object verified to
-    # be an audited backend. Without a guard the engine cannot know "audited" (engine ⊥ gate) — the
-    # gate entry points wire the real guard; a guard-less call is a LOGIC path (documented, tests).
-    factory = make_sandbox
-    if backend_guard is not None:
-        _base = make_sandbox
+    # 3.5-close #1.6 + B3/D3: the trusted-backend guard is MANDATORY (no None opt-out). Wrap the factory
+    # so EVERY constructed sandbox (including _require_hermetic's probe and each trial) has its RETURNED
+    # object verified by the guard, which RAISES on rejection. The engine stays ignorant of "audited"
+    # (engine ⊥ gate) — it just calls the plain Callable it was handed; the gate composition root selects
+    # the real guard policy, and tests inject an explicit test-only opt-out (tests/_backend_optout.py),
+    # so there is no guard-less LOGIC path in production.
+    _base = make_sandbox
 
-        def factory() -> Sandbox:
-            sb = _base()
-            backend_guard(sb)
-            return sb
+    def factory() -> Sandbox:
+        sb = _base()
+        backend_guard(sb)
+        return sb
 
     _require_hermetic(factory)
     if not calibration_set.is_adequate:

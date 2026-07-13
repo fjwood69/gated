@@ -253,7 +253,7 @@ def run_calibration(
     approval: GovernanceApproval,
     set_id: str = "default",
     trials: int = DEFAULT_CALIBRATION_TRIALS,
-    backend_guard: BackendGuard | None = None,
+    backend_guard: BackendGuard,
 ) -> CalibrationOutcome:
     """Run the 3.2 BATCH calibrator (shadow-first — full fixture distribution, zero live-PR cost)
     against the out-of-band CalibrationSet, and record the state move. Records PENDING->CALIBRATING;

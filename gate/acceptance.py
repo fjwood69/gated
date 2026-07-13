@@ -305,7 +305,7 @@ def run_acceptance_anchor(
     now: float,
     budget: ResourceBudget,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
-    backend_guard: BackendGuard | None = None,
+    backend_guard: BackendGuard,
 ) -> AcceptanceReport:
     """Conduct the two-sided acceptance run against REAL fixtures + a REAL sandbox and return a SIGNED,
     identity-bound report. Self-grading closure: ``signer_approval`` must be a CALIBRATION_GOVERNANCE

@@ -38,6 +38,7 @@ from gate.policy_state import Disposition, PolicyState
 from gate.policy_store import PolicyStore
 from gate.snapshot import AttestationRecord, issue_snapshot
 from sandbox.noop import NoOpSandbox
+from tests._backend_optout import allow_any_backend
 
 
 def _bundle(det):  # type: ignore[no-untyped-def]
@@ -204,7 +205,7 @@ class Done2_LegibleRefuseTests(unittest.TestCase):
         outcome = run_calibration(
             "p1", store=s, make_sandbox=_hermetic_factory(), detector_id="d", resolve=_bundle(det),
             calibration_set=cset, budget=_BUDGET, calibration_chain_head="fx-head",
-            approval=_appr("gov1", op="p1-cal"), trials=3,
+            approval=_appr("gov1", op="p1-cal"), trials=3, backend_guard=allow_any_backend
         )
         self.assertFalse(outcome.passed)
         self.assertIsNone(outcome.calibration_result_ref)  # no PASS -> no ref -> cannot enable
@@ -227,7 +228,7 @@ class Done3_PerPolicyIsolationTests(unittest.TestCase):
         run_calibration("pA", store=s, make_sandbox=_hermetic_factory(), detector_id="d",
                         resolve=_bundle(det), calibration_set=cset, budget=_BUDGET,
                         calibration_chain_head="fx",
-                        approval=_appr("gov1", op="pA-cal"), trials=3)
+                        approval=_appr("gov1", op="pA-cal"), trials=3, backend_guard=allow_any_backend)
         self.assertIs(s.current_state("pA"), PolicyState.REJECTED)
         self.assertIs(_resolve(s, "pA").disposition, Disposition.SKIP_NEUTRAL)
         # pB untouched by pA's failure.
@@ -247,7 +248,7 @@ class EnablePathTests(unittest.TestCase):
         outcome = run_calibration("p1", store=s, make_sandbox=_hermetic_factory(), detector_id="d",
                                   resolve=_bundle(det), calibration_set=cset, budget=_BUDGET,
                                   calibration_chain_head="fx",
-                                  approval=_appr("gov1", op="p1-cal"), trials=3)
+                                  approval=_appr("gov1", op="p1-cal"), trials=3, backend_guard=allow_any_backend)
         self.assertTrue(outcome.passed)
         self.assertIsNotNone(outcome.calibration_result_ref)  # PASS -> a ref to bind ENABLED to
         self.assertIs(s.current_state("p1"), PolicyState.CALIBRATING)  # NOT auto-enabled

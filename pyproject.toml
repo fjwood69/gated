@@ -1,0 +1,25 @@
+# gated — packaging (B3 / S2). FLAT layout: package discovery is an explicit ALLOWLIST of the six
+# production packages, with tests* + scripts* excluded belt-and-braces. The shipped wheel therefore
+# contains ONLY production code — the test-only backend opt-out (tests/_backend_optout.py) is physically
+# absent from the artifact, so it cannot re-enter a production execution path. The clean-wheel test
+# (tests/test_packaging.py) builds the actual wheel and verifies its emitted contents — a manifest/config
+# test alone proves only that setuptools was configured, not what it emitted.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gated"
+version = "0.3.5"
+description = "A calibration-and-enforcement gate: hermetic measurement of a detector against a signed fixture oracle, with governance-attested tier transitions."
+requires-python = ">=3.9"
+dependencies = [
+    "pynacl",
+    "pyjwt",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+# ALLOWLIST — only these ship. Anything not listed (tests, scripts, docs) is excluded by omission.
+include = ["core*", "sandbox*", "engine*", "observe*", "gate*", "cli*"]
+exclude = ["tests*", "scripts*"]

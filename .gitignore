@@ -5,6 +5,10 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+build/
+dist/
+*.egg-info/
+*.whl
 *.db
 *.db-wal
 *.db-shm

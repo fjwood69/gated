@@ -27,6 +27,7 @@ from gate.acceptance import (
 from gate.authority import AuthorityDomain, GovernanceApproval
 from gate.detector_registry import DetectorRegistry, profile_of
 from sandbox.noop import NoOpSandbox
+from tests._backend_optout import allow_any_backend
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
 _HOLDOUT_KEY = b"calibration-governance-holdout-key"
@@ -111,7 +112,7 @@ def _run(store: BlindHoldoutStore, *, honest, fn, fp, signer=None, make_sandbox=
         trust_policy_id=trust_policy_id,
         visible_set=_VISIBLE, blind_holdout_store=store, holdout_key=_HOLDOUT_KEY,
         signer=SeedSigner(_SIGNER_SEED), signer_principal="cal-gov-1",
-        signer_approval=signer or _cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3)
+        signer_approval=signer or _cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3, backend_guard=allow_any_backend)
 
 
 # honest: reused across BOTH the visible AND the holdout lane (same instance, 12 trials). Each set is
@@ -276,7 +277,7 @@ class AcceptanceAnchorTests(unittest.TestCase):
                 fp_happy_detector_id="fp", resolve=alternating, trust_policy_id=_TRUST_POLICY_ID,
                 visible_set=_VISIBLE, blind_holdout_store=store, holdout_key=_HOLDOUT_KEY,
                 signer=SeedSigner(_SIGNER_SEED), signer_principal="cal-gov-1",
-                signer_approval=_cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3)
+                signer_approval=_cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3, backend_guard=allow_any_backend)
 
     def test_same_module_different_entrypoint_is_a_distinct_identity(self) -> None:
         # P1-3 (neg 2): the entrypoint argv is part of the resolved profile, so a detector with the SAME
