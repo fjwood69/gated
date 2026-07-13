@@ -392,10 +392,14 @@ class RestoreContinuityNegativesTests(unittest.TestCase):
         self.assertIs(_controller(s, c).attempt_restore(att).result,
                       RestoreResult.REFUSED_STALE_GENERATION)
 
-    def test_neg3_set_move_in_atomic_context_cas_aborts(self) -> None:
-        # the SET coordinate of the authorized context is pinned ATOMICALLY under the store lock: an
-        # expect_authorized_context whose SET differs from the store's current one aborts (mirrors the
-        # subject-move test — both live in the 3-tuple, checked as one unit at the append).
+    def test_neg3_set_move_in_context_cas_rejected(self) -> None:
+        # the SET coordinate is part of the CAS: reattest REJECTS an expect_authorized_context whose SET
+        # differs from the store's CURRENT one (mirrors the subject-move test — both live in the 3-tuple).
+        # SCOPE (honest): this proves MISMATCH-REJECTION (a stale expectation is refused), NOT an actual
+        # concurrent interleaving. The ATOMICITY that makes the read->recheck->append race-free is
+        # established by CODE INSPECTION — all three run under one ``with self._lock:`` in reattest() — not
+        # by this test. A true two-thread interleaving test is deliberately omitted (it would test
+        # threading.Lock, not the design) — see the atomicity argument in reattest()'s docstring.
         from gate.policy_store import ReAttestConflict
         c = _cal_store()
         s = _policy_store_enabled(c.set_head("X"))

@@ -297,12 +297,30 @@ evidence, or governance superseded it) is a SUCCESS signal — the policy is alr
 LOGS and DROPS, it does not retry. At-least-once redelivery of the same measurement is caught by this and
 refused ("already done", not "failed").
 
-**No dedup liveness gap (why `tier_generation` is NOT in `deterministic_job_id`):** the job dedup key is
-`(policy_id, set_id, oracle_head, subject)`. A fixture append advances `set_head` → `oracle_head` → a NEW
-job_id, so a fresh-generation trigger is never collapsed onto a stale job; and a DEMOTE→re-ratify self-
-attests via the initial-enable path (bound to the current oracle head) with no re-attest job needed. So the
-generation is distinguished by `oracle_head` already — adding it to the dedup key would only widen the
-outbox→queue idempotency blast radius for no liveness benefit (board-ruled DEFER).
+**D-C — dedup closed, but a liveness residual remains (DEFERRED into AuthorizedRunPlan; GPT-5.6 re-dissent).**
+The job dedup key `(policy_id, set_id, oracle_head, subject)` includes `oracle_head`, which advances on every
+fixture append — so a fresh-generation trigger gets a NEW job_id and is never collapsed onto a stale job.
+That closes the *dedup* mechanism, and it is why `tier_generation` is NOT added to `deterministic_job_id`
+(it would widen the outbox→queue idempotency blast radius for no dedup benefit). **But disproving the dedup
+mechanism does NOT prove the liveness gap absent** — the same bad outcome (a policy stuck bound to a stale
+head) arises via a DIFFERENT mechanism: drain-without-re-enqueue + stale-pass ratification —
+
+1. J1 is queued for the current head H2 under generation G1.
+2. Governance demotes then re-ratifies a STALE H1 pass → generation G2. (`ratify_enable` accepts any
+   matching persisted pass; it does NOT prove `pinned_set_version == live set_head` — the root cause.)
+3. J1 measures H2 but is REFUSED — its signed `tier_generation` is G1, not the current head G2 (the
+   stale-generation guard fires: correct, *security*-wise).
+4. The policy is now bound to the stale H1 while live reality is H2 — SAFE (refuses stale evidence) but
+   STUCK (it will not accept the correct H2 evidence).
+5. The H2 outbox trigger was already drained, so no new job is guaranteed.
+
+Adding `tier_generation` to the job_id does NOT fix this — there is no second enqueue to de-duplicate; the
+trigger is simply gone. So the DEFER is upheld (a job_id change cannot help), but D-C is **deferred, not
+unconditionally ruled out.** The fix is a MANDATORY AuthorizedRunPlan liveness invariant: calibration +
+ratification must use ONE current, sealed `(set_id, oracle_head, subject, ICV)` context — `ratify_enable`
+must prove `pinned_set_version == live set_head(set_id)`, so a stale pass can never be re-ratified (killing
+step 2 at the root). **Lesson banked:** disproving one *mechanism* of a gap (dedup) is not proving the *gap*
+(stuck-on-stale-head) absent — enumerate the other mechanisms that reach the same bad outcome.
 
 **IDENTITY_CONTRACT_VERSION bump blast radius (named residual):** bumping the ICV changes the subject
 digest's domain prefix (`gated.calibrated-subject.v{ICV}`), so every ENABLED policy's `authorized_subject`
@@ -324,6 +342,17 @@ an ICV bump is a BREAKING change requiring re-ratification of all ENABLED polici
 - **The acceptance envelope + the snapshot remain 2-tuple (pre-v3).** The live gatekeeper cannot be wired
   until both are bumped to carry the 4-tuple, or the enforcement match would compare a v3 attested subject
   against a 2-tuple accepted identity.
+- **MANDATORY liveness invariant — current-head calibration/ratification (D-C carry-forward).** AuthorizedRunPlan
+  must enforce that calibration + ratification use ONE current, sealed `(set_id, oracle_head, subject, ICV)`
+  context: `ratify_enable` must prove `pinned_set_version == live set_head(set_id)` (it currently accepts any
+  matching persisted pass, including a stale-head one), and `run_calibration` must verify the caller's
+  `(set_id, head)` correspond. This closes the restore-continuity liveness residual at its root (a stale pass
+  can never be re-ratified → a policy cannot get safely-but-stuck on a stale head). This is the LIVENESS half
+  of what the live gatekeeper must enforce, alongside the SECURITY 4-tuple — S3 does not seal without it.
+- **The recal WORKER (log-and-drop on superseded refusal) is UNBUILT.** No component yet leases recal jobs,
+  runs `run_recalibration`, and consumes `RestoreOutcome`; the "relay invariant" in `restore_controller` is a
+  CONTRACT for that future worker, not implemented behaviour. When built it MUST treat a `REFUSED_STALE_GENERATION`
+  (head already moved) as "already done" — log + complete the job, never retry-forever.
 
 ### Named-next increments (deploy-bar — not dropped)
 - **`policy → accepted_detector_id` per-policy selection.** Migration alone lets the gate run any

@@ -29,12 +29,18 @@ What it enforces before appending a RE_ATTESTATION (authenticity + gates + the a
      ``expect_authorized_context``) — so a re-attest can never land after a concurrent human DEMOTE or an
      authorized-context change (subject OR set). On a conflict it re-reads and retries; it NEVER forces.
 
-RELAY INVARIANT (board mandate): a restore REFUSED because the policy head already moved (a re-attest
-already advanced the evidence, or a governance change superseded it) is a SUCCESS signal for the relay —
-the policy is already re-attested (or deliberately superseded), so the relay LOGS and DROPS the job; it
-does NOT retry indefinitely. At-least-once redelivery of the same signed measurement is caught by the
-tier-generation / head CAS (the head moved on the first success) and refused — that refusal means "already
-done", not "failed".
+RELAY INVARIANT (a CONTRACT for the consuming worker — NOT yet-implemented behaviour). This reference has
+no worker that leases recal jobs and calls ``attempt_restore`` (only tests invoke it); when that worker is
+built (a named-next increment, alongside AuthorizedRunPlan) it MUST treat a restore REFUSED because the head
+already moved (``REFUSED_STALE_GENERATION`` after another re-attest advanced the evidence, or a governance
+change superseded it) as a SUCCESS signal — the policy is already re-attested (or deliberately superseded),
+so the worker LOGS and completes/DROPS the job; it does NOT retry indefinitely. At-least-once redelivery of
+the same signed measurement is caught by the tier-generation / head CAS and refused: that refusal means
+"already done", not "failed". LIVENESS CAVEAT (D-C residual, deferred): a ``REFUSED_STALE_GENERATION`` can
+also leave a policy SAFELY-BUT-STUCK bound to a stale head if the current-head trigger was already drained
+and re-ratification admitted a stale pass — closing that is a MANDATORY AuthorizedRunPlan invariant
+(calibration/ratification must use one current, sealed ``(set_id, oracle_head, subject, ICV)`` context;
+``ratify_enable`` must prove ``pinned_set_version == live set_head``). See ARCHITECTURE.md.
 
 Gate-side. Imports the policy store (governance) + attestation (measurement) + core; does NOT import the
 engine or the runner. ``core`` never imports this.
