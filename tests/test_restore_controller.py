@@ -115,14 +115,16 @@ def _controller(s: PolicyStore, c: CalibrationStore, *, trusted: bool = True,
 
 
 def _run(c: CalibrationStore, verdicts: list[Verdict], *, tier_gen: str = "tg", nonce: str = "n1",  # type: ignore[no-untyped-def]
-         requested: str | None = None, detector: "_ScriptedDetector | None" = None):
+         requested: str | None = None, detector: "_ScriptedDetector | None" = None, set_id: str = "X"):
     # detectors arrive by NAME through a trusted registry via the ATOMIC bundle (P1-3 v3); the SIGNED
     # subject is measurement-derived. ``requested`` defaults to the policy's authorized subject (_DET).
+    # ``set_id`` selects WHICH set to calibrate against — the SAME detector against a different set yields
+    # the SAME measurement-derived subject (profile/env unchanged) but a different signed set_id.
     det = detector if detector is not None else _ScriptedDetector(verdicts)
     reg = DetectorRegistry()
     reg.register("d", lambda: det, accepted_profile_digest=profile_of("d", det).digest())
     return run_recalibration(
-        policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(),
+        policy_id="p1", set_id=set_id, calibration_store=c, make_sandbox=_factory(),
         detector_id="d", resolve=reg.resolve_bundle,
         requested_subject_identity=(requested if requested is not None else _DET), tier_generation=tier_gen,
         budget=_BUDGET, issuer=_ISSUER, nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3, backend_guard=test_guard_policy, trust_policy=_REF_TP)
@@ -159,7 +161,7 @@ class RestoreControllerTests(unittest.TestCase):
                                           oracle_head_for=c.set_head).disposition,
                       Disposition.BLOCK_ACTION_REQUIRED)
         # async re-cal: detector now catches BOTH known-bad (b1,b2) and passes g1 -> clean PASS @ new head.
-        att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3)
+        att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3, tier_gen=s.policy_head("p1"))
         self.assertIs(att.outcome, VerdictType.PASS)
         # the restore controller re-attests.
         outcome = _controller(s, c).attempt_restore(att)
@@ -227,7 +229,7 @@ class RestoreControllerTests(unittest.TestCase):
         s = _policy_store_enabled(c.set_head("X"))
         c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
-        att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3)
+        att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3, tier_gen=s.policy_head("p1"))
         store = _att_store()
         outcome = _controller(s, c, att_store=store).attempt_restore(att)
         self.assertIs(outcome.result, RestoreResult.RESTORED)
@@ -257,7 +259,7 @@ class RestoreControllerTests(unittest.TestCase):
         self.assertNotEqual(s.policy_head("p1"), s.head_hash())  # p1's head != global head
         c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
-        att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3)
+        att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3, tier_gen=s.policy_head("p1"))
         outcome = _controller(s, c).attempt_restore(att)
         self.assertIs(outcome.result, RestoreResult.RESTORED)  # p1 restores despite p2 existing
 
@@ -296,21 +298,22 @@ class V3GovernanceTargetTests(unittest.TestCase):
         self.assertIs(_controller(s, c).attempt_restore(att2).result,
                       RestoreResult.REFUSED_SUBJECT_MISMATCH)         # requested != policy's authorized target
 
-    def test_reattest_refuses_when_authorized_subject_moved(self) -> None:
-        # v4 P1-b: the authorized-subject check is ATOMIC with the head CAS (under the store lock). If the
-        # policy's authorized target no longer equals what the restore verified, reattest raises
-        # ReAttestConflict — closing the read-authorized-then-CAS-on-head-only race. Guard = the
-        # expect_authorized_subject check inside reattest; remove it and this re-attests a stale subject.
+    def test_reattest_refuses_when_authorized_context_moved(self) -> None:
+        # v4 P1-b + S3 restore-continuity: the authorized-CONTEXT check is ATOMIC with the head CAS (under
+        # the store lock). If the policy's authorized (set, subject, ICV) no longer equals what the restore
+        # verified, reattest raises ReAttestConflict — closing the read-context-then-CAS-on-head-only race.
+        # Guard = the expect_authorized_context check inside reattest; remove it and this re-attests a stale
+        # context. A moved SUBJECT is caught here exactly as a moved SET is (both are in the 3-tuple).
         from gate.policy_store import ReAttestConflict
         c = _cal_store()
-        s = _policy_store_enabled(c.set_head("X"))  # authorized target == _DET, bound to ref "cal-0"
+        s = _policy_store_enabled(c.set_head("X"))  # authorized context == ("X", _DET, 1), ref "cal-0"
         cap = ReAttestCapability(s)
         with self.assertRaises(ReAttestConflict):
             cap.reattest(
                 "p1", calibration_result_ref="cal-0", set_id="X", pinned_set_version=c.set_head("X"),
                 detector_identity=_DET, identity_contract_version=1, job_id="j", nonce="n",
                 expect_policy_head=s.policy_head("p1"),
-                expect_authorized_subject="a-DIFFERENT-authorized-subject")  # != current -> conflict
+                expect_authorized_context=("X", "a-DIFFERENT-subject", 1))  # != current -> conflict
 
     def test_store_get_rejects_a_tampered_row(self) -> None:
         # v3 (board P2): the store binds the lookup key to content — a row whose bytes were tampered
@@ -345,6 +348,91 @@ class RestoreControllerStructuralTests(unittest.TestCase):
     def test_capability_exposes_no_arbitrary_transition(self) -> None:
         # board amendment 1: the restore capability is restricted to the RE_ATTESTATION record kind.
         self.assertFalse(hasattr(ReAttestCapability, "transition"))
+
+
+class RestoreContinuityNegativesTests(unittest.TestCase):
+    """S3 restore-continuity acceptance harness (board-required negatives). Each proves a distinct
+    continuity coordinate: a valid, clean, AUTHENTIC measurement is still REFUSED when it targets the
+    wrong set or a superseded generation, or is replayed; and set_id / tier_generation are signed
+    (tampering either breaks authenticity). Remove the corresponding guard and each of these flips to
+    RESTORED — that is the guard's teeth."""
+
+    def _cal_with_set_Y(self) -> CalibrationStore:
+        c = _cal_store()  # set X: b1(bad) + g1(good)
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="y1"),
+                 fixture_id="yb", set_id="Y", label=FixtureLabel.KNOWN_BAD, payload=b"ybad")
+        c.append(ChangeOp.ADD_KNOWN_GOOD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="y2"),
+                 fixture_id="yg", set_id="Y", label=FixtureLabel.KNOWN_GOOD, payload=b"ygood")
+        return c
+
+    def test_neg1_same_subject_different_set_refused(self) -> None:
+        # FINDING 1: a clean, same-SUBJECT measurement calibrated against set Y cannot restore a policy
+        # authorized against set X — the oracle check only proves Y is itself current, not that Y is
+        # THIS policy's set. The set is now an atomic CAS coordinate.
+        c = self._cal_with_set_Y()
+        s = _policy_store_enabled(c.set_head("X"))            # p1 authorized for set X, subject _DET
+        att = _run(c, [_FAIL] * 3 + [_PASS] * 3, set_id="Y",  # SAME detector -> SAME subject, set_id="Y"
+                   tier_gen=s.policy_head("p1"))
+        self.assertIs(att.outcome, VerdictType.PASS)
+        self.assertEqual(att.set_id, "Y")
+        self.assertEqual(att.subject_identity, _DET)          # subject matches the authorized one...
+        outcome = _controller(s, c).attempt_restore(att)
+        self.assertIs(outcome.result, RestoreResult.REFUSED_SET_MISMATCH)  # ...but the SET does not
+
+    def test_neg2_stale_generation_refused(self) -> None:
+        # FINDING 2: a clean measurement whose signed tier_generation != the policy's current head (as
+        # after a human DEMOTE->re-ratify moved the head between trigger and restore) is refused.
+        c = _cal_store()
+        s = _policy_store_enabled(c.set_head("X"))
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift"),
+                 fixture_id="b2", set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
+        att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3,
+                   tier_gen="a-stale-generation-that-is-not-the-current-head")
+        self.assertIs(att.outcome, VerdictType.PASS)
+        self.assertIs(_controller(s, c).attempt_restore(att).result,
+                      RestoreResult.REFUSED_STALE_GENERATION)
+
+    def test_neg3_set_move_in_atomic_context_cas_aborts(self) -> None:
+        # the SET coordinate of the authorized context is pinned ATOMICALLY under the store lock: an
+        # expect_authorized_context whose SET differs from the store's current one aborts (mirrors the
+        # subject-move test — both live in the 3-tuple, checked as one unit at the append).
+        from gate.policy_store import ReAttestConflict
+        c = _cal_store()
+        s = _policy_store_enabled(c.set_head("X"))
+        cap = ReAttestCapability(s)
+        with self.assertRaises(ReAttestConflict):
+            cap.reattest("p1", calibration_result_ref="cal-0", set_id="X", pinned_set_version=c.set_head("X"),
+                         detector_identity=_DET, identity_contract_version=1, job_id="j", nonce="n",
+                         expect_policy_head=s.policy_head("p1"),
+                         expect_authorized_context=("Y-DIFFERENT-SET", _DET, 1))  # wrong SET -> conflict
+
+    def test_neg5_duplicate_measurement_after_success_refused(self) -> None:
+        # FINDING 2 bonus (single-use / replay resistance): a measurement that RESTORED once cannot be
+        # replayed — the successful re-attest moved the head, so the SAME signed measurement now fails the
+        # tier_generation check. Per the relay invariant, this refusal means "already done", not "failed".
+        c = _cal_store()
+        s = _policy_store_enabled(c.set_head("X"))
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift"),
+                 fixture_id="b2", set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
+        att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3, tier_gen=s.policy_head("p1"))
+        ctrl = _controller(s, c)
+        self.assertIs(ctrl.attempt_restore(att).result, RestoreResult.RESTORED)      # first succeeds
+        self.assertIs(ctrl.attempt_restore(att).result,                              # replay refused
+                      RestoreResult.REFUSED_STALE_GENERATION)
+
+    def test_neg6_signed_set_id_and_tier_generation_are_tamper_evident(self) -> None:
+        # FINDINGS 1+2: set_id and tier_generation are in the SIGNED calibration_context. Tampering either
+        # breaks the HMAC -> unverifiable -> refused at AUTHENTICITY (step 1), never reaching the continuity
+        # checks. replace() keeps the ORIGINAL signature over the ORIGINAL bytes, so the recompute mismatches.
+        from dataclasses import replace
+        c = _cal_store()
+        s = _policy_store_enabled(c.set_head("X"))
+        c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift"),
+                 fixture_id="b2", set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
+        att = _run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3, tier_gen=s.policy_head("p1"))
+        for tampered in (replace(att, set_id="EVIL"), replace(att, tier_generation="EVIL")):
+            self.assertIs(_controller(s, c).attempt_restore(tampered).result,
+                          RestoreResult.REFUSED_UNTRUSTED)
 
 
 if __name__ == "__main__":

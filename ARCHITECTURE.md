@@ -269,6 +269,41 @@ persisted pass via `pass_binding` (measurement-derived, not caller-supplied). `c
 return the TRANSITION-bound values (not the pass-row values), and a conflicting `record_calibration_pass`
 under an existing ref is REJECTED (a ref binds one immutable pass).
 
+**Restore continuity — the authorized-identity coordinate set.** A re-attestation is asynchronous: a
+measurement is TRIGGERED under one policy state and LANDS later. Restore must confirm that EVERY coordinate
+of the policy's authorized identity is unchanged across that window — not just that the measurement is a
+clean, authentic pass. The coordinates and the window each closes:
+
+| Coordinate | Staleness window it closes | Check |
+|---|---|---|
+| `oracle_head` | the SET drifted (a fixture appended) since the measurement | `att.oracle_head == live set_head(att.set_id)` |
+| `set_id` | same-subject cross-set rebind (measured against set Y, policy authorized for X) | `att.set_id == authorized_set` |
+| `subject` | measured/requested subject ≠ the policy's authorized subject | `att.requested_subject == authorized_subject` (+ `measured == requested`) |
+| `tier_generation` | measurement-to-restore staleness across a human DEMOTE→re-ratify | `att.tier_generation == policy_head` |
+| `policy_head` | a concurrent transition DURING the restore read→append | atomic CAS `expect_policy_head` |
+
+These are INDEPENDENT — a measurement can be for the right set but a stale generation, or the right
+generation but the wrong set — so each needs its own guard; none subsumes another. The `(set_id, subject,
+ICV)` triple is read as ONE snapshot (`current_authorized_context`) and pinned as ONE unit in the atomic CAS
+(`expect_authorized_context`), so no caller can check part of the authorization context. `tier_generation`
+is the POLICY-SCOPED head (`policy_head`), captured per-policy at relay time — NOT the global `head_hash()`,
+which would spuriously fail restore whenever an UNRELATED policy transitioned. The generation coordinate
+doubles as a **single-use nonce**: a successful re-attest moves the head, so a replayed measurement fails
+`tier_generation == policy_head` — replay resistance falls out of the staleness check (restore has no
+idempotent early-return; every success appends a record).
+
+**Relay invariant:** a restore REFUSED because the head already moved (a re-attest already advanced the
+evidence, or governance superseded it) is a SUCCESS signal — the policy is already re-attested; the relay
+LOGS and DROPS, it does not retry. At-least-once redelivery of the same measurement is caught by this and
+refused ("already done", not "failed").
+
+**No dedup liveness gap (why `tier_generation` is NOT in `deterministic_job_id`):** the job dedup key is
+`(policy_id, set_id, oracle_head, subject)`. A fixture append advances `set_head` → `oracle_head` → a NEW
+job_id, so a fresh-generation trigger is never collapsed onto a stale job; and a DEMOTE→re-ratify self-
+attests via the initial-enable path (bound to the current oracle head) with no re-attest job needed. So the
+generation is distinguished by `oracle_head` already — adding it to the dedup key would only widen the
+outbox→queue idempotency blast radius for no liveness benefit (board-ruled DEFER).
+
 **IDENTITY_CONTRACT_VERSION bump blast radius (named residual):** bumping the ICV changes the subject
 digest's domain prefix (`gated.calibrated-subject.v{ICV}`), so every ENABLED policy's `authorized_subject`
 (composed under the old ICV) no longer matches a new measurement's subject (new ICV) — restore is refused

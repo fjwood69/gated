@@ -6,7 +6,7 @@ tier) and NOT the merge-path gatekeeper (which stays read-only). It holds a capa
 RE_ATTESTATION record kind (``ReAttestCapability``) — it can advance a policy's evidence, never perform an
 arbitrary tier transition (board amendment 1).
 
-What it enforces before appending a RE_ATTESTATION (the 5-part CAS + gates):
+What it enforces before appending a RE_ATTESTATION (authenticity + gates + the atomic CAS):
   1. AUTHENTICITY — the measurement is HMAC-valid under the issuer's key AND the issuer is on the
      allowlist (issuer/key-epoch; board amendment 2). An unverifiable measurement moves nothing.
   2. CLEAN PASS — outcome PASS, short_circuit OFF, non-empty coverage (a FAIL/ERROR is a NO-OP on
@@ -16,10 +16,25 @@ What it enforces before appending a RE_ATTESTATION (the 5-part CAS + gates):
   4. ORACLE CURRENT — the signed ``oracle_head`` still equals the live ``set_head(set_id)``. If the set
      drifted again, restore is REFUSED; a newer re-cal (enqueued by that append) handles it. Self-
      correcting + fail-closed: a stale re-attest would only leave the policy UNATTESTABLE again.
-  5. STATE + POLICY-HEAD CAS — the policy is currently ENABLED (asymmetry: an ADVISORY/DEMOTED policy
-     has NO re-attest path and must re-ratify), AND the policy-evidence head is unchanged across the
-     append (atomic under the store lock via ``expect_policy_head``) — so a re-attest can never land
-     after a concurrent human DEMOTE. On a head-conflict it re-reads and retries; it NEVER forces.
+  5. AUTHORIZED CONTEXT — the measurement's ``set_id`` AND ``requested_subject_identity`` both equal the
+     policy's CURRENT authorized context ``(set_id, subject, ICV)``, read as ONE snapshot. Closes the
+     same-subject cross-set rebind (finding 1): the oracle check proves set Y is current, not that Y is
+     THIS policy's set.
+  6. TIER GENERATION — the signed ``tier_generation`` (the policy head the measurement was TRIGGERED
+     under) equals the policy's CURRENT head. Closes measurement-to-restore staleness across a human
+     DEMOTE->re-ratify round-trip (finding 2), and makes a measurement SINGLE-USE per generation.
+  7. STATE + ATOMIC CAS — the policy is currently ENABLED (asymmetry: an ADVISORY/DEMOTED policy has NO
+     re-attest path and must re-ratify), AND the policy-evidence head + the whole authorized-context
+     3-tuple are unchanged across the append (atomic under the store lock via ``expect_policy_head`` +
+     ``expect_authorized_context``) — so a re-attest can never land after a concurrent human DEMOTE or an
+     authorized-context change (subject OR set). On a conflict it re-reads and retries; it NEVER forces.
+
+RELAY INVARIANT (board mandate): a restore REFUSED because the policy head already moved (a re-attest
+already advanced the evidence, or a governance change superseded it) is a SUCCESS signal for the relay —
+the policy is already re-attested (or deliberately superseded), so the relay LOGS and DROPS the job; it
+does NOT retry indefinitely. At-least-once redelivery of the same signed measurement is caught by the
+tier-generation / head CAS (the head moved on the first success) and refused — that refusal means "already
+done", not "failed".
 
 Gate-side. Imports the policy store (governance) + attestation (measurement) + core; does NOT import the
 engine or the runner. ``core`` never imports this.
@@ -64,12 +79,13 @@ class ReAttestCapability:
     def policy_head(self, policy_id: str) -> str:
         return self._store.policy_head(policy_id)
 
-    def authorized_subject_identity(self, policy_id: str) -> str | None:
-        """v3 (board P2): the subject identity the policy is CURRENTLY authorized for (its live
-        calibration binding). Restore requires the re-cal's requested subject to equal THIS — so a
-        measurement for a different (even globally-trusted) subject can never re-bind the policy."""
-        att = self._store.current_attestation(policy_id)
-        return None if att is None else att[2]
+    def authorized_context(self, policy_id: str) -> tuple[str, str, int] | None:
+        """S3 restore-continuity: the policy's CURRENT authorization context ``(set_id, subject, ICV)``
+        read as ONE snapshot. Restore requires the measurement's set AND requested subject to equal this —
+        so a measurement for a different set (even a valid current one) or a different (even globally-
+        trusted) subject can never re-bind the policy. Read once; every CAS input derives from it (no
+        read-then-read TOCTOU between set and subject)."""
+        return self._store.current_authorized_context(policy_id)
 
     def record_calibration_pass(self, ref: str, *, policy_id: str, pinned_set_version: str,
                                 detector_identity: str, identity_contract_version: int,
@@ -82,13 +98,13 @@ class ReAttestCapability:
     def reattest(self, policy_id: str, *, calibration_result_ref: str, set_id: str,
                  pinned_set_version: str, detector_identity: str, identity_contract_version: int,
                  job_id: str, nonce: str,
-                 expect_policy_head: str, expect_authorized_subject: str) -> int:
+                 expect_policy_head: str, expect_authorized_context: tuple[str, str, int]) -> int:
         return self._store.reattest(
             policy_id, grant=_REATTEST_GRANT, calibration_result_ref=calibration_result_ref,
             set_id=set_id, pinned_set_version=pinned_set_version, detector_identity=detector_identity,
             identity_contract_version=identity_contract_version,
             job_id=job_id, nonce=nonce, expect_policy_head=expect_policy_head,
-            expect_authorized_subject=expect_authorized_subject)
+            expect_authorized_context=expect_authorized_context)
 
 
 class RestoreResult(Enum):
@@ -96,6 +112,8 @@ class RestoreResult(Enum):
     REFUSED_NOT_CLEAN_PASS = "not_clean_pass"  # FAIL/ERROR/short-circuit -> no-op on governance state
     REFUSED_UNTRUSTED = "untrusted"          # bad signature / issuer / revoked detector identity
     REFUSED_SUBJECT_MISMATCH = "subject_mismatch"  # measured != requested, or requested != policy's target
+    REFUSED_SET_MISMATCH = "set_mismatch"    # signed set_id != the policy's AUTHORIZED set (same-subject X->Y rebind)
+    REFUSED_STALE_GENERATION = "stale_generation"  # signed tier_generation != authorized policy head (measured under a superseded generation)
     REFUSED_ORACLE_STALE = "oracle_stale"    # signed head != live set_head (a newer re-cal will handle)
     REFUSED_NOT_ENABLED = "not_enabled"      # policy not ENABLED (asymmetry: must re-ratify)
     REFUSED_CAS_EXHAUSTED = "cas_exhausted"  # lost the policy-head CAS too many times
@@ -196,17 +214,49 @@ class RestoreController:
                     f"{att.policy_id} is not ENABLED — a demoted policy must re-ratify, never "
                     "auto-restore (tier asymmetry)",
                 )
-            # the requested subject MUST equal the policy's CURRENTLY AUTHORIZED target (v3, board P1):
-            # a re-cal can only re-attest the SAME subject the policy is already enabled for, never rebind
-            # it to a different one — even a globally-trusted measured subject. Measurement ≠ governance.
-            authorized = self._cap.authorized_subject_identity(att.policy_id)
-            if authorized is None or att.requested_subject_identity != authorized:
+            # SINGLE authorization-context snapshot (board refinement): the measurement's set AND requested
+            # subject must BOTH equal the policy's CURRENTLY AUTHORIZED context — a re-cal can only re-attest
+            # the SAME (set, subject) the policy is enabled for, never rebind EITHER, even to a valid current
+            # set or a globally-trusted subject. Read ONCE; the CAS below pins the whole 3-tuple atomically.
+            # Measurement ≠ governance.
+            ctx = self._cap.authorized_context(att.policy_id)
+            if ctx is None:
+                return RestoreOutcome(
+                    RestoreResult.REFUSED_NOT_ENABLED,
+                    f"{att.policy_id} has no current authorized context (not ENABLED / no bound pass)",
+                )
+            authorized_set, authorized_subject, _authorized_icv = ctx
+            # FINDING 1 (set continuity): the measurement's set must be the policy's AUTHORIZED set. The
+            # oracle-head check above only proves set Y is itself CURRENT, not that Y is THIS policy's set —
+            # so a same-subject measurement calibrated against a different set Y cannot rebind a policy
+            # authorized against set X.
+            if att.set_id != authorized_set:
+                return RestoreOutcome(
+                    RestoreResult.REFUSED_SET_MISMATCH,
+                    f"signed set_id {att.set_id!r} != the policy's authorized set {authorized_set!r} — a "
+                    "measurement for another set cannot rebind the policy (same-subject cross-set rebind)",
+                )
+            if att.requested_subject_identity != authorized_subject:
                 return RestoreOutcome(
                     RestoreResult.REFUSED_SUBJECT_MISMATCH,
                     f"requested subject {att.requested_subject_identity!r} != the policy's authorized "
-                    f"target {authorized!r} — restore cannot rebind the policy's subject",
+                    f"target {authorized_subject!r} — restore cannot rebind the policy's subject",
                 )
             policy_head = self._cap.policy_head(att.policy_id)
+            # FINDING 2 (tier-generation staleness): the signed tier_generation (the policy head the
+            # measurement was TRIGGERED under) must equal the policy's CURRENT head. A measurement triggered
+            # under generation G1, superseded by a human DEMOTE->re-ratify to G2, then arriving late, is
+            # refused HERE — the policy-head CAS alone guards only the restore read->append window, not
+            # measurement-to-restore staleness across a governance round-trip. Since policy_head is also
+            # expect_policy_head below, this equality is enforced ATOMICALLY at the append, and it makes a
+            # measurement SINGLE-USE within a generation (a successful re-attest moves the head, so a replayed
+            # measurement fails this check — replay resistance falls out of the staleness coordinate).
+            if att.tier_generation != policy_head:
+                return RestoreOutcome(
+                    RestoreResult.REFUSED_STALE_GENERATION,
+                    f"signed tier_generation {att.tier_generation[:12]}.. != the policy's current head "
+                    f"{policy_head[:12]}.. — measured under a superseded generation; a fresh re-cal restores",
+                )
             # persist the pass the re-attest binds to (idempotent; ref binds the immutable signed att).
             # the policy store's generic ``detector_identity`` field carries the calibrated-subject
             # identity value (P1-3) — the identity the future enforcement match compares.
@@ -222,12 +272,12 @@ class RestoreController:
                     identity_contract_version=att.identity_contract_version,
                     job_id=att.run_id, nonce=att.nonce,
                     expect_policy_head=policy_head,
-                    # v4 P1-b: bind the authorized-subject check ATOMICALLY with the head CAS. If governance
-                    # moved the authorized target since we read it, reattest raises ReAttestConflict -> the
-                    # loop re-reads authorized above and refuses (REFUSED_SUBJECT_MISMATCH) on the retry.
-                    expect_authorized_subject=authorized)
+                    # bind the authorized-CONTEXT check ATOMICALLY with the head CAS (set + subject + ICV as
+                    # ONE unit). If governance moved the authorized context (subject OR set) since we read it,
+                    # reattest raises ReAttestConflict -> the loop re-reads ctx above and refuses on retry.
+                    expect_authorized_context=ctx)
             except ReAttestConflict:
-                continue  # the policy head moved; re-read and retry the whole CAS
+                continue  # the policy head/context moved; re-read and retry the whole CAS
             return RestoreOutcome(RestoreResult.RESTORED, "re-attested to the current oracle head", seq)
         return RestoreOutcome(
             RestoreResult.REFUSED_CAS_EXHAUSTED,

@@ -35,15 +35,18 @@ def relay_outbox(
 
     Targets the CURRENT ``set_head`` (not the entry's append-time head), so all pending triggers for a
     set collapse to the current head — a policy is re-calibrated against reality, once, not once per
-    intermediate append. ``tier_generation`` records the tier head at relay time (provenance; the
-    restore CAS gates on the policy-evidence head, not this)."""
+    intermediate append. ``tier_generation`` is the POLICY-SCOPED head (``policy_head(policy_id)``),
+    captured PER-POLICY (S3 restore-continuity): the restore CAS requires the signed generation to still
+    equal this policy's head, refusing a measurement triggered under a generation a human DEMOTE->re-ratify
+    later superseded. It is deliberately NOT the global ``head_hash()`` — a global head would spuriously
+    fail restore whenever an UNRELATED policy transitioned between trigger and restore."""
     enqueued = 0
-    tier_generation = policy_store.head_hash()
     for entry in calibration_store.undrained_outbox():
         current_head = calibration_store.set_head(entry.set_id)
         for policy_id, detector_identity in policy_store.enabled_policies_for_set(entry.set_id):
             # the policy's stored identity IS the calibrated-subject identity (P1-3) — passed as the
             # dedup/routing key, never as signed authority.
+            tier_generation = policy_store.policy_head(policy_id)  # POLICY-scoped generation (per-policy)
             job_id = deterministic_job_id(
                 policy_id=policy_id, set_id=entry.set_id, oracle_head=current_head,
                 subject_identity=detector_identity,

@@ -287,7 +287,7 @@ class PolicyStore:
         job_id: str,
         nonce: str,
         expect_policy_head: str,
-        expect_authorized_subject: str,
+        expect_authorized_context: tuple[str, str, int],
     ) -> int:
         """3.5 job-1: append a RE_ATTESTATION record — an EVIDENCE refresh, NOT a state transition.
 
@@ -308,10 +308,13 @@ class PolicyStore:
 
         Capability + expectations (honest hierarchy — see ``_ReAttestGrant``): a ``_ReAttestGrant`` is
         required, which is a trusted-process CALL-PATH convention (accidental-misuse tripwire, NOT authz);
-        the load-bearing controls are the MANDATORY ``expect_policy_head`` + ``expect_authorized_subject``,
-        checked atomically against the chain under this lock — a concurrency + same-subject CONTINUITY
-        guarantee, so a re-attest can never land after a concurrent human DEMOTE or an authorized-target
-        change. Real authorization is an authenticated store boundary (deploy-tier)."""
+        the load-bearing controls are the MANDATORY ``expect_policy_head`` + ``expect_authorized_context``,
+        checked atomically against the chain under this lock — a concurrency + same-CONTEXT CONTINUITY
+        guarantee, so a re-attest can never land after a concurrent human DEMOTE or an authorized-context
+        change (subject OR set). ``expect_authorized_context`` is the WHOLE ``(set_id, subject, ICV)``
+        3-tuple (board refinement): pinning it atomically closes the same-subject/different-set rebind — a
+        measurement calibrated against set Y cannot re-attest a policy authorized against set X even when
+        the subject matches. Real authorization is an authenticated store boundary (deploy-tier)."""
         if not isinstance(grant, _ReAttestGrant):
             raise PrivilegedOperationError(
                 "re-attestation must be called through the RestoreController's grant (a "
@@ -335,14 +338,16 @@ class PolicyStore:
                     f"policy-evidence head for {policy_id} moved since the restore CAS read it "
                     f"(expected {expect_policy_head[:12]}..) — aborting re-attestation, will retry"
                 )
-            # v4 P1-b + v5-P1c: the AUTHORIZED-SUBJECT check is ATOMIC with the head CAS (same lock) and
-            # MANDATORY — else a concurrent governance change of the authorized target (A->B) between the
-            # restore's read and this append would let a re-attest for the stale subject land. Verify the
-            # policy's CURRENT authorized subject still equals what the restore controller verified against.
-            if self._current_authorized_subject_unlocked(policy_id) != expect_authorized_subject:
+            # v4 P1-b + v5-P1c + S3 restore-continuity: the AUTHORIZED-CONTEXT check is ATOMIC with the head
+            # CAS (same lock) and MANDATORY — else a concurrent governance change of the authorized target
+            # (subject A->B OR set X->Y) between the restore's read and this append would let a re-attest for
+            # the stale context land. The WHOLE (set_id, subject, ICV) 3-tuple is pinned as one unit (board
+            # refinement) so no caller can check part of the authorization context; a set rebind is caught
+            # here exactly as a subject rebind is.
+            if self._current_authorized_context_unlocked(policy_id) != expect_authorized_context:
                 raise ReAttestConflict(
-                    f"authorized subject for {policy_id} moved since the restore CAS read it "
-                    f"(expected {expect_authorized_subject!r}) — aborting re-attestation, will retry"
+                    f"authorized context for {policy_id} moved since the restore CAS read it "
+                    f"(expected {expect_authorized_context!r}) — aborting re-attestation, will retry"
                 )
             # S3 ckpt4-fix: a re-attest is CURRENT enforcement -> its ICV must equal the process contract
             # (old evidence is inadmissible now), and the persisted PASS must exist under that SAME ICV.
@@ -482,11 +487,14 @@ class PolicyStore:
             return None
         return (str(row["set_id"]), str(row["pinned_set_version"]), str(row["detector_identity"]))
 
-    def _current_authorized_subject_unlocked(self, policy_id: str) -> str | None:
-        """v4 P1-b: the subject identity the policy's CURRENT ENABLED calibration is bound to, read UNDER
-        THE LOCK (no verify_chain — the reattest CAS holds the lock and only needs the current binding).
-        None if the policy is not ENABLED or has no bound pass. Mirrors ``current_attestation``'s identity
-        column, used for the atomic authorized-subject check inside ``reattest``."""
+    def _current_authorized_context_unlocked(self, policy_id: str) -> tuple[str, str, int] | None:
+        """S3 restore-continuity: the FULL authorization context the policy's CURRENT ENABLED calibration
+        is bound to — ``(set_id, subject, identity_contract_version)`` — read UNDER THE LOCK (no
+        verify_chain; the reattest CAS holds the lock and needs only the current binding). None if the
+        policy is not ENABLED or has no bound pass under the current contract. This is the SINGLE atomic
+        snapshot the restore CAS pins (board refinement): a caller cannot check the subject while missing
+        the set (or vice versa) — the whole 3-tuple moves or none of it does. All values are the
+        TRANSITION-bound (hash-chained) coordinates, matched against the persisted pass."""
         row = self._conn().execute(
             "SELECT new_state, calibration_result_ref, set_id, pinned_set_version, detector_identity,"
             " identity_contract_version FROM tier_transition_chain WHERE policy_id=? "
@@ -495,8 +503,8 @@ class PolicyStore:
         if row is None or row["new_state"] != PolicyState.ENABLED.value:
             return None
         # S3 ckpt4-fix2b/2c: head must be the current contract, and the pass must exact-match ALL of the
-        # HASH-CHAINED record's coordinates (INCLUDING set_id — ckpt4-fix2c); the returned authorized subject
-        # is the TRANSITION-bound one.
+        # HASH-CHAINED record's coordinates (INCLUDING set_id); the returned context is the TRANSITION-bound
+        # (set_id, subject, ICV).
         if row["identity_contract_version"] != IDENTITY_CONTRACT_VERSION:
             return None
         if not self._pass_exists_unlocked(
@@ -504,7 +512,16 @@ class PolicyStore:
             str(row["pinned_set_version"]), str(row["detector_identity"]), IDENTITY_CONTRACT_VERSION,
         ):
             return None
-        return str(row["detector_identity"])
+        return (str(row["set_id"]), str(row["detector_identity"]), int(row["identity_contract_version"]))
+
+    def current_authorized_context(self, policy_id: str) -> tuple[str, str, int] | None:
+        """S3 restore-continuity: the locked, chain-verified read of the authorization context
+        ``(set_id, subject, identity_contract_version)`` — what the RestoreController reads ONCE to derive
+        every CAS input from a single snapshot (no read-then-read TOCTOU between set and subject). Fails
+        CLOSED on a broken chain. ``reattest`` re-checks the SAME 3-tuple atomically under the store lock."""
+        if not self.verify_chain():
+            raise ChainIntegrityError("tier-transition chain failed verification — refusing to read")
+        return self._current_authorized_context_unlocked(policy_id)
 
     def pass_binding(
         self, calibration_result_ref: str, policy_id: str, pinned_set_version: str,

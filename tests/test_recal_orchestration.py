@@ -81,7 +81,7 @@ def _cal() -> CalibrationStore:
 
 
 def _make_att(c: CalibrationStore, verdicts: list[Verdict], *, nonce: str = "n1",  # type: ignore[no-untyped-def]
-              requested: str | None = None):
+              requested: str | None = None, tier_gen: str = "tg"):
     # detectors arrive by NAME through a trusted registry via the ATOMIC bundle (P1-3 v3); the SIGNED
     # subject is measurement-derived. The requested target defaults to the policy's authorized subject.
     det = _ScriptedDetector(verdicts)
@@ -91,7 +91,7 @@ def _make_att(c: CalibrationStore, verdicts: list[Verdict], *, nonce: str = "n1"
         policy_id="p1", set_id="X", calibration_store=c, make_sandbox=lambda: _HermeticNoOp(),
         detector_id="d", resolve=reg.resolve_bundle,
         requested_subject_identity=(requested if requested is not None else _DET),
-        tier_generation="tg", budget=_BUDGET, issuer=_ISSUER,
+        tier_generation=tier_gen, budget=_BUDGET, issuer=_ISSUER,
         nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3, backend_guard=test_guard_policy, trust_policy=_REF_TP)
 
 
@@ -193,8 +193,8 @@ class RelayTests(unittest.TestCase):
 
 
 class FullLoopTests(unittest.TestCase):
-    def _run(self, c: CalibrationStore, verdicts: list[Verdict]):  # type: ignore[no-untyped-def]
-        return _make_att(c, verdicts)
+    def _run(self, c: CalibrationStore, verdicts: list[Verdict], *, tier_gen: str = "tg"):  # type: ignore[no-untyped-def]
+        return _make_att(c, verdicts, tier_gen=tier_gen)
 
     def test_proactive_trigger_to_restore_end_to_end(self) -> None:
         c = _cal()
@@ -219,7 +219,10 @@ class FullLoopTests(unittest.TestCase):
         relay_outbox(calibration_store=c, policy_store=s, queue=q, now=10.0)
         job = q.lease(lease_token="w1", visibility_timeout=60.0, now=20.0)
         assert job is not None
-        att = self._run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3)  # catches b1+b2, passes g1
+        # thread the JOB's tier_generation (the relay set it to p1's policy_head) into the measurement —
+        # exactly as run_recalibration does — so the signed generation matches at restore (S3 continuity).
+        att = self._run(c, [_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3,  # catches b1+b2, passes g1
+                        tier_gen=job.tier_generation)
         att_store = MeasurementAttestationStore(Path(tempfile.mkdtemp(prefix="mv-orch-att-")) / "a.db")
         outcome = RestoreController(
             ReAttestCapability(s), issuer_public_keys={_ISSUER: _PUB}, oracle_head_for=ohf,
@@ -265,12 +268,12 @@ class ZombieMetricTests(unittest.TestCase):
         # re-attest p1 back to the current head, and mark the job done.
         s.record_calibration_pass("cal-1", policy_id="p1", pinned_set_version=c.set_head("X"),
                                   detector_identity=_DET, set_id="X", identity_contract_version=1)
-        _att = s.current_attestation("p1")
-        assert _att is not None
+        _ctx = s.current_authorized_context("p1")
+        assert _ctx is not None
         s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-1", set_id="X",
                    pinned_set_version=c.set_head("X"),
                    detector_identity=_DET, job_id="j", nonce="n",
-                   expect_policy_head=s.policy_head("p1"), expect_authorized_subject=_att[2], identity_contract_version=1)
+                   expect_policy_head=s.policy_head("p1"), expect_authorized_context=_ctx, identity_contract_version=1)
         job = q.lease(lease_token="w1", visibility_timeout=60.0, now=0.0)
         assert job is not None
         q.complete(job.job_id, lease_token="w1", now=1.0)

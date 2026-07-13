@@ -56,11 +56,10 @@ def _reattest(s: PolicyStore, pid: str, *, ref: str, psv: str, det: str,
     """reattest filling the now-MANDATORY CAS expectations from the store's CURRENT state (the
     non-racing happy path a direct caller uses). Stale-expectation negatives call ``s.reattest``
     directly with a deliberately wrong expectation."""
-    att = s.current_attestation(pid)
-    subj = att[2] if att is not None else "unused"  # unreached: a not-ENABLED policy fails earlier
+    ctx = s.current_authorized_context(pid) or ("X", det, 1)  # fallback unreached: not-ENABLED fails earlier
     return s.reattest(pid, grant=_GRANT, calibration_result_ref=ref, set_id=set_id,
                       pinned_set_version=psv, detector_identity=det, job_id=job, nonce=nonce,
-                      expect_policy_head=s.policy_head(pid), expect_authorized_subject=subj, identity_contract_version=1)
+                      expect_policy_head=s.policy_head(pid), expect_authorized_context=ctx, identity_contract_version=1)
 
 
 class ReAttestPrimitiveTests(unittest.TestCase):
@@ -171,7 +170,8 @@ class ReAttestMandatoryExpectationTests(unittest.TestCase):
                        pinned_set_version="v2",
                        detector_identity="det-1", job_id="j", nonce="n",
                        expect_policy_head="STALE-head-that-never-matches",
-                       expect_authorized_subject=att[2], identity_contract_version=1)
+                       expect_authorized_context=s.current_authorized_context("p1"),
+                       identity_contract_version=1)
 
     def test_stale_authorized_subject_aborts(self) -> None:
         s = self._ready()
@@ -180,7 +180,7 @@ class ReAttestMandatoryExpectationTests(unittest.TestCase):
                        pinned_set_version="v2",
                        detector_identity="det-1", job_id="j", nonce="n",
                        expect_policy_head=s.policy_head("p1"),
-                       expect_authorized_subject="a-DIFFERENT-authorized-subject", identity_contract_version=1)
+                       expect_authorized_context=("X", "a-DIFFERENT-subject", 1), identity_contract_version=1)
 
 
 class ChainPassLinkageTests(unittest.TestCase):
