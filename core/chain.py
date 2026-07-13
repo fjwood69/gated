@@ -84,18 +84,31 @@ def _normalise_canonical(value: object, path: str = "$") -> Any:
     raise NonCanonicalValueError(f"{path}: unsupported type {type(value).__name__} for canonical digest")
 
 
-def canonical_digest(domain: str, payload: Mapping[str, Any], *, version: int = CANONICAL_DIGEST_VERSION) -> str:
-    """A CANONICAL + DETERMINISTIC identity digest (3.5-close) — domain-separated + versioned, with the
-    payload schema-validated + NFC-normalised BEFORE hashing. NOT "non-malleable" (a digest is only as
-    strong as the schema it validates); it is *canonical and deterministic*: reordered maps hash
-    identically, ``None`` differs from an absent key, floats are rejected, and NFC/NFD forms coincide.
-    DISTINCT from ``content_digest`` (the FROZEN ledger wire format): this binder may version
-    independently. Domain separation means a profile digest can never be confused with an envelope or a
-    trust-policy digest (each passes a distinct ``domain``)."""
+def canonical_bytes(domain: str, payload: Mapping[str, Any], *, version: int = CANONICAL_DIGEST_VERSION) -> bytes:
+    """The public, versioned CANONICAL BYTE ENCODING (``gated.canonical.v1``) that underlies every 3.5-close
+    identity/receipt digest. Extracted VERBATIM from ``canonical_digest`` (behaviour-preserving, A2a): the
+    payload is schema-validated + NFC-normalised, wrapped in a ``{domain, version, payload}`` envelope, and
+    serialised with FROZEN JSON settings (``sort_keys`` + compact separators + ``ensure_ascii=False`` +
+    utf-8). Exposing the BYTES (not only their hash) lets ``canonical_digest`` be defined as
+    ``sha256(canonical_bytes(...))`` and lets a companion repo pin the exact byte vectors (cross-repo
+    contract). Rejects the SAME non-canonical inputs (floats, non-str keys, unknown types) at the SAME
+    point via ``_normalise_canonical`` — so error timing/types are unchanged. Do NOT alter the JSON settings
+    or the envelope shape without a version bump: the bytes ARE the contract."""
     normalised = _normalise_canonical(dict(payload))
     envelope = {"domain": domain, "version": version, "payload": normalised}
-    canonical = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def canonical_digest(domain: str, payload: Mapping[str, Any], *, version: int = CANONICAL_DIGEST_VERSION) -> str:
+    """A CANONICAL + DETERMINISTIC identity digest (3.5-close) = ``sha256(canonical_bytes(...))`` —
+    domain-separated + versioned, with the payload schema-validated + NFC-normalised BEFORE hashing. NOT
+    "non-malleable" (a digest is only as strong as the schema it validates); it is *canonical and
+    deterministic*: reordered maps hash identically, ``None`` differs from an absent key, floats are
+    rejected, and NFC/NFD forms coincide. DISTINCT from ``content_digest`` (the FROZEN ledger wire format):
+    this binder may version independently. Domain separation means a profile digest can never be confused
+    with an envelope or a trust-policy digest (each passes a distinct ``domain``). A2a: this is now a thin
+    wrapper over ``canonical_bytes`` — byte-for-byte identical output to before the extraction."""
+    return hashlib.sha256(canonical_bytes(domain, payload, version=version)).hexdigest()
 
 
 __all__ = [
@@ -104,6 +117,7 @@ __all__ = [
     "GENESIS_HASH",
     "content_digest",
     "chain_hash",
+    "canonical_bytes",
     "canonical_digest",
     "NonCanonicalValueError",
 ]
