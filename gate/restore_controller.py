@@ -80,11 +80,12 @@ class ReAttestCapability:
             identity_contract_version=identity_contract_version, set_id=set_id)
 
     def reattest(self, policy_id: str, *, calibration_result_ref: str, pinned_set_version: str,
-                 detector_identity: str, job_id: str, nonce: str, expect_policy_head: str,
-                 expect_authorized_subject: str) -> int:
+                 detector_identity: str, identity_contract_version: int, job_id: str, nonce: str,
+                 expect_policy_head: str, expect_authorized_subject: str) -> int:
         return self._store.reattest(
             policy_id, grant=_REATTEST_GRANT, calibration_result_ref=calibration_result_ref,
             pinned_set_version=pinned_set_version, detector_identity=detector_identity,
+            identity_contract_version=identity_contract_version,
             job_id=job_id, nonce=nonce, expect_policy_head=expect_policy_head,
             expect_authorized_subject=expect_authorized_subject)
 
@@ -215,7 +216,9 @@ class RestoreController:
             try:
                 seq = self._cap.reattest(
                     att.policy_id, calibration_result_ref=ref, pinned_set_version=att.oracle_head,
-                    detector_identity=att.subject_identity, job_id=att.run_id, nonce=att.nonce,
+                    detector_identity=att.subject_identity,
+                    identity_contract_version=att.identity_contract_version,
+                    job_id=att.run_id, nonce=att.nonce,
                     expect_policy_head=policy_head,
                     # v4 P1-b: bind the authorized-subject check ATOMICALLY with the head CAS. If governance
                     # moved the authorized target since we read it, reattest raises ReAttestConflict -> the

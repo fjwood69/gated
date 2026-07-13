@@ -37,9 +37,10 @@ CREATE TABLE IF NOT EXISTS measurement_attestation (
 
 
 def _strict_int(v: object) -> int:
-    """v4 P2: an int field must be an actual ``int`` — not a ``bool`` (int subclass), string, or float."""
+    """v4 P2: an int field must be an actual ``int`` — not a ``bool`` (int subclass), string, float, or
+    absent (``None``, from a ``.get`` on a missing key -> a normalised schema error, not a raw KeyError)."""
     if type(v) is not int:
-        raise AttestationError(f"stored integer field must be an int, got {type(v).__name__}")
+        raise MeasurementSchemaError(f"stored integer field must be an int, got {type(v).__name__}")
     return v
 
 
@@ -49,9 +50,9 @@ def _reconstruct(payload: dict[str, object], signature: str) -> MeasurementAttes
     interpreted (fail-closed migration boundary; no defaulting of a missing identity coordinate). The four
     ``runtime_subject`` coordinates are read from the nested block and may be null (an unattestable ERROR);
     ``issued_at`` is recovered from the signed ``issued_at_ms`` (the envelope is float-free)."""
-    schema = str(payload.get("schema", ""))
+    schema = payload.get("schema")  # compare directly — no str()-coercion of an alternate repr
     if schema != MEASUREMENT_ATTESTATION_SCHEMA:
-        raise AttestationError(
+        raise MeasurementSchemaError(
             f"stored attestation has unsupported schema {schema!r} — only "
             f"{MEASUREMENT_ATTESTATION_SCHEMA!r} is reconstructable")
     icv = payload.get("identity_contract_version")
@@ -104,7 +105,7 @@ def _reconstruct(payload: dict[str, object], signature: str) -> MeasurementAttes
         oracle_head=_req(context, "oracle_head"), coverage_digest=_req(context, "coverage_digest"),
         tier_generation=_req(context, "tier_generation"), issuer=_req(payload, "issuer"),
         run_id=_req(payload, "run_id"), nonce=_req(payload, "nonce"),
-        issued_at_ms=_strict_int(payload["issued_at_ms"]),
+        issued_at_ms=_strict_int(payload.get("issued_at_ms")),  # .get -> missing => strict-int rejects, no KeyError
         fixture_coverage=_req_tuple("fixture_coverage"),
         short_circuit=sc,
         fn_failures=_req_tuple("fn_failures"),

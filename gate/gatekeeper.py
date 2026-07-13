@@ -329,7 +329,7 @@ def ratify_enable(
     return store.transition(
         policy_id, PolicyState.ENABLED, approval=approval,
         calibration_result_ref=calibration_result_ref, pinned_set_version=pinned_set_version,
-        detector_identity=subject,
+        detector_identity=subject, identity_contract_version=IDENTITY_CONTRACT_VERSION,
     )
 
 

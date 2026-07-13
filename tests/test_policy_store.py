@@ -41,7 +41,7 @@ def _enable(store: PolicyStore, pid: str, *, detector: str = "det-1") -> None:
                                   detector_identity=detector, identity_contract_version=1)
     store.transition(pid, PolicyState.ENABLED, approval=_appr("gov1", op=f"{pid}-3"),
                      calibration_result_ref="cal-1", pinned_set_version="fx-head",
-                     detector_identity=detector)
+                     detector_identity=detector, identity_contract_version=1)
 
 
 class EnablePathTests(unittest.TestCase):
@@ -55,7 +55,7 @@ class EnablePathTests(unittest.TestCase):
         s = _store()
         with self.assertRaises(IllegalTransitionError):
             s.transition("p1", PolicyState.ENABLED, approval=_appr("gov1", op="x"),
-                         calibration_result_ref="c", pinned_set_version="v", detector_identity="d")
+                         calibration_result_ref="c", pinned_set_version="v", detector_identity="d", identity_contract_version=1)
 
     def test_enabled_requires_anchors(self) -> None:
         s = _store()
@@ -82,14 +82,14 @@ class EnablePathTests(unittest.TestCase):
         with self.assertRaises(PrivilegedOperationError):
             s.transition("p1", PolicyState.ENABLED, approval=_appr("gov1", op="3"),
                          calibration_result_ref="fabricated", pinned_set_version="fx-head",
-                         detector_identity="det-1")
+                         detector_identity="det-1", identity_contract_version=1)
         # a pass for a DIFFERENT detector does not satisfy it either (identity must match).
         s.record_calibration_pass("real", policy_id="p1", pinned_set_version="fx-head",
                                   detector_identity="det-OTHER", identity_contract_version=1)
         with self.assertRaises(PrivilegedOperationError):
             s.transition("p1", PolicyState.ENABLED, approval=_appr("gov1", op="3b"),
                          calibration_result_ref="real", pinned_set_version="fx-head",
-                         detector_identity="det-1")
+                         detector_identity="det-1", identity_contract_version=1)
 
 
 class RealDualControlTests(unittest.TestCase):

@@ -242,6 +242,21 @@ conditional presence → composite recompute → governance/current-state match.
 BEFORE any field is interpreted, so an old/unknown record is refused before a missing coordinate could be
 defaulted. Old vectors are refused at that guard (rejection-test fixtures, never a live basis).
 
+**Store read validation strategy (do not "simplify" it):** `MeasurementAttestationStore.get()` validates via
+STRICT deserialisation (`_reconstruct` — schema→ICV guard first, then exact types, NO coercion) + the
+`attestation_ref` recompute + a raw-vs-canonical byte comparison. It does NOT call `verify_measurement`
+(wire-types + signature + composite): the ref-recompute catches any tamper that changes the canonical bytes,
+and strict `_reconstruct` catches type corruption — the two layers complement each other. `verify_measurement`
+is applied at SIGN time and at RESTORE time, not at store-read time. (Documented so a future change does not
+remove the ref-recompute as "redundant" on the assumption `get()` already verifies.)
+
+**Tamper-evidence:** the `identity_contract_version` is bound into BOTH the signed measurement (the four-tuple
+subject's domain prefix + an explicit field) AND the `tier_transition_chain` record hash (`_digest_fields`).
+`verify_chain` replays each ENABLED / re-attest record against its OWN recorded ICV (historical integrity — a
+valid record from a superseded contract stays verifiable); CURRENT enablement / re-attestation separately
+require the ICV to equal the process contract (old evidence inadmissible now). The `calibration_pass` also
+carries the ICV and the read paths exact-match the current one.
+
 **PARTIAL v3 bump — NOT closed (S3-completion dependencies):**
 - **Live-gatekeeper 4-tuple enforcement is UNWIRED.** `pipeline` / `live_app` do not yet match a running
   detector's measured 4-tuple against the attested subject. A post-hoc match alone does not satisfy the

@@ -43,7 +43,7 @@ def _enable(s: PolicyStore, pid: str = "p1", *, det: str = "det-1", head: str = 
     s.record_calibration_pass(ref, policy_id=pid, pinned_set_version=head, detector_identity=det,
                               set_id=set_id, identity_contract_version=1)
     s.transition(pid, PolicyState.ENABLED, approval=_appr("g1", op=f"{pid}-{head}-3"),
-                 calibration_result_ref=ref, pinned_set_version=head, detector_identity=det)
+                 calibration_result_ref=ref, pinned_set_version=head, detector_identity=det, identity_contract_version=1)
     return ref
 
 
@@ -59,7 +59,7 @@ def _reattest(s: PolicyStore, pid: str, *, ref: str, psv: str, det: str,
     subj = att[2] if att is not None else "unused"  # unreached: a not-ENABLED policy fails earlier
     return s.reattest(pid, grant=_GRANT, calibration_result_ref=ref, pinned_set_version=psv,
                       detector_identity=det, job_id=job, nonce=nonce,
-                      expect_policy_head=s.policy_head(pid), expect_authorized_subject=subj)
+                      expect_policy_head=s.policy_head(pid), expect_authorized_subject=subj, identity_contract_version=1)
 
 
 class ReAttestPrimitiveTests(unittest.TestCase):
@@ -104,7 +104,7 @@ class ReAttestPrimitiveTests(unittest.TestCase):
         with self.assertRaises(IllegalTransitionError):
             s.transition("p1", PolicyState.ENABLED, approval=_appr("g1", "g2", op="sneak"),
                          calibration_result_ref="cal-p1-v1", pinned_set_version="v1",
-                         detector_identity="det-1")
+                         detector_identity="det-1", identity_contract_version=1)
 
     def test_reattest_requires_enabled(self) -> None:
         s = _store()
@@ -159,7 +159,7 @@ class ReAttestMandatoryExpectationTests(unittest.TestCase):
         # mandatory keyword args now); the None opt-out that let a caller skip the CAS is gone.
         with self.assertRaises(TypeError):
             s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2",  # type: ignore[call-arg]
-                       pinned_set_version="v2", detector_identity="det-1", job_id="j", nonce="n")
+                       pinned_set_version="v2", detector_identity="det-1", job_id="j", nonce="n", identity_contract_version=1)
 
     def test_stale_policy_head_aborts(self) -> None:
         s = self._ready()
@@ -169,7 +169,7 @@ class ReAttestMandatoryExpectationTests(unittest.TestCase):
             s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", pinned_set_version="v2",
                        detector_identity="det-1", job_id="j", nonce="n",
                        expect_policy_head="STALE-head-that-never-matches",
-                       expect_authorized_subject=att[2])
+                       expect_authorized_subject=att[2], identity_contract_version=1)
 
     def test_stale_authorized_subject_aborts(self) -> None:
         s = self._ready()
@@ -177,7 +177,7 @@ class ReAttestMandatoryExpectationTests(unittest.TestCase):
             s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", pinned_set_version="v2",
                        detector_identity="det-1", job_id="j", nonce="n",
                        expect_policy_head=s.policy_head("p1"),
-                       expect_authorized_subject="a-DIFFERENT-authorized-subject")
+                       expect_authorized_subject="a-DIFFERENT-authorized-subject", identity_contract_version=1)
 
 
 class ReAttestChainReplayGuardTests(unittest.TestCase):
@@ -191,19 +191,32 @@ class ReAttestChainReplayGuardTests(unittest.TestCase):
         fields = {
             "policy_id": pid, "prior_state": PolicyState.ENABLED.value,
             "new_state": PolicyState.ENABLED.value, "calibration_result_ref": ref,
-            "pinned_set_version": head, "detector_identity": det, "principals": "[]",
+            "pinned_set_version": head, "detector_identity": det,
+            "identity_contract_version": 1, "principals": "[]",
             "purpose": "re-attestation", "rationale": job, "operation_id": nonce,
             "added_at": 1234.0,
         }
         rec = chain_hash(prev, _digest_fields(fields))
         s._conn().execute(
             "INSERT INTO tier_transition_chain (policy_id, prior_state, new_state,"
-            " calibration_result_ref, pinned_set_version, detector_identity, principals, purpose,"
-            " rationale, operation_id, added_at, prev_hash, record_hash)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (pid, PolicyState.ENABLED.value, PolicyState.ENABLED.value, ref, head, det, "[]",
+            " calibration_result_ref, pinned_set_version, detector_identity, identity_contract_version,"
+            " principals, purpose, rationale, operation_id, added_at, prev_hash, record_hash)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (pid, PolicyState.ENABLED.value, PolicyState.ENABLED.value, ref, head, det, 1, "[]",
              "re-attestation", job, nonce, 1234.0, prev, rec),
         )
+
+    def test_tampering_chain_identity_contract_version_breaks_verify(self) -> None:
+        # S3 ckpt4-fix: identity_contract_version is IN the record hash (tamper-evident). Altering it on a
+        # stored ENABLED record must break verify_chain — the ICV can no longer be silently changed without
+        # detection (the earlier gap: ICV lived only on the unchained calibration_pass).
+        s = _store()
+        _enable(s, head="v1")
+        self.assertTrue(s.verify_chain())
+        s._conn().execute(
+            "UPDATE tier_transition_chain SET identity_contract_version=99 "
+            "WHERE new_state=? AND policy_id=?", (PolicyState.ENABLED.value, "p1"))
+        self.assertFalse(s.verify_chain())  # the hash covers ICV -> the edit is detected
 
     def test_hash_valid_reattest_with_unresolvable_ref_fails_verify(self) -> None:
         s = _store()

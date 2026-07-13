@@ -12,8 +12,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from core.chain import canonical_digest
 from gate.attestation import AttestationError, MeasurementSchemaError
 from gate.attestation_store import MeasurementAttestationStore
+from gate.signing import SeedSigner
+
+_ATTESTATION_DOMAIN = "gated.measurement-attestation"  # the same domain the store signs/reconstructs under
+_SEED = bytes(range(32))
 
 
 def _store() -> MeasurementAttestationStore:
@@ -56,8 +61,12 @@ class StoreDeserialisationBoundaryTests(unittest.TestCase):
             "fixture_coverage": ["b1"], "short_circuit": False,
             "fn_failures": [], "fp_failures": [], "flaky": [], "harness_errors": [],
         }
-        _raw_insert(s, "v2ref", json.dumps(v2_envelope, sort_keys=True, separators=(",", ":")), "00")
-        with self.assertRaises(AttestationError):  # refused at the schema version guard
+        # a REAL Ed25519 signature over the v2 canonical envelope — a formerly-VALID signed record, not a
+        # synthetic one. It is still refused at the schema guard, which fires BEFORE the signature is checked.
+        sig = SeedSigner(_SEED).sign(
+            canonical_digest(_ATTESTATION_DOMAIN, v2_envelope).encode("utf-8")).hex()
+        _raw_insert(s, "v2ref", json.dumps(v2_envelope, sort_keys=True, separators=(",", ":")), sig)
+        with self.assertRaises(MeasurementSchemaError):  # refused at the schema version guard, before sig
             s.get("v2ref")
 
     def test_unknown_icv_record_is_refused_before_field_parsing(self) -> None:

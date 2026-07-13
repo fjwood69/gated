@@ -187,8 +187,10 @@ class MeasurementAttestation:
             and self.outcome is VerdictType.PASS
             and self.short_circuit is False
             and len(self.fixture_coverage) > 0
-            and all(getattr(self, f) is not None for f in RUNTIME_SUBJECT_FIELDS)
-            and self.subject_identity is not None
+            # truthiness — an empty-string coordinate does NOT make a clean pass (matches the wire-type +
+            # conditional-validity rejection; keeps the property honest on an UNVERIFIED object too).
+            and all(getattr(self, f) for f in RUNTIME_SUBJECT_FIELDS)
+            and bool(self.subject_identity)
         )
 
 

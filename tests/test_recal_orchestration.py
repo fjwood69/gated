@@ -112,7 +112,7 @@ def _pol(head: str) -> PolicyStore:
     s.record_calibration_pass("cal-0", policy_id="p1", pinned_set_version=head,
                               detector_identity=_DET, set_id="X", identity_contract_version=1)
     s.transition("p1", PolicyState.ENABLED, approval=_appr("g1", op="c"),
-                 calibration_result_ref="cal-0", pinned_set_version=head, detector_identity=_DET)
+                 calibration_result_ref="cal-0", pinned_set_version=head, detector_identity=_DET, identity_contract_version=1)
     return s
 
 
@@ -268,7 +268,7 @@ class ZombieMetricTests(unittest.TestCase):
         assert _att is not None
         s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-1", pinned_set_version=c.set_head("X"),
                    detector_identity=_DET, job_id="j", nonce="n",
-                   expect_policy_head=s.policy_head("p1"), expect_authorized_subject=_att[2])
+                   expect_policy_head=s.policy_head("p1"), expect_authorized_subject=_att[2], identity_contract_version=1)
         job = q.lease(lease_token="w1", visibility_timeout=60.0, now=0.0)
         assert job is not None
         q.complete(job.job_id, lease_token="w1", now=1.0)

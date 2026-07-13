@@ -106,6 +106,11 @@ CREATE TABLE IF NOT EXISTS tier_transition_chain (
     calibration_result_ref TEXT,               -- REQUIRED for -> ENABLED (addition #3)
     pinned_set_version     TEXT,               -- REQUIRED for -> ENABLED: the CalibrationSet head
     detector_identity      TEXT,               -- REQUIRED for -> ENABLED: which detector was calibrated
+    identity_contract_version INTEGER,         -- S3 ckpt4-fix: the ICV the subject was composed under, IN
+                                               -- the hash (tamper-evident). REQUIRED for ->ENABLED / re-attest;
+                                               -- verify_chain replays each record against ITS OWN recorded ICV
+                                               -- (historical integrity); CURRENT enforcement requires it to
+                                               -- equal the process ICV (old evidence inadmissible now).
     principals             TEXT NOT NULL,      -- json: sorted distinct governance principal ids
     purpose                TEXT NOT NULL,
     rationale              TEXT NOT NULL,
@@ -140,7 +145,9 @@ def _digest_fields(row: Mapping[str, object]) -> str:
             "policy_id": row["policy_id"], "prior_state": row["prior_state"],
             "new_state": row["new_state"], "calibration_result_ref": row["calibration_result_ref"],
             "pinned_set_version": row["pinned_set_version"],
-            "detector_identity": row["detector_identity"], "principals": row["principals"],
+            "detector_identity": row["detector_identity"],
+            "identity_contract_version": row["identity_contract_version"],
+            "principals": row["principals"],
             "purpose": row["purpose"], "rationale": row["rationale"],
             "operation_id": row["operation_id"], "added_at": row["added_at"],
         }
@@ -181,6 +188,7 @@ class PolicyStore:
         calibration_result_ref: str | None = None,
         pinned_set_version: str | None = None,
         detector_identity: str | None = None,
+        identity_contract_version: int | None = None,
     ) -> int:
         """Append a tier transition, hash-chained. Guarded three ways:
           * the (current -> new_state) edge must be legal (else IllegalTransitionError);
@@ -208,17 +216,26 @@ class PolicyStore:
                         ("calibration_result_ref", calibration_result_ref),
                         ("pinned_set_version", pinned_set_version),
                         ("detector_identity", detector_identity),
+                        ("identity_contract_version", identity_contract_version),
                     ) if not v
                 ]
                 if missing:
                     raise PrivilegedOperationError(
                         f"enablement requires non-null {missing} — no un-anchored ENABLED grant"
                     )
+                # S3 ckpt4-fix: current enablement requires the ICV to equal the process contract — old
+                # evidence is inadmissible NOW (a pass composed under a superseded contract cannot enable).
+                if identity_contract_version != IDENTITY_CONTRACT_VERSION:
+                    raise PrivilegedOperationError(
+                        f"enablement identity_contract_version {identity_contract_version} != current "
+                        f"{IDENTITY_CONTRACT_VERSION} — a pass from another identity contract cannot enable"
+                    )
                 # gap-1: the anchors must reference a PERSISTED PASS — a non-null but FABRICATED
-                # reference cannot enable. Bind mechanically to a recorded, matching calibration_pass.
+                # reference cannot enable. Bind mechanically to a recorded, matching calibration_pass (under
+                # the SAME ICV — the pass and the transition record agree on the identity contract).
                 if not self._pass_exists_unlocked(
                     str(calibration_result_ref), policy_id, str(pinned_set_version),
-                    str(detector_identity),
+                    str(detector_identity), int(identity_contract_version),
                 ):
                     raise PrivilegedOperationError(
                         f"no recorded passing calibration matches ref={calibration_result_ref!r} for "
@@ -234,6 +251,7 @@ class PolicyStore:
                 "calibration_result_ref": calibration_result_ref,
                 "pinned_set_version": pinned_set_version,
                 "detector_identity": detector_identity,
+                "identity_contract_version": identity_contract_version,
                 "principals": principals_json, "purpose": approval.purpose,
                 "rationale": approval.rationale, "operation_id": approval.operation_id,
                 "added_at": self._clock(),
@@ -242,11 +260,11 @@ class PolicyStore:
             cur = self._conn().execute(
                 "INSERT INTO tier_transition_chain "
                 "(policy_id, prior_state, new_state, calibration_result_ref, pinned_set_version,"
-                " detector_identity, principals, purpose, rationale, operation_id, added_at,"
-                " prev_hash, record_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " detector_identity, identity_contract_version, principals, purpose, rationale,"
+                " operation_id, added_at, prev_hash, record_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (policy_id, fields["prior_state"], new_state.value, calibration_result_ref,
-                 pinned_set_version, detector_identity, principals_json, approval.purpose,
-                 approval.rationale, approval.operation_id, fields["added_at"], prev_hash,
+                 pinned_set_version, detector_identity, identity_contract_version, principals_json,
+                 approval.purpose, approval.rationale, approval.operation_id, fields["added_at"], prev_hash,
                  record_hash),
             )
             return int(cur.lastrowid or 0)
@@ -259,6 +277,7 @@ class PolicyStore:
         calibration_result_ref: str,
         pinned_set_version: str,
         detector_identity: str,
+        identity_contract_version: int,
         job_id: str,
         nonce: str,
         expect_policy_head: str,
@@ -319,8 +338,16 @@ class PolicyStore:
                     f"authorized subject for {policy_id} moved since the restore CAS read it "
                     f"(expected {expect_authorized_subject!r}) — aborting re-attestation, will retry"
                 )
+            # S3 ckpt4-fix: a re-attest is CURRENT enforcement -> its ICV must equal the process contract
+            # (old evidence is inadmissible now), and the persisted PASS must exist under that SAME ICV.
+            if identity_contract_version != IDENTITY_CONTRACT_VERSION:
+                raise PrivilegedOperationError(
+                    f"re-attestation identity_contract_version {identity_contract_version} != current "
+                    f"{IDENTITY_CONTRACT_VERSION} — a pass from another identity contract cannot re-attest"
+                )
             if not self._pass_exists_unlocked(
-                calibration_result_ref, policy_id, pinned_set_version, detector_identity
+                calibration_result_ref, policy_id, pinned_set_version, detector_identity,
+                identity_contract_version,
             ):
                 raise PrivilegedOperationError(
                     f"no recorded passing calibration matches ref={calibration_result_ref!r} for "
@@ -333,6 +360,7 @@ class PolicyStore:
                 "new_state": PolicyState.ENABLED.value,
                 "calibration_result_ref": calibration_result_ref,
                 "pinned_set_version": pinned_set_version, "detector_identity": detector_identity,
+                "identity_contract_version": identity_contract_version,
                 "principals": "[]", "purpose": "re-attestation", "rationale": job_id,
                 "operation_id": nonce, "added_at": self._clock(),
             }
@@ -340,10 +368,11 @@ class PolicyStore:
             cur = self._conn().execute(
                 "INSERT INTO tier_transition_chain "
                 "(policy_id, prior_state, new_state, calibration_result_ref, pinned_set_version,"
-                " detector_identity, principals, purpose, rationale, operation_id, added_at,"
-                " prev_hash, record_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " detector_identity, identity_contract_version, principals, purpose, rationale,"
+                " operation_id, added_at, prev_hash, record_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (policy_id, PolicyState.ENABLED.value, PolicyState.ENABLED.value,
-                 calibration_result_ref, pinned_set_version, detector_identity, "[]",
+                 calibration_result_ref, pinned_set_version, detector_identity,
+                 identity_contract_version, "[]",
                  "re-attestation", job_id, nonce, fields["added_at"], prev_hash, record_hash),
             )
             return int(cur.lastrowid or 0)
@@ -457,13 +486,17 @@ class PolicyStore:
 
     def _pass_exists_unlocked(
         self, calibration_result_ref: str, policy_id: str, pinned_set_version: str,
-        detector_identity: str,
+        detector_identity: str, identity_contract_version: int,
     ) -> bool:
+        """Does a persisted PASS match ALL of (ref, policy, set-version, subject, ICV)? The ICV is a
+        PARAMETER (not the process constant) so the CALLER decides which contract to check against: write
+        paths (enable/reattest) pass the CURRENT ICV; ``verify_chain`` replay passes each record's OWN
+        recorded ICV (historical integrity — a valid old record is not misread as corruption)."""
         row = self._conn().execute(
             "SELECT 1 FROM calibration_pass WHERE calibration_result_ref=? AND policy_id=? "
             "AND pinned_set_version=? AND detector_identity=? AND identity_contract_version=? LIMIT 1",
             (calibration_result_ref, policy_id, pinned_set_version, detector_identity,
-             IDENTITY_CONTRACT_VERSION),
+             identity_contract_version),
         ).fetchone()
         return row is not None
 
@@ -504,7 +537,9 @@ class PolicyStore:
                 "new_state": row["new_state"],
                 "calibration_result_ref": row["calibration_result_ref"],
                 "pinned_set_version": row["pinned_set_version"],
-                "detector_identity": row["detector_identity"], "principals": row["principals"],
+                "detector_identity": row["detector_identity"],
+                "identity_contract_version": row["identity_contract_version"],
+                "principals": row["principals"],
                 "purpose": row["purpose"], "rationale": row["rationale"],
                 "operation_id": row["operation_id"], "added_at": row["added_at"],
             }
@@ -524,9 +559,14 @@ class PolicyStore:
                 # (board): the referenced calibration_pass must still match the record's own
                 # pinned_set_version + detector_identity, so a replayed/forged re-attest pointing at a
                 # stale or mismatched pass is rejected. State is unchanged.
-                if not self._pass_exists_unlocked(
+                # S3 ckpt4-fix: replay the pass-existence against THIS record's OWN recorded ICV (historical
+                # integrity) — NOT the process constant. A valid record from a superseded identity contract
+                # must remain verifiable history (it just cannot enable/re-attest NOW, which the write-path
+                # current-ICV guard enforces separately).
+                rec_icv = row["identity_contract_version"]
+                if type(rec_icv) is not int or not self._pass_exists_unlocked(
                     str(row["calibration_result_ref"]), pid, str(row["pinned_set_version"]),
-                    str(row["detector_identity"]),
+                    str(row["detector_identity"]), rec_icv,
                 ):
                     return False
                 # last_state[pid] stays ENABLED (no state change).
