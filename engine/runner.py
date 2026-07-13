@@ -46,6 +46,7 @@ from core import (
     VerdictType,
 )
 from core.chain import content_digest
+from engine.observation_trust import TrustPolicy
 
 _log = logging.getLogger("gated.engine")
 
@@ -100,6 +101,10 @@ class TrialReport:
     short_circuited: bool
     aggregate: Verdict
     execution_identity: ExecutionIdentity | None = None
+    # B1: the digest of the observation trust policy APPLIED to these trials (None if no policy was applied).
+    # It is measured PROVENANCE — the digest of the policy that actually governed the observation, carried up
+    # so calibration can bind it into the signed identity (only when consistent across all trials).
+    trust_policy_digest: str | None = None
     # 3.5-close #1.1 (board amendment 3): the NAME of the detector that judged these trials. Lives HERE
     # (enforcement metadata), NOT on ExecutionResult — the sandbox produces facts about the run and does
     # not know which detector judged its result. Set by the caller (calibration / live enforcement) that
@@ -139,6 +144,25 @@ def aggregate(verdicts: Sequence[Verdict]) -> Verdict:
     return Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
 
 
+def _judge(
+    check: RuntimeAssertion, result: ExecutionResult, trust_policy: TrustPolicy | None,
+) -> Verdict:
+    """Apply the observation trust policy (if any) BEFORE the detector. An untrusted observation is mapped
+    MECHANICALLY to ``Verdict(ERROR)`` — the detector's ``assert_invariant`` is NEVER consulted for it, so an
+    always-PASS detector cannot launder a timeout / error / malformed run into a PASS (board B1). Only a
+    TRUSTED observation reaches the detector; a non-zero ``completed`` exit code is trusted (the detector
+    decides its meaning)."""
+    if trust_policy is not None:
+        decision = trust_policy.evaluate(result)
+        if not decision.trusted:
+            reason = (
+                Reason.TELEMETRY_MISSING if decision.code == "MALFORMED"
+                else Reason.OBSERVATION_INCOMPLETE
+            )
+            return Verdict(VerdictType.ERROR, reason)
+    return check.assert_invariant(result)
+
+
 def run_check(
     make_sandbox: Callable[[], Sandbox],
     check: RuntimeAssertion,
@@ -150,6 +174,7 @@ def run_check(
     report_sink: TrialReportSink | None = None,
     detector_id: str | None = None,
     command: Command | None = None,
+    trust_policy: TrustPolicy | None = None,
 ) -> Verdict:
     """Run ``check`` on ``artifact`` across up to ``trials`` isolated trials -> one
     Verdict. ``make_sandbox`` is a factory so each trial gets a fresh sandbox instance
@@ -186,7 +211,7 @@ def run_check(
             if first_fail:
                 break  # re-attempting an unresolvable image gains nothing
             continue
-        verdict = check.assert_invariant(result)
+        verdict = _judge(check, result, trust_policy)  # trust policy applied BEFORE the detector
         verdicts.append(verdict)
         raws.append(_raw_identity(sb, result))  # image coord = the digest the sandbox actually ran
         if first_fail and verdict.status is VerdictType.FAIL:
@@ -215,6 +240,7 @@ def run_check(
             aggregate=result_verdict,
             execution_identity=identity,
             detector_id=detector_id,
+            trust_policy_digest=trust_policy.policy_digest if trust_policy is not None else None,
         )
         # The audit sink is an OBSERVER — it must never crash the engine or suppress the
         # Verdict (the merge gate's source of truth). Emit-failure is logged, not
