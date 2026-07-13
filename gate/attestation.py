@@ -85,11 +85,6 @@ class SubjectMismatchError(AttestationError):
     """Recompute layer: ``subject_identity`` != ``H_v{ICV}(runtime_subject)`` — tampered or inconsistent."""
 
 
-class PolicyAuthorizationError(AttestationError):
-    """Governance layer: the (verified) measured subject is not the policy's currently authorized target.
-    Raised by the governance consumer (restore controller), never by ``verify_measurement`` itself."""
-
-
 def calibrated_subject_identity(
     resolved_profile_digest: str | None,
     trust_policy_digest: str | None,
@@ -226,8 +221,25 @@ def _check_identity_contract(att: MeasurementAttestation) -> None:
             f"{IDENTITY_CONTRACT_VERSION!r}")
 
 
+def _req_nonempty_str(att: MeasurementAttestation, name: str) -> None:
+    v = getattr(att, name)
+    if type(v) is not str or v == "":
+        raise MeasurementSchemaError(f"{name} must be a non-empty str")
+
+
+def _opt_nonempty_str(att: MeasurementAttestation, name: str) -> None:
+    """A field that is ``None`` OR a NON-EMPTY str. An empty string is NOT a valid identity coordinate —
+    it would otherwise be treated as 'present' by the all-four check and hash into a meaningless composite
+    (the empty-string identity-downgrade bypass)."""
+    v = getattr(att, name)
+    if v is not None and (type(v) is not str or v == ""):
+        raise MeasurementSchemaError(f"{name} must be a non-empty str or None")
+
+
 def _check_wire_types(att: MeasurementAttestation) -> None:
-    """The remaining exact wire types (after the discriminators are typed + matched)."""
+    """The remaining EXACT wire types (after the discriminators are typed + matched) — EVERY signed field,
+    not just the runtime coordinates. Identity coordinates must be non-empty when present; the required
+    string fields must be non-empty; no coercion is tolerated."""
     if not isinstance(att.outcome, VerdictType):
         raise MeasurementSchemaError("outcome must be a VerdictType")
     if type(att.issued_at_ms) is not int:  # bool is an int subclass — reject it explicitly
@@ -238,10 +250,13 @@ def _check_wire_types(att: MeasurementAttestation) -> None:
         seq = getattr(att, name)
         if not isinstance(seq, tuple) or not all(type(x) is str for x in seq):
             raise MeasurementSchemaError(f"{name} must be a tuple of str")
-    for name in RUNTIME_SUBJECT_FIELDS:
-        v = getattr(att, name)
-        if v is not None and type(v) is not str:
-            raise MeasurementSchemaError(f"{name} must be str or None")
+    # the four runtime-subject coordinates + the optional composite: None or a NON-EMPTY str.
+    for name in (*RUNTIME_SUBJECT_FIELDS, "subject_identity"):
+        _opt_nonempty_str(att, name)
+    # the required non-empty string fields (issuance metadata + the whole calibration_context block).
+    for name in ("policy_id", "requested_subject_identity", "issuer", "run_id", "nonce",
+                 *CALIBRATION_CONTEXT_FIELDS):
+        _req_nonempty_str(att, name)
 
 
 def _check_conditional_validity(att: MeasurementAttestation) -> None:
@@ -249,7 +264,9 @@ def _check_conditional_validity(att: MeasurementAttestation) -> None:
     composite subject; an ERROR may carry null coordinates (non-restorable evidence). Whenever a subject is
     present, ALL four coordinates must be present and the subject MUST equal ``H_v{ICV}(runtime_subject)``
     using the SIGNED ICV as the domain prefix."""
-    coords_present = all(getattr(att, f) is not None for f in RUNTIME_SUBJECT_FIELDS)
+    # truthiness (not ``is not None``) — an empty-string coordinate is NOT present (defence in depth; the
+    # wire-type layer already rejects an empty coordinate, this is the second gate).
+    coords_present = all(getattr(att, f) for f in RUNTIME_SUBJECT_FIELDS)
     subj = att.subject_identity
     if att.outcome in (VerdictType.PASS, VerdictType.FAIL):
         if not coords_present or subj is None:
@@ -322,7 +339,6 @@ __all__ = [
     "AttestationSignatureError",
     "SubjectCompositionError",
     "SubjectMismatchError",
-    "PolicyAuthorizationError",
     "MeasurementAttestation",
     "MEASUREMENT_ATTESTATION_SCHEMA",
     "IDENTITY_CONTRACT_VERSION",

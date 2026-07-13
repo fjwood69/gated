@@ -72,10 +72,12 @@ class ReAttestCapability:
         return None if att is None else att[2]
 
     def record_calibration_pass(self, ref: str, *, policy_id: str, pinned_set_version: str,
-                                detector_identity: str, set_id: str) -> None:
+                                detector_identity: str, identity_contract_version: int,
+                                set_id: str) -> None:
         self._store.record_calibration_pass(
             ref, policy_id=policy_id, pinned_set_version=pinned_set_version,
-            detector_identity=detector_identity, set_id=set_id)
+            detector_identity=detector_identity,
+            identity_contract_version=identity_contract_version, set_id=set_id)
 
     def reattest(self, policy_id: str, *, calibration_result_ref: str, pinned_set_version: str,
                  detector_identity: str, job_id: str, nonce: str, expect_policy_head: str,
@@ -208,7 +210,8 @@ class RestoreController:
             # identity value (P1-3) — the identity the future enforcement match compares.
             self._cap.record_calibration_pass(
                 ref, policy_id=att.policy_id, pinned_set_version=att.oracle_head,
-                detector_identity=att.subject_identity, set_id=att.set_id)
+                detector_identity=att.subject_identity,
+                identity_contract_version=att.identity_contract_version, set_id=att.set_id)
             try:
                 seq = self._cap.reattest(
                     att.policy_id, calibration_result_ref=ref, pinned_set_version=att.oracle_head,

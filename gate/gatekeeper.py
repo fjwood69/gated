@@ -43,7 +43,7 @@ from engine.calibration import (
     calibrate,
 )
 from engine.observation_trust import TrustPolicy
-from gate.attestation import calibrated_subject_identity
+from gate.attestation import IDENTITY_CONTRACT_VERSION, calibrated_subject_identity
 from gate.authority import GovernanceApproval
 from gate.policy_state import Disposition, PolicyState, disposition_for
 from gate.policy_store import ChainIntegrityError, PolicyStore
@@ -293,7 +293,7 @@ def run_calibration(
         ref = _result_ref(policy_id, calibration_chain_head, subject, result)
         store.record_calibration_pass(
             ref, policy_id=policy_id, pinned_set_version=calibration_chain_head,
-            detector_identity=subject, set_id=set_id,
+            detector_identity=subject, identity_contract_version=IDENTITY_CONTRACT_VERSION, set_id=set_id,
         )
     else:
         store.transition(

@@ -110,6 +110,20 @@ class AttestationV3Tests(unittest.TestCase):
         with self.assertRaises(SubjectCompositionError):
             _signed(guard_policy_digest=None)
 
+    def test_empty_string_coordinate_is_rejected(self) -> None:
+        # the empty-string identity-downgrade: a coordinate of "" must NOT count as present. It is rejected
+        # at the WIRE-type layer (MeasurementSchemaError) before conditional presence, so a PASS can never
+        # be signed with a meaningless empty coordinate that would hash into a valid-looking composite.
+        with self.assertRaises(MeasurementSchemaError):
+            _signed(trust_policy_digest="")
+        with self.assertRaises(MeasurementSchemaError):
+            _signed(guard_policy_digest="")
+
+    def test_empty_required_string_is_rejected(self) -> None:
+        # a required non-empty field (e.g. a calibration_context field) that is "" is refused too.
+        with self.assertRaises(MeasurementSchemaError):
+            _signed(oracle_head="")
+
     def test_orphan_subject_is_SubjectCompositionError_at_sign(self) -> None:
         # a subject claimed while a coordinate is null is incoherent (an unattestable ERROR must not smuggle
         # in a calibrated subject) — refused at SIGN (validate-before-sign).
@@ -154,6 +168,24 @@ class AttestationV3Tests(unittest.TestCase):
         verify_measurement(resigned, verifier=KeyVerifier(_PUB))
         self.assertEqual(resigned.subject_identity, base_signed.subject_identity)  # subject unchanged
         self.assertEqual(resigned.oracle_head, "a-DIFFERENT-oracle-head")          # context changed
+
+    def test_inverse_context_isolation_subject_change_leaves_context_bytes(self) -> None:
+        # the INVERSE of context-isolation: mutating a runtime_subject coordinate changes the subject but
+        # leaves the calibration_context block's serialized bytes UNCHANGED (the separation is bidirectional
+        # — subject and context are independent structures).
+        import json
+        base = _unsigned()
+        new_trust = "a-DIFFERENT-trust-digest"
+        changed = replace(
+            base, trust_policy_digest=new_trust,
+            subject_identity=calibrated_subject_identity(
+                base.resolved_profile_digest, new_trust, base.guard_policy_digest,
+                base.execution_identity_digest),
+        )
+        self.assertNotEqual(base.subject_identity, changed.subject_identity)  # subject moved
+        self.assertEqual(  # context bytes did NOT
+            json.dumps(base._calibration_context(), sort_keys=True),
+            json.dumps(changed._calibration_context(), sort_keys=True))
 
     # ---- ERROR / non-restorable ----
 

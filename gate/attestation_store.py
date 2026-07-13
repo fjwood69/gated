@@ -22,6 +22,7 @@ from gate.attestation import (
     MEASUREMENT_ATTESTATION_SCHEMA,
     AttestationError,
     MeasurementAttestation,
+    MeasurementSchemaError,
     attestation_ref,
 )
 
@@ -67,29 +68,49 @@ def _reconstruct(payload: dict[str, object], signature: str) -> MeasurementAttes
         v = src.get(key)
         if v is None:
             return None
-        if not isinstance(v, str):  # strict — no coercion of alternate reprs into a str
+        if type(v) is not str:  # strict — no coercion of alternate reprs into a str
             raise AttestationError(f"stored {key!r} must be a string or null, got {type(v).__name__}")
         return v
 
+    def _req(src: dict[str, object], key: str) -> str:
+        v = src.get(key)
+        if type(v) is not str:  # PRESERVE the exact wire value or REJECT — never str()-coerce
+            raise AttestationError(f"stored {key!r} must be a str, got {type(v).__name__}")
+        return v
+
+    def _req_tuple(key: str) -> tuple[str, ...]:
+        v = payload.get(key)
+        if not isinstance(v, list) or not all(type(x) is str for x in v):
+            raise AttestationError(f"stored {key!r} must be a list of str")
+        return tuple(v)
+
+    sc = payload.get("short_circuit")
+    if type(sc) is not bool:
+        raise AttestationError(f"stored 'short_circuit' must be a bool, got {type(sc).__name__}")
+    try:
+        outcome = VerdictType(payload["outcome"])
+    except (ValueError, KeyError) as exc:
+        raise AttestationError(f"stored 'outcome' is not a valid verdict: {exc}") from None
+
     return MeasurementAttestation(
-        outcome=VerdictType(payload["outcome"]), policy_id=str(payload["policy_id"]),
+        outcome=outcome, policy_id=_req(payload, "policy_id"),
         subject_identity=_opt(payload, "subject_identity"),
-        requested_subject_identity=str(payload["requested_subject_identity"]),
+        requested_subject_identity=_req(payload, "requested_subject_identity"),
         resolved_profile_digest=_opt(subject, "resolved_profile_digest"),
         trust_policy_digest=_opt(subject, "trust_policy_digest"),
         guard_policy_digest=_opt(subject, "guard_policy_digest"),
         execution_identity_digest=_opt(subject, "execution_identity_digest"),
-        set_id=str(context["set_id"]),
-        oracle_head=str(context["oracle_head"]), coverage_digest=str(context["coverage_digest"]),
-        tier_generation=str(context["tier_generation"]), issuer=str(payload["issuer"]),
-        run_id=str(payload["run_id"]), nonce=str(payload["nonce"]),
+        set_id=_req(context, "set_id"),
+        oracle_head=_req(context, "oracle_head"), coverage_digest=_req(context, "coverage_digest"),
+        tier_generation=_req(context, "tier_generation"), issuer=_req(payload, "issuer"),
+        run_id=_req(payload, "run_id"), nonce=_req(payload, "nonce"),
         issued_at_ms=_strict_int(payload["issued_at_ms"]),
-        fixture_coverage=tuple(payload["fixture_coverage"]),  # type: ignore[arg-type]
-        short_circuit=bool(payload["short_circuit"]),
-        fn_failures=tuple(payload["fn_failures"]),  # type: ignore[arg-type]
-        fp_failures=tuple(payload["fp_failures"]),  # type: ignore[arg-type]
-        flaky=tuple(payload["flaky"]),  # type: ignore[arg-type]
-        harness_errors=tuple(payload["harness_errors"]),  # type: ignore[arg-type]
+        fixture_coverage=_req_tuple("fixture_coverage"),
+        short_circuit=sc,
+        fn_failures=_req_tuple("fn_failures"),
+        fp_failures=_req_tuple("fp_failures"),
+        flaky=_req_tuple("flaky"),
+        harness_errors=_req_tuple("harness_errors"),
         identity_contract_version=icv,
         schema=schema, signature=signature,
     )
@@ -151,7 +172,14 @@ class MeasurementAttestationStore:
         ).fetchone()
         if row is None:
             return None
-        att = _reconstruct(json.loads(row["payload_json"]), row["signature"])
+        try:
+            parsed = json.loads(row["payload_json"])
+        except ValueError as exc:  # malformed stored JSON is a schema-layer failure, not an unhandled crash
+            raise MeasurementSchemaError(
+                f"stored attestation under ref {ref} is not valid JSON: {exc}") from None
+        if not isinstance(parsed, dict):
+            raise MeasurementSchemaError(f"stored attestation under ref {ref} is not a JSON object")
+        att = _reconstruct(parsed, row["signature"])
         # v3 (board P2): bind the lookup key to the content — the reconstructed attestation's ref MUST
         # recompute to the requested ref, else the stored bytes do not match the key (corruption/tamper).
         if attestation_ref(att) != ref:

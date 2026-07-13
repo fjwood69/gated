@@ -224,6 +224,38 @@ Untrusted-telemetry parsing cannot reach the verdict: `sandbox/oci.py` and `sand
 host-observed egress counter) — there is no parse of artifact output, no `pickle`, no regex-DoS surface.
 Not a deferral; the architecture cannot be hit.
 
+## S3 (identity plane) — the 4-tuple RuntimeSubject, and what is NOT yet wired
+
+The measurement-attestation is bumped to **`measurement-attestation:v3`** binding the 4-tuple
+**RuntimeSubject** = `H_v{ICV}(resolved_profile, trust_policy, guard_policy, execution)`. Two structures
+are signed under ONE issuer signature: `runtime_subject` (the four coordinates — the subject digest
+consumes ONLY these) and `calibration_context` (`set_id`/`oracle_head`/`coverage_digest`/`tier_generation`
+— **the signature authenticates the REPORTED context, not its authorization or currency**; governance
+re-checks currency at restore). `IDENTITY_CONTRACT_VERSION` is bound two ways — an explicit signed field
+AND the subject digest's domain prefix `gated.calibrated-subject.v{ICV}` — so a vN subject digest is
+cryptographically unverifiable under vM. Three INDEPENDENT version axes: the attestation SCHEMA (`v3`), the
+IDENTITY CONTRACT (`ICV`), and the policy/guard contracts (digests, not numbers).
+
+**Mandatory deserialisation order (enshrine this for every authority-bearing structure):** decode/shape →
+discriminator PRIMITIVE types → schema equality → ICV equality → remaining wire types → signature →
+conditional presence → composite recompute → governance/current-state match. The version guard fires
+BEFORE any field is interpreted, so an old/unknown record is refused before a missing coordinate could be
+defaulted. Old vectors are refused at that guard (rejection-test fixtures, never a live basis).
+
+**PARTIAL v3 bump — NOT closed (S3-completion dependencies):**
+- **Live-gatekeeper 4-tuple enforcement is UNWIRED.** `pipeline` / `live_app` do not yet match a running
+  detector's measured 4-tuple against the attested subject. A post-hoc match alone does not satisfy the
+  two-stage enforcement invariant (the gate must decide authorization BEFORE the run). The pre-run
+  mechanism is an **`AuthorizedRunPlan`** — an **internal, immutable frozen dataclass** (NOT a signed
+  token: a node signing its own permission slip is circular trust = deploy-tier) that carries the
+  pre-checked `(profile, trust_policy, guard_policy, oracle_context, ICV, policy_generation)` through the
+  `live_app` routing layers to the execution boundary, preventing mid-flight mutation; POST-run, the
+  parent-measured execution identity completes + verifies the 4-tuple. This is **reference-tier** (it must
+  be built before S3 seals); a cross-process signed token replacing it is deploy-tier.
+- **The acceptance envelope + the snapshot remain 2-tuple (pre-v3).** The live gatekeeper cannot be wired
+  until both are bumped to carry the 4-tuple, or the enforcement match would compare a v3 attested subject
+  against a 2-tuple accepted identity.
+
 ### Named-next increments (deploy-bar — not dropped)
 - **`policy → accepted_detector_id` per-policy selection.** Migration alone lets the gate run any
   *registered* detector; per-policy binding authorizes a specific detector for a specific policy.

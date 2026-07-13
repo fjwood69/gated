@@ -41,7 +41,7 @@ def _enable(s: PolicyStore, pid: str = "p1", *, det: str = "det-1", head: str = 
     s.transition(pid, PolicyState.CALIBRATING, approval=_appr("g1", op=f"{pid}-{head}-2"),
                  pinned_set_version=head)
     s.record_calibration_pass(ref, policy_id=pid, pinned_set_version=head, detector_identity=det,
-                              set_id=set_id)
+                              set_id=set_id, identity_contract_version=1)
     s.transition(pid, PolicyState.ENABLED, approval=_appr("g1", op=f"{pid}-{head}-3"),
                  calibration_result_ref=ref, pinned_set_version=head, detector_identity=det)
     return ref
@@ -69,7 +69,7 @@ class ReAttestPrimitiveTests(unittest.TestCase):
         self.assertEqual(s.current_attestation("p1"), ("X", "v1", "det-1"))
         # fixture appended -> new head v2; async re-cal PASS -> new persisted pass -> re-attest.
         s.record_calibration_pass("cal-v2", policy_id="p1", pinned_set_version="v2",
-                                  detector_identity="det-1", set_id="X")
+                                  detector_identity="det-1", set_id="X", identity_contract_version=1)
         _reattest(s, "p1", ref="cal-v2", psv="v2", det="det-1", job="job-abc", nonce="n1")
         self.assertEqual(s.current_attestation("p1"), ("X", "v2", "det-1"))  # evidence moved forward
         self.assertIs(s.current_state("p1"), PolicyState.ENABLED)            # tier UNCHANGED
@@ -83,6 +83,19 @@ class ReAttestPrimitiveTests(unittest.TestCase):
         _enable(s, "p1", det="det-1", head="v1")   # ref cal-p1-v1 bound to p1
         self.assertEqual(s.subject_for_pass("cal-p1-v1", "p1", "v1"), "det-1")
         self.assertIsNone(s.subject_for_pass("cal-p1-v1", "p2", "v1"))   # p1's pass can't enable p2
+
+    def test_pass_from_another_identity_contract_is_invisible(self) -> None:
+        # S3 ckpt4-fix: a calibration_pass recorded under a DIFFERENT identity_contract_version is not
+        # matchable by the read paths (subject_for_pass) — so a pass composed under another identity
+        # contract can never enable / re-attest under the current one (ICV exact-match).
+        s = _store()
+        s.record_calibration_pass("cal-x", policy_id="p1", pinned_set_version="v1", detector_identity="d",
+                                  set_id="X", identity_contract_version=99)
+        self.assertIsNone(s.subject_for_pass("cal-x", "p1", "v1"))  # wrong ICV -> not found
+        # a matching-ICV pass IS visible (control).
+        s.record_calibration_pass("cal-y", policy_id="p1", pinned_set_version="v1", detector_identity="d",
+                                  set_id="X", identity_contract_version=1)
+        self.assertEqual(s.subject_for_pass("cal-y", "p1", "v1"), "d")
 
     def test_transition_still_refuses_enabled_to_enabled(self) -> None:
         # a re-attest cannot be smuggled through the general governance transition path.
@@ -109,7 +122,7 @@ class ReAttestPrimitiveTests(unittest.TestCase):
         s = _store()
         _enable(s, det="det-1", head="v1")
         s.record_calibration_pass("cal-v2", policy_id="p1", pinned_set_version="v2",
-                                  detector_identity="det-1", set_id="X")
+                                  detector_identity="det-1", set_id="X", identity_contract_version=1)
         # the pass is for det-1; a re-attest claiming det-EVIL must not resolve it.
         with self.assertRaises(PrivilegedOperationError):
             _reattest(s, "p1", ref="cal-v2", psv="v2", det="det-EVIL")
@@ -121,7 +134,7 @@ class ReAttestPrimitiveTests(unittest.TestCase):
         h1 = s.policy_head("p1")
         # an append to p2 must NOT move p1's evidence head (avoids cross-policy CAS thrash).
         s.record_calibration_pass("cal-p2-v2", policy_id="p2", pinned_set_version="v2",
-                                  detector_identity="det-1", set_id="X")
+                                  detector_identity="det-1", set_id="X", identity_contract_version=1)
         _reattest(s, "p2", ref="cal-p2-v2", psv="v2", det="det-1")
         self.assertEqual(s.policy_head("p1"), h1)              # untouched
         self.assertNotEqual(s.policy_head("p2"), h1)
@@ -137,7 +150,7 @@ class ReAttestMandatoryExpectationTests(unittest.TestCase):
         s = _store()
         _enable(s, head="v1")  # p1 ENABLED, det-1
         s.record_calibration_pass("cal-v2", policy_id="p1", pinned_set_version="v2",
-                                  detector_identity="det-1", set_id="X")
+                                  detector_identity="det-1", set_id="X", identity_contract_version=1)
         return s
 
     def test_expectations_are_required_kwargs(self) -> None:
@@ -206,7 +219,7 @@ class ReAttestChainReplayGuardTests(unittest.TestCase):
         # a real pass exists for (v2, det-1), but the crafted record claims det-EVIL @ v2 -> the pass
         # metadata does not match the record -> reject.
         s.record_calibration_pass("cal-v2", policy_id="p1", pinned_set_version="v2",
-                                  detector_identity="det-1", set_id="X")
+                                  detector_identity="det-1", set_id="X", identity_contract_version=1)
         self._craft_reattest_row(s, "p1", ref="cal-v2", head="v2", det="det-EVIL")
         self.assertFalse(s.verify_chain())
 

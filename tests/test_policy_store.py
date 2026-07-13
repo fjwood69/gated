@@ -38,7 +38,7 @@ def _enable(store: PolicyStore, pid: str, *, detector: str = "det-1") -> None:
     store.transition(pid, PolicyState.CALIBRATING, approval=_appr("gov1", op=f"{pid}-2"),
                      pinned_set_version="fx-head")
     store.record_calibration_pass("cal-1", policy_id=pid, pinned_set_version="fx-head",
-                                  detector_identity=detector)
+                                  detector_identity=detector, identity_contract_version=1)
     store.transition(pid, PolicyState.ENABLED, approval=_appr("gov1", op=f"{pid}-3"),
                      calibration_result_ref="cal-1", pinned_set_version="fx-head",
                      detector_identity=detector)
@@ -85,7 +85,7 @@ class EnablePathTests(unittest.TestCase):
                          detector_identity="det-1")
         # a pass for a DIFFERENT detector does not satisfy it either (identity must match).
         s.record_calibration_pass("real", policy_id="p1", pinned_set_version="fx-head",
-                                  detector_identity="det-OTHER")
+                                  detector_identity="det-OTHER", identity_contract_version=1)
         with self.assertRaises(PrivilegedOperationError):
             s.transition("p1", PolicyState.ENABLED, approval=_appr("gov1", op="3b"),
                          calibration_result_ref="real", pinned_set_version="fx-head",

@@ -110,7 +110,7 @@ def _pol(head: str) -> PolicyStore:
     s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="a"))
     s.transition("p1", PolicyState.CALIBRATING, approval=_appr("g1", op="b"), pinned_set_version=head)
     s.record_calibration_pass("cal-0", policy_id="p1", pinned_set_version=head,
-                              detector_identity=_DET, set_id="X")
+                              detector_identity=_DET, set_id="X", identity_contract_version=1)
     s.transition("p1", PolicyState.ENABLED, approval=_appr("g1", op="c"),
                  calibration_result_ref="cal-0", pinned_set_version=head, detector_identity=_DET)
     return s
@@ -263,7 +263,7 @@ class ZombieMetricTests(unittest.TestCase):
         c, s, q = self._setup_drifted()
         # re-attest p1 back to the current head, and mark the job done.
         s.record_calibration_pass("cal-1", policy_id="p1", pinned_set_version=c.set_head("X"),
-                                  detector_identity=_DET, set_id="X")
+                                  detector_identity=_DET, set_id="X", identity_contract_version=1)
         _att = s.current_attestation("p1")
         assert _att is not None
         s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-1", pinned_set_version=c.set_head("X"),

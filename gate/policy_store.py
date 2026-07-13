@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from core.chain import GENESIS_HASH, chain_hash, content_digest
+from gate.attestation import IDENTITY_CONTRACT_VERSION
 from gate.authority import GovernanceApproval
 from gate.policy_state import PolicyState, is_legal_transition, is_weakening
 
@@ -123,6 +124,9 @@ CREATE TABLE IF NOT EXISTS calibration_pass (
     set_id                 TEXT NOT NULL DEFAULT 'default',  -- 3.4: the SET this policy calibrated against
     pinned_set_version     TEXT NOT NULL,   -- the set_head(set_id) AT calibration time (the oracle head)
     detector_identity      TEXT NOT NULL,
+    identity_contract_version INTEGER NOT NULL,  -- S3 ckpt4-fix: the ICV the subject identity was composed
+                                                 -- under; enable/reattest EXACT-MATCH the current ICV, so a
+                                                 -- pass from another identity contract cannot enable.
     passed_at              REAL NOT NULL
 );
 """
@@ -373,21 +377,23 @@ class PolicyStore:
         policy_id: str,
         pinned_set_version: str,
         detector_identity: str,
+        identity_contract_version: int,
         set_id: str = "default",
     ) -> None:
         """Persist the FACTUAL attestation that a calibration ran and PASSED for this
-        (policy, SET, set-head/oracle-version, detector identity). Written by the calibration flow
-        AFTER a real ``calibrate()`` returned passed=True — never on a FAIL. ``ratify_enable`` ->
-        ENABLED is gated on a matching row (gap-1). ``pinned_set_version`` is the ``set_head(set_id)``
-        at calibration time — the SCOPED oracle head enforcement later compares against (close-3).
-        Idempotent by ref (INSERT OR IGNORE)."""
+        (policy, SET, set-head/oracle-version, detector identity, IDENTITY CONTRACT VERSION). Written by
+        the calibration flow AFTER a real ``calibrate()`` returned passed=True — never on a FAIL.
+        ``ratify_enable`` -> ENABLED is gated on a matching row (gap-1). ``identity_contract_version`` is the
+        ICV the subject identity was composed under (S3 ckpt4-fix); the read paths EXACT-MATCH the current
+        ICV, so a pass composed under another contract can never enable. Idempotent by ref
+        (INSERT OR IGNORE)."""
         with self._lock:
             self._conn().execute(
                 "INSERT OR IGNORE INTO calibration_pass "
                 "(calibration_result_ref, policy_id, set_id, pinned_set_version, detector_identity,"
-                " passed_at) VALUES (?,?,?,?,?,?)",
+                " identity_contract_version, passed_at) VALUES (?,?,?,?,?,?,?)",
                 (calibration_result_ref, policy_id, set_id, pinned_set_version, detector_identity,
-                 self._clock()),
+                 identity_contract_version, self._clock()),
             )
 
     def current_attestation(self, policy_id: str) -> tuple[str, str, str] | None:
@@ -410,8 +416,8 @@ class PolicyStore:
             return None
         prow = self._conn().execute(
             "SELECT set_id, pinned_set_version, detector_identity FROM calibration_pass "
-            "WHERE calibration_result_ref=? AND policy_id=? LIMIT 1",
-            (row["calibration_result_ref"], policy_id)
+            "WHERE calibration_result_ref=? AND policy_id=? AND identity_contract_version=? LIMIT 1",
+            (row["calibration_result_ref"], policy_id, IDENTITY_CONTRACT_VERSION)
         ).fetchone()
         if prow is None:
             return None
@@ -430,8 +436,8 @@ class PolicyStore:
             return None
         prow = self._conn().execute(
             "SELECT detector_identity FROM calibration_pass "
-            "WHERE calibration_result_ref=? AND policy_id=? LIMIT 1",
-            (row["calibration_result_ref"], policy_id)
+            "WHERE calibration_result_ref=? AND policy_id=? AND identity_contract_version=? LIMIT 1",
+            (row["calibration_result_ref"], policy_id, IDENTITY_CONTRACT_VERSION)
         ).fetchone()
         return None if prow is None else str(prow["detector_identity"])
 
@@ -440,11 +446,12 @@ class PolicyStore:
     ) -> str | None:
         """v4 P1-a: recover the MEASURED subject identity bound to a persisted calibration_pass, so
         ``ratify_enable`` enables the identity the RUN produced, not a caller-supplied one. None if no such
-        pass exists (a fabricated ref cannot enable)."""
+        pass exists under the CURRENT identity contract (a fabricated ref, or a pass composed under another
+        ICV, cannot enable — S3 ckpt4-fix)."""
         row = self._conn().execute(
             "SELECT detector_identity FROM calibration_pass WHERE calibration_result_ref=? AND policy_id=? "
-            "AND pinned_set_version=? LIMIT 1",
-            (calibration_result_ref, policy_id, pinned_set_version),
+            "AND pinned_set_version=? AND identity_contract_version=? LIMIT 1",
+            (calibration_result_ref, policy_id, pinned_set_version, IDENTITY_CONTRACT_VERSION),
         ).fetchone()
         return None if row is None else str(row["detector_identity"])
 
@@ -454,8 +461,9 @@ class PolicyStore:
     ) -> bool:
         row = self._conn().execute(
             "SELECT 1 FROM calibration_pass WHERE calibration_result_ref=? AND policy_id=? "
-            "AND pinned_set_version=? AND detector_identity=? LIMIT 1",
-            (calibration_result_ref, policy_id, pinned_set_version, detector_identity),
+            "AND pinned_set_version=? AND detector_identity=? AND identity_contract_version=? LIMIT 1",
+            (calibration_result_ref, policy_id, pinned_set_version, detector_identity,
+             IDENTITY_CONTRACT_VERSION),
         ).fetchone()
         return row is not None
 

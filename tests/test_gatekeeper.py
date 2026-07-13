@@ -98,7 +98,7 @@ def _enable(store: PolicyStore, pid: str, *, detector: str = "det-1", set_id: st
     store.transition(pid, PolicyState.CALIBRATING, approval=_appr("gov1", op=f"{pid}-2"),
                      pinned_set_version=head)
     store.record_calibration_pass(ref, policy_id=pid, pinned_set_version=head,
-                                  detector_identity=detector, set_id=set_id)
+                                  detector_identity=detector, set_id=set_id, identity_contract_version=1)
     store.transition(pid, PolicyState.ENABLED, approval=_appr("gov1", op=f"{pid}-3"),
                      calibration_result_ref=ref, pinned_set_version=head,
                      detector_identity=detector)

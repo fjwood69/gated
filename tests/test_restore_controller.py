@@ -95,7 +95,7 @@ def _policy_store_enabled(head: str) -> PolicyStore:
     s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="a"))
     s.transition("p1", PolicyState.CALIBRATING, approval=_appr("g1", op="b"), pinned_set_version=head)
     s.record_calibration_pass("cal-0", policy_id="p1", pinned_set_version=head,
-                              detector_identity=_DET, set_id="X")
+                              detector_identity=_DET, set_id="X", identity_contract_version=1)
     s.transition("p1", PolicyState.ENABLED, approval=_appr("g1", op="c"),
                  calibration_result_ref="cal-0", pinned_set_version=head, detector_identity=_DET)
     return s
@@ -249,7 +249,7 @@ class RestoreControllerTests(unittest.TestCase):
         s.transition("p2", PolicyState.CALIBRATING, approval=_appr("g1", op="p2b"),
                      pinned_set_version=c.set_head("X"))
         s.record_calibration_pass("cal-p2", policy_id="p2", pinned_set_version=c.set_head("X"),
-                                  detector_identity=_DET, set_id="X")
+                                  detector_identity=_DET, set_id="X", identity_contract_version=1)
         s.transition("p2", PolicyState.ENABLED, approval=_appr("g1", op="p2c"),
                      calibration_result_ref="cal-p2", pinned_set_version=c.set_head("X"),
                      detector_identity=_DET)

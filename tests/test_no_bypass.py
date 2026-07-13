@@ -88,11 +88,11 @@ class RuntimeGateTests(unittest.TestCase):
         s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=appr("g1", op="1"))
         s.transition("p1", PolicyState.CALIBRATING, approval=appr("g1", op="2"), pinned_set_version="v")
         s.record_calibration_pass("cal", policy_id="p1", pinned_set_version="v",
-                                  detector_identity="d", set_id="X")
+                                  detector_identity="d", set_id="X", identity_contract_version=1)
         s.transition("p1", PolicyState.ENABLED, approval=appr("g1", op="3"),
                      calibration_result_ref="cal", pinned_set_version="v", detector_identity="d")
         s.record_calibration_pass("cal2", policy_id="p1", pinned_set_version="v2",
-                                  detector_identity="d", set_id="X")
+                                  detector_identity="d", set_id="X", identity_contract_version=1)
         head = s.policy_head("p1")
         att = s.current_attestation("p1")
         assert att is not None
