@@ -17,3 +17,22 @@ def allow_any_backend(sandbox: Sandbox) -> None:
     reintroduce the audited-backend fail-open — which is exactly why it lives here (excluded from the
     wheel) and why the packaging/AST tests forbid any other no-op guard in production code."""
     return None
+
+
+class _TestGuardPolicy:
+    """A TEST-ONLY guard policy that accepts any backend but bears a stable ``policy_digest`` — so tests
+    exercising the S3 4-tuple RuntimeSubject (which requires a guard-policy digest for a clean PASS/FAIL)
+    can run against a NoOp sandbox without a real audited backend. Excluded from the wheel."""
+
+    policy_id = "test-guard:v1"
+
+    @property
+    def policy_digest(self) -> str:
+        return "test-guard-digest:v1"
+
+    def __call__(self, sandbox: Sandbox) -> None:
+        return None
+
+
+# a shared instance for tests that need a guard-with-digest (the 4-tuple PASS/FAIL path).
+test_guard_policy = _TestGuardPolicy()

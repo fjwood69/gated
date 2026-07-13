@@ -40,6 +40,7 @@ from engine.calibration import (
     CalibrationResult,
     calibrate,
 )
+from engine.observation_trust import TrustPolicy
 from gate.attestation import (
     MeasurementAttestation,
     calibrated_subject_identity,
@@ -91,6 +92,7 @@ def run_recalibration(
     signer: Signer,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
     backend_guard: BackendGuard,
+    trust_policy: TrustPolicy,
 ) -> MeasurementAttestation:
     """Seal the set (snapshot-isolated), run the batch calibrator against the frozen fixtures, and
     return a SIGNED measurement. Emits — never enforces.
@@ -117,7 +119,7 @@ def run_recalibration(
         # the CalibrationResult, so the signed subject binds the detector that ACTUALLY ran.
         result = calibrate(
             make_sandbox, detector_id, resolve, sealed.calibration_set, budget,
-            trials=trials, backend_guard=backend_guard,
+            trials=trials, backend_guard=backend_guard, trust_policy=trust_policy,
         )
     except DetectorResolutionError as exc:
         # drift / unregistered -> a signed ERROR AUDIT attestation with null components: categorically
@@ -125,7 +127,8 @@ def run_recalibration(
         unsigned = MeasurementAttestation(
             outcome=VerdictType.ERROR, policy_id=policy_id, subject_identity=None,
             requested_subject_identity=requested_subject_identity,
-            resolved_profile_digest=None, execution_identity_digest=None, set_id=set_id,
+            resolved_profile_digest=None, trust_policy_digest=None, guard_policy_digest=None,
+            execution_identity_digest=None, set_id=set_id,
             oracle_head=sealed.oracle_head, coverage_digest=sealed.coverage_digest,
             tier_generation=tier_generation, issuer=issuer, run_id=job_id, nonce=nonce,
             issued_at_ms=issued_at_ms, fixture_coverage=sealed.fixture_ids, short_circuit=False,
@@ -133,17 +136,22 @@ def run_recalibration(
         )
         return sign_measurement(unsigned, signer=signer)
 
+    # S3: the four RuntimeSubject coordinates, all measured/derived by the SAME calibration operation.
     rpd = result.resolved_profile_digest
+    tpd = result.trust_policy_digest       # the APPLIED observation-trust policy (measured provenance)
+    gpd = result.guard_policy_digest       # the APPLIED backend-guard policy (measured provenance)
     eid = result.execution_identity.digest() if result.execution_identity is not None else None
-    # conditional validity: a subject exists ONLY when both components are present (PASS/FAIL); an
-    # unattestable ERROR (no execution identity) carries null components and a null subject.
+    # conditional validity: a subject exists ONLY when ALL FOUR coordinates are present (a clean PASS/FAIL);
+    # an unattestable ERROR (any coordinate missing) carries null coordinates and a null subject.
+    _coords = (rpd, tpd, gpd, eid)
     subject = (
-        calibrated_subject_identity(rpd, eid) if (rpd is not None and eid is not None) else None
+        calibrated_subject_identity(rpd, tpd, gpd, eid) if all(c is not None for c in _coords) else None
     )
     unsigned = MeasurementAttestation(
         outcome=_outcome_of(result), policy_id=policy_id, subject_identity=subject,
         requested_subject_identity=requested_subject_identity,
-        resolved_profile_digest=rpd, execution_identity_digest=eid, set_id=set_id,
+        resolved_profile_digest=rpd, trust_policy_digest=tpd, guard_policy_digest=gpd,
+        execution_identity_digest=eid, set_id=set_id,
         oracle_head=sealed.oracle_head, coverage_digest=sealed.coverage_digest,
         tier_generation=tier_generation, issuer=issuer, run_id=job_id, nonce=nonce,
         issued_at_ms=issued_at_ms, fixture_coverage=sealed.fixture_ids,

@@ -42,6 +42,7 @@ from engine.calibration import (
     DEFAULT_CALIBRATION_TRIALS,
     calibrate,
 )
+from engine.observation_trust import TrustPolicy
 from gate.attestation import calibrated_subject_identity
 from gate.authority import GovernanceApproval
 from gate.policy_state import Disposition, PolicyState, disposition_for
@@ -254,6 +255,7 @@ def run_calibration(
     set_id: str = "default",
     trials: int = DEFAULT_CALIBRATION_TRIALS,
     backend_guard: BackendGuard,
+    trust_policy: TrustPolicy,
 ) -> CalibrationOutcome:
     """Run the 3.2 BATCH calibrator (shadow-first — full fixture distribution, zero live-PR cost)
     against the out-of-band CalibrationSet, and record the state move. Records PENDING->CALIBRATING;
@@ -272,17 +274,22 @@ def run_calibration(
     )
     # detector by NAME, resolved only through the trusted registry (never a caller-supplied object).
     result = calibrate(make_sandbox, detector_id, resolve, calibration_set, budget,
-                       trials=trials, backend_guard=backend_guard)
+                       trials=trials, backend_guard=backend_guard, trust_policy=trust_policy)
     breaking = (*result.fn_failures, *result.fp_failures, *result.flaky, *result.harness_errors)
     ref: str | None = None
     if result.passed:
         rpd = result.resolved_profile_digest
+        tpd = result.trust_policy_digest
+        gpd = result.guard_policy_digest
         eid = result.execution_identity.digest() if result.execution_identity is not None else None
-        if rpd is None or eid is None:  # a clean pass implies both (identity_consistent + bundle); fail-closed
+        if rpd is None or tpd is None or gpd is None or eid is None:
+            # a clean pass implies all four RuntimeSubject coordinates (profile/trust/guard/execution) —
+            # fail-closed rather than persist an un-attributable pass.
             raise ConfigurationError(
-                "a PASSED calibration lacked a resolved-profile or execution identity — cannot derive the "
+                "a PASSED calibration lacked one of the four runtime-subject coordinates "
+                "(resolved-profile / trust-policy / guard-policy / execution identity) — cannot derive the "
                 "measured subject; refusing to persist an un-attributable pass")
-        subject = calibrated_subject_identity(rpd, eid)
+        subject = calibrated_subject_identity(rpd, tpd, gpd, eid)
         ref = _result_ref(policy_id, calibration_chain_head, subject, result)
         store.record_calibration_pass(
             ref, policy_id=policy_id, pinned_set_version=calibration_chain_head,

@@ -1,12 +1,13 @@
-"""3.5-close P1-3 — the measurement-attestation v2 wire schema + measurement-derived subject identity.
-Run: python3 -m unittest discover -s tests
+"""3.5 S3 — the measurement-attestation v3 wire schema + the 4-tuple RuntimeSubject identity. Run:
+python3 -m unittest discover -s tests
 
-The signed evidence object is versioned (``measurement-attestation:v2``) and the identity it binds is the
-MEASUREMENT-DERIVED calibrated-subject identity — H(resolved_profile_digest, execution_identity_digest) —
-never a caller string. These tests pin the v2 vectors and prove the guards: a v1 record is hard-rejected,
-tampering EITHER derivation component (or the composite) invalidates verification, a subject claimed
-WITHOUT both components is refused, and an unattestable ERROR (null environment) is a valid signed record
-but categorically non-restorable.
+The signed evidence object is versioned (``measurement-attestation:v3``) and carries an
+``IDENTITY_CONTRACT_VERSION``; the identity it binds is the composite over the FOUR RuntimeSubject
+coordinates — H_v{ICV}(resolved_profile, trust_policy, guard_policy, execution) — never a caller string.
+These tests pin the v3 guards with the LAYER-TAGGED error taxonomy (each negative asserts the EXACT
+subclass, so it cannot pass for the wrong reason), re-signing mutated records where the identity layer is
+under test, and prove the runtime_subject / calibration_context separation is structural (the
+context-isolation test).
 """
 from __future__ import annotations
 
@@ -15,9 +16,15 @@ from dataclasses import replace
 
 from core import VerdictType
 from gate.attestation import (
+    IDENTITY_CONTRACT_VERSION,
     MEASUREMENT_ATTESTATION_SCHEMA,
     AttestationError,
+    AttestationSignatureError,
+    IdentityContractError,
     MeasurementAttestation,
+    MeasurementSchemaError,
+    SubjectCompositionError,
+    SubjectMismatchError,
     attestation_ref,
     calibrated_subject_identity,
     sign_measurement,
@@ -28,91 +35,141 @@ from gate.signing import KeyVerifier, SeedSigner, public_key
 _SEED = bytes(range(32))
 _PUB = public_key(_SEED)
 _RPD = "blake2b:resolved-profile-A"
+_TPD = "trust-policy-digest-C"
+_GPD = "guard-policy-digest-D"
 _EID = "exec-identity-digest-B"
 
 
-def _signed(**over: object) -> MeasurementAttestation:
-    """A signed PASS-shaped v2 attestation, with per-field overrides for the negative cases."""
+def _unsigned(**over: object) -> MeasurementAttestation:
+    """A PASS-shaped v3 attestation (UNSIGNED), with per-field overrides for the negative cases. The
+    subject is the 4-tuple composite over the (possibly-overridden) runtime_subject coordinates."""
     rpd = over.pop("resolved_profile_digest", _RPD)
+    tpd = over.pop("trust_policy_digest", _TPD)
+    gpd = over.pop("guard_policy_digest", _GPD)
     eid = over.pop("execution_identity_digest", _EID)
+    coords = (rpd, tpd, gpd, eid)
     subject = over.pop(
         "subject_identity",
-        calibrated_subject_identity(rpd, eid) if (rpd is not None and eid is not None) else None,
+        calibrated_subject_identity(rpd, tpd, gpd, eid) if all(c is not None for c in coords) else None,
     )
     fields: dict[str, object] = dict(
         outcome=VerdictType.PASS, policy_id="p1", subject_identity=subject,
         requested_subject_identity="requested-target",
-        resolved_profile_digest=rpd, execution_identity_digest=eid, set_id="X", oracle_head="head-1",
+        resolved_profile_digest=rpd, trust_policy_digest=tpd, guard_policy_digest=gpd,
+        execution_identity_digest=eid, set_id="X", oracle_head="head-1",
         coverage_digest="cov-1", tier_generation="tg-1", issuer="cal-gov-1", run_id="r-1", nonce="n-1",
         issued_at_ms=100000, fixture_coverage=("b1", "g1"), short_circuit=False,
     )
     fields.update(over)
-    return sign_measurement(MeasurementAttestation(**fields), signer=SeedSigner(_SEED))  # type: ignore[arg-type]
+    return MeasurementAttestation(**fields)  # type: ignore[arg-type]
 
 
-class AttestationV2Tests(unittest.TestCase):
-    def test_v2_round_trip_and_clean_pass(self) -> None:
+def _signed(**over: object) -> MeasurementAttestation:
+    return sign_measurement(_unsigned(**over), signer=SeedSigner(_SEED))
+
+
+class AttestationV3Tests(unittest.TestCase):
+    def test_v3_round_trip_and_clean_pass(self) -> None:
         att = _signed()
         verify_measurement(att, verifier=KeyVerifier(_PUB))  # valid
         self.assertEqual(att.schema, MEASUREMENT_ATTESTATION_SCHEMA)
+        self.assertEqual(att.identity_contract_version, IDENTITY_CONTRACT_VERSION)
         self.assertTrue(att.is_clean_pass)
-        self.assertEqual(att.subject_identity, calibrated_subject_identity(_RPD, _EID))
+        self.assertEqual(att.subject_identity, calibrated_subject_identity(_RPD, _TPD, _GPD, _EID))
 
     def test_deterministic_envelope_and_signature(self) -> None:
-        # NFR6: same inputs -> same signed bytes -> same signature (reproducible, no clock/RNG).
         self.assertEqual(_signed().signature, _signed().signature)
         self.assertEqual(attestation_ref(_signed()), attestation_ref(_signed()))
 
-    def test_v1_schema_is_hard_rejected(self) -> None:
-        # a v1-schema record cannot restore a tier — refused by version. v4: rejected at SIGN (validate the
-        # complete schema before signing), so a non-v2 record is never even produced.
-        with self.assertRaises(AttestationError):
-            _signed(schema="measurement-attestation:v1")
+    # ---- the exact-error-code taxonomy matrix (one mutation per test, re-signed where the identity
+    #      layer is under test so signature-rejection does not mask it) ----
 
-    def test_tamper_resolved_profile_digest_is_refused(self) -> None:
-        tampered = replace(_signed(), resolved_profile_digest="blake2b:EVIL")  # signature not recomputed
-        with self.assertRaises(AttestationError):
-            verify_measurement(tampered, verifier=KeyVerifier(_PUB))
+    def test_wrong_schema_is_MeasurementSchemaError_at_sign(self) -> None:
+        with self.assertRaises(MeasurementSchemaError):
+            _signed(schema="measurement-attestation:v2")  # an old schema is refused at SIGN
 
-    def test_tamper_execution_identity_digest_is_refused(self) -> None:
-        tampered = replace(_signed(), execution_identity_digest="exec-EVIL")
-        with self.assertRaises(AttestationError):
-            verify_measurement(tampered, verifier=KeyVerifier(_PUB))
+    def test_wrong_icv_is_IdentityContractError_at_sign(self) -> None:
+        with self.assertRaises(IdentityContractError):
+            _signed(identity_contract_version=IDENTITY_CONTRACT_VERSION + 1)
 
-    def test_tamper_subject_composite_is_refused(self) -> None:
-        # even if the components are untouched, a forged composite is caught by the recompute check
-        # (guard: verify recomputes H(profile, execution) and compares).
-        tampered = replace(_signed(), subject_identity="forged-subject-that-was-not-derived")
-        with self.assertRaises(AttestationError):
-            verify_measurement(tampered, verifier=KeyVerifier(_PUB))
+    def test_bool_issued_at_ms_is_MeasurementSchemaError(self) -> None:
+        with self.assertRaises(MeasurementSchemaError):
+            _signed(issued_at_ms=True)  # bool is an int subclass — rejected before signing
 
-    def test_subject_without_both_components_is_incoherent(self) -> None:
-        # a subject claimed while a derivation component is null is refused — an unattestable ERROR must
-        # not smuggle in a calibrated subject. v3 validate-before-sign: it is refused at SIGN time (the
-        # runner never produces such a record), which is stronger than only rejecting on read.
-        with self.assertRaises(AttestationError):
+    def test_bad_hex_signature_is_AttestationSignatureError(self) -> None:
+        bad = replace(_signed(), signature="nothex!!")
+        with self.assertRaises(AttestationSignatureError):
+            verify_measurement(bad, verifier=KeyVerifier(_PUB))
+
+    def test_wrong_key_is_AttestationSignatureError(self) -> None:
+        with self.assertRaises(AttestationSignatureError):
+            verify_measurement(_signed(), verifier=KeyVerifier(public_key(bytes(range(1, 33)))))
+
+    def test_pass_missing_a_coordinate_is_SubjectCompositionError_at_sign(self) -> None:
+        # a PASS requires ALL FOUR runtime_subject coordinates. Drop the guard digest -> composition error.
+        with self.assertRaises(SubjectCompositionError):
+            _signed(guard_policy_digest=None)
+
+    def test_orphan_subject_is_SubjectCompositionError_at_sign(self) -> None:
+        # a subject claimed while a coordinate is null is incoherent (an unattestable ERROR must not smuggle
+        # in a calibrated subject) — refused at SIGN (validate-before-sign).
+        with self.assertRaises(SubjectCompositionError):
             _signed(outcome=VerdictType.ERROR, execution_identity_digest=None,
                     subject_identity="orphan-subject")
 
+    def test_forged_subject_is_SubjectMismatchError_at_sign(self) -> None:
+        # a subject that is not H(runtime_subject) is caught by the recompute at SIGN, so a validly-signed
+        # record can NEVER carry a mismatched composite.
+        with self.assertRaises(SubjectMismatchError):
+            _signed(subject_identity="forged-subject-that-was-not-derived")
+
+    # ---- tamper (not re-signed) -> signature layer fires (the record's bytes changed) ----
+
+    def test_tamper_any_coordinate_without_resign_fails_signature(self) -> None:
+        for field_name, evil in (
+            ("resolved_profile_digest", "blake2b:EVIL"),
+            ("trust_policy_digest", "trust-EVIL"),
+            ("guard_policy_digest", "guard-EVIL"),
+            ("execution_identity_digest", "exec-EVIL"),
+        ):
+            tampered = replace(_signed(), **{field_name: evil})  # signature not recomputed
+            with self.assertRaises(AttestationSignatureError):
+                verify_measurement(tampered, verifier=KeyVerifier(_PUB))
+
+    # ---- the mandatory CONTEXT-ISOLATION proof (three properties) ----
+
+    def test_context_isolation_three_properties(self) -> None:
+        base_unsigned = _unsigned()
+        changed_unsigned = replace(base_unsigned, oracle_head="a-DIFFERENT-oracle-head")
+        # (a) changing a calibration_context field leaves the SUBJECT identity unchanged (the subject digest
+        #     consumes ONLY the four runtime_subject coordinates).
+        self.assertEqual(base_unsigned.subject_identity, changed_unsigned.subject_identity)
+        # (b) it INVALIDATES the old signature (the envelope covers the context too).
+        base_signed = sign_measurement(base_unsigned, signer=SeedSigner(_SEED))
+        forged = replace(base_signed, oracle_head="a-DIFFERENT-oracle-head")  # context changed, sig stale
+        with self.assertRaises(AttestationSignatureError):
+            verify_measurement(forged, verifier=KeyVerifier(_PUB))
+        # (c) RE-SIGNING yields a valid attestation with the SAME subject and the changed context.
+        resigned = sign_measurement(changed_unsigned, signer=SeedSigner(_SEED))
+        verify_measurement(resigned, verifier=KeyVerifier(_PUB))
+        self.assertEqual(resigned.subject_identity, base_signed.subject_identity)  # subject unchanged
+        self.assertEqual(resigned.oracle_head, "a-DIFFERENT-oracle-head")          # context changed
+
+    # ---- ERROR / non-restorable ----
+
     def test_error_with_null_environment_is_valid_but_non_restorable(self) -> None:
-        # conditional validity: an ERROR whose environment was unattestable carries null components + null
-        # subject. It is a VALID signed audit record, but categorically NOT a restore basis.
-        att = _signed(outcome=VerdictType.ERROR, resolved_profile_digest=None,
-                      execution_identity_digest=None, subject_identity=None,
+        att = _signed(outcome=VerdictType.ERROR, resolved_profile_digest=None, trust_policy_digest=None,
+                      guard_policy_digest=None, execution_identity_digest=None, subject_identity=None,
                       harness_errors=("detector-unresolved:UnregisteredDetectorError",))
         verify_measurement(att, verifier=KeyVerifier(_PUB))  # a valid signed record
         self.assertFalse(att.is_clean_pass)                  # but never restorable
         self.assertTrue(attestation_ref(att))                # still content-addressable audit evidence
 
-    def test_bool_issued_at_ms_is_rejected_at_sign(self) -> None:
-        # v4 P2: bool is an int subclass — a strict wire-schema check must reject issued_at_ms=True BEFORE
-        # signing (type coercion laundering). Guard = type(...) is int; remove it and True signs cleanly.
-        with self.assertRaises(AttestationError):
-            _signed(issued_at_ms=True)
-
-    def test_wrong_key_is_refused(self) -> None:
-        with self.assertRaises(AttestationError):
-            verify_measurement(_signed(), verifier=KeyVerifier(public_key(bytes(range(1, 33)))))
+    def test_all_taxonomy_errors_are_attestation_errors(self) -> None:
+        # the layer-tagged subclasses remain AttestationError so existing `except AttestationError` catches.
+        for cls in (MeasurementSchemaError, IdentityContractError, AttestationSignatureError,
+                    SubjectCompositionError, SubjectMismatchError):
+            self.assertTrue(issubclass(cls, AttestationError))
 
 
 if __name__ == "__main__":

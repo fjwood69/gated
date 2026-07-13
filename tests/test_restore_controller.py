@@ -31,7 +31,9 @@ from gate.restore_controller import (
     RestoreResult,
 )
 from sandbox.noop import NoOpSandbox
-from tests._backend_optout import allow_any_backend
+from gate.trust_policy import resolve_trust_policy
+from tests._backend_optout import test_guard_policy
+_REF_TP = resolve_trust_policy("trust-policy:completed-only")
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
 _SEED = bytes(range(32))
@@ -122,7 +124,7 @@ def _run(c: CalibrationStore, verdicts: list[Verdict], *, tier_gen: str = "tg", 
         policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(),
         detector_id="d", resolve=reg.resolve_bundle,
         requested_subject_identity=(requested if requested is not None else _DET), tier_generation=tier_gen,
-        budget=_BUDGET, issuer=_ISSUER, nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3, backend_guard=allow_any_backend)
+        budget=_BUDGET, issuer=_ISSUER, nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3, backend_guard=test_guard_policy, trust_policy=_REF_TP)
 
 
 # The deterministic MEASUREMENT-DERIVED subject identity for this module's detector + NoOp environment

@@ -1,37 +1,33 @@
 """gate/attestation.py — 3.5 job-1: the SIGNED MEASUREMENT (the re-calibration runner's only output).
 
-The keystone of *measurement ≠ governance*. The re-calibration runner MEASURES a detector's fitness
-and emits one of these — a signed statement "subject S, on set S at oracle-head H, tier-generation G,
-scored PASS/FAIL/ERROR over THIS complete fixture coverage, short-circuit OFF, in run R". It carries
-**no authority to change any tier**: the signing key is the MEASUREMENT key, which is NOT in the
-tier-write authorised set, and the runner is handed no ``PolicyStore``. A separate governance act (the
-restore controller for an auto-restore, or a human ``ratify_enable`` / demote) must CONSUME a verified
-attestation to move state. A FAIL never demotes and a PASS never enables *by itself*.
+The keystone of *measurement ≠ governance*. The re-calibration runner MEASURES a detector's fitness and
+emits one of these — a signed statement "runtime-subject S, under calibration-context C, scored PASS/FAIL/
+ERROR over THIS complete coverage, short-circuit OFF, in run R". It carries **no authority to change any
+tier**: the signing key is the MEASUREMENT key (not in the tier-write set), and the runner is handed no
+``PolicyStore``. A separate governance act (restore controller / human ratify/demote) must CONSUME a
+verified attestation to move state.
 
-3.5-close P1-3 — MEASUREMENT-DERIVED IDENTITY (schema ``measurement-attestation:v2``). The identity a
-PASS binds is no longer a CALLER-supplied string (the sign-A-run-B hole). It is the **calibrated-subject
-identity** = ``H(resolved_profile_digest, execution_identity_digest)``, where BOTH coordinates come from
-the SAME calibration operation and neither is caller input:
-  * ``resolved_profile_digest`` — the trusted registry's ``ResolvedDetectorProfile`` digest for the
-    detector that ACTUALLY ran (which detector code + entrypoint + trusted config), carried out of
-    ``calibrate`` so no second resolution can drift.
-  * ``execution_identity_digest`` — the parent-measured environment identity (backend/image/isolation/
-    observer) the run actually happened in.
-Both components are exposed alongside the composite so a consumer can recompute the binding and identify
-the measured environment; the verifier RECOMPUTES ``subject_identity`` and rejects a tampered composite.
-The 3.4 caller-supplied 4-tuple (``core.identity.bind_identity``) is superseded here — it was itself
-caller-derived and is retained only as a non-authoritative legacy helper.
+3.5 S3 — the 4-TUPLE RuntimeSubject (schema ``measurement-attestation:v3``, ``IDENTITY_CONTRACT_VERSION``).
+The signed record has two explicit NESTED blocks under ONE issuer signature (board ckpt4 Q1):
+  * ``runtime_subject`` = { resolved_profile_digest, trust_policy_digest, guard_policy_digest,
+    execution_identity_digest } — WHO/WHAT ran. The ``subject_identity`` composite is
+    ``H_v{ICV}(runtime_subject)`` and consumes ONLY these four coordinates (``RUNTIME_SUBJECT_FIELDS``), so
+    a calibration-context field can never drift into the identity hash.
+  * ``calibration_context`` = { set_id, oracle_head, coverage_digest, tier_generation } — UNDER WHAT it was
+    measured. The signature AUTHENTICATES the reported context; it does NOT authorize or vouch for its
+    currency (governance re-checks that against live policy/oracle state at restore).
+The two blocks are separate STRUCTURES, not separate authorities — one measurement issuer signs both. All
+four trust/guard/profile/execution coordinates are measured/derived, never caller-supplied (the P1-3/S3
+sign-A-run-B close, now over the full 4-tuple).
 
-Replay-safety (the amendment): a PASS binds its FULL context — ``subject_identity`` + its two components,
-the scoped ``oracle_head``, the ``tier_generation``, ``run_id`` + ``nonce`` + ``issued_at``, the COMPLETE
-``fixture_coverage``, and ``short_circuit=False``. A stale PASS cannot be replayed to restore a detector
-because the restore controller re-checks these against the CURRENT world and refuses on any drift.
+``IDENTITY_CONTRACT_VERSION`` is bound TWO ways: an explicit signed field AND the subject digest's
+domain PREFIX (``gated.calibrated-subject.v{ICV}``), so a vN subject digest is cryptographically
+unverifiable under vM — not merely rejected. The attestation SCHEMA version and the ICV are INDEPENDENT
+axes (the wire format may evolve without changing how identity composes, and vice-versa).
 
-Signed with ASYMMETRIC Ed25519 (merge-ready #2): the runner signs with a PRIVATE seed; the restore
-controller holds ONLY the PUBLIC key. The signed content is a domain-separated, schema-validated
-``canonical_digest`` envelope (versioned, float-free, NFC-normalised) — cross-language reproducible and
-tamper-evident on every field. A deployment binds a KMS/HSM behind the same seam. Gate-side; ``core``
-never imports this. Deterministic (NFR6): run_id / nonce / issued_at are INPUTS, not generated here.
+Signed with ASYMMETRIC Ed25519: the runner signs with a PRIVATE seed; the restore controller holds ONLY
+the PUBLIC key. The signed content is a domain-separated, schema-validated ``canonical_digest`` envelope.
+Gate-side; ``core`` never imports this. Deterministic (NFR6): run_id / nonce / issued_at are INPUTS.
 """
 from __future__ import annotations
 
@@ -41,93 +37,138 @@ from core import VerdictType
 from gate import signing
 from core.chain import canonical_digest, content_digest
 
-# The attestation wire schema. This is a NEW evidence schema, not merely new field population — the
-# signed bytes carry the version, and the verifier HARD-REJECTS anything else (a v1 record cannot
-# restore a tier). Nothing is deployed, so no v1 compatibility machinery exists.
-MEASUREMENT_ATTESTATION_SCHEMA = "measurement-attestation:v2"
+# The attestation WIRE schema — an axis independent of the identity contract. The verifier hard-rejects
+# any other value (an old record cannot restore a tier). Nothing is deployed, so no back-compat machinery.
+MEASUREMENT_ATTESTATION_SCHEMA = "measurement-attestation:v3"
 _ATTESTATION_DOMAIN = "gated.measurement-attestation"
 
-# The calibrated-subject identity binder (P1-3). Domain-separated + versioned so the composite is
-# unambiguous and a future scheme change invalidates old records rather than silently reinterpreting them.
-_SUBJECT_DOMAIN = "gated.calibrated-subject"
-CALIBRATED_SUBJECT_VERSION = 1
+# The IDENTITY CONTRACT version — how the RuntimeSubject coordinates compose into the subject digest. Bound
+# as an explicit signed field AND baked into the subject digest's domain prefix (crypto domain separation).
+IDENTITY_CONTRACT_VERSION = 1
+_SUBJECT_DOMAIN_PREFIX = "gated.calibrated-subject"
+
+# The EXPLICIT allowlist of coordinates that enter the subject identity hash — nothing else may. The
+# calibration-context fields are signed by the envelope but MUST NOT feed the subject digest (the
+# context-isolation test proves this structurally).
+RUNTIME_SUBJECT_FIELDS = (
+    "resolved_profile_digest",
+    "trust_policy_digest",
+    "guard_policy_digest",
+    "execution_identity_digest",
+)
+CALIBRATION_CONTEXT_FIELDS = ("set_id", "oracle_head", "coverage_digest", "tier_generation")
 
 
 class AttestationError(RuntimeError):
-    """A measurement attestation could not be trusted — unsupported schema (a v1 record), signature-
-    invalid (payload tampered or wrong key), or an incoherent/tampered subject composite. The consumer
-    (restore controller / governance) fails CLOSED: an unverifiable measurement is no measurement, so no
-    state moves."""
+    """Base: a measurement attestation could not be trusted. The consumer fails CLOSED — an unverifiable
+    measurement is no measurement, so no state moves. Subclasses are LAYER-TAGGED so a negative test can
+    assert exactly which layer rejected (and cannot pass for the wrong reason)."""
 
 
-def calibrated_subject_identity(resolved_profile_digest: str, execution_identity_digest: str) -> str:
-    """The composite CALIBRATED-SUBJECT identity: WHICH detector code (its resolved-profile digest) ran in
-    WHICH measured environment (its parent-measured execution-identity digest). Both coordinates are
-    trusted/measured, never caller-supplied — this is the P1-3 close. A change in EITHER yields a new
-    subject identity, so a stale calibration cannot bind a drifted detector or a drifted environment (the
-    future enforcement match fails closed)."""
-    return canonical_digest(_SUBJECT_DOMAIN, {
-        "version": CALIBRATED_SUBJECT_VERSION,
+class MeasurementSchemaError(AttestationError):
+    """Wire layer: wrong schema version, or a field of the wrong primitive type."""
+
+
+class IdentityContractError(AttestationError):
+    """Identity-contract layer: an ``identity_contract_version`` this build does not implement."""
+
+
+class AttestationSignatureError(AttestationError):
+    """Signature layer: the signature is not valid hex, or does not verify under the issuer's public key."""
+
+
+class SubjectCompositionError(AttestationError):
+    """Composition layer: the outcome-required runtime_subject coordinates are absent / partial."""
+
+
+class SubjectMismatchError(AttestationError):
+    """Recompute layer: ``subject_identity`` != ``H_v{ICV}(runtime_subject)`` — tampered or inconsistent."""
+
+
+class PolicyAuthorizationError(AttestationError):
+    """Governance layer: the (verified) measured subject is not the policy's currently authorized target.
+    Raised by the governance consumer (restore controller), never by ``verify_measurement`` itself."""
+
+
+def calibrated_subject_identity(
+    resolved_profile_digest: str | None,
+    trust_policy_digest: str | None,
+    guard_policy_digest: str | None,
+    execution_identity_digest: str | None,
+    *,
+    icv: int = IDENTITY_CONTRACT_VERSION,
+) -> str:
+    """The composite CALIBRATED-SUBJECT identity over the FOUR RuntimeSubject coordinates: WHICH detector
+    code, under WHICH observation-trust policy + WHICH backend-guard policy, in WHICH measured environment.
+    All four are trusted/measured, never caller-supplied. The ``icv`` is bound into the DOMAIN PREFIX, so a
+    change in the identity contract yields a digest that cannot cross-verify under another contract version.
+    A change in ANY coordinate yields a new subject identity (the enforcement match then fails closed)."""
+    return canonical_digest(f"{_SUBJECT_DOMAIN_PREFIX}.v{icv}", {
         "resolved_profile_digest": resolved_profile_digest,
+        "trust_policy_digest": trust_policy_digest,
+        "guard_policy_digest": guard_policy_digest,
         "execution_identity_digest": execution_identity_digest,
     })
 
 
 @dataclass(frozen=True)
 class MeasurementAttestation:
-    """A signed, self-describing measurement. ``outcome`` is the calibration-level verdict
-    (PASS/FAIL/ERROR). Everything except ``signature`` is signed. For a FAIL, the failure breakdown
-    (``fn_failures`` etc.) is the legible evidence a human uses for the missed-FN split; it does NOT
-    itself resolve anything (no auto-resolve). ``fixture_coverage`` is the sorted tuple of every
-    ground-truth fixture id scored — a PASS with incomplete coverage is not a valid restore basis.
+    """A signed, self-describing measurement. ``outcome`` is the calibration-level verdict. Everything
+    except ``signature`` is signed. The identity lives in the ``runtime_subject`` block (the four
+    ``RUNTIME_SUBJECT_FIELDS``); ``set_id``/``oracle_head``/``coverage_digest``/``tier_generation`` are the
+    ``calibration_context`` block (signed as REPORTED, not authorized).
 
-    P1-3 (v2): ``subject_identity`` is the measurement-derived calibrated-subject identity (see
-    ``calibrated_subject_identity``); ``resolved_profile_digest`` and ``execution_identity_digest`` are its
-    two derivation components, exposed so a consumer can recompute + identify the measured environment.
-    CONDITIONAL VALIDITY: a PASS/FAIL requires BOTH components (and hence a subject); an ERROR whose
-    environment was unattestable may carry ``execution_identity_digest=None`` (and ``subject_identity=None``)
-    — it is signed evidence of a failed attempt but is categorically NON-restorable (``is_clean_pass``
-    False). A drifted/unregistered resolution likewise yields audit evidence, never a restore basis."""
+    CONDITIONAL VALIDITY: a PASS/FAIL requires ALL FOUR runtime_subject coordinates and the composite
+    subject; an ERROR whose environment/policies were unattestable may carry null coordinates (and
+    ``subject_identity=None``) — signed evidence of a failed attempt, categorically NON-restorable
+    (``is_clean_pass`` False)."""
 
     outcome: VerdictType
     policy_id: str
-    subject_identity: str | None      # P1-3 MEASURED composite = H(profile, execution) (None on ERROR)
-    requested_subject_identity: str   # v3: the GOVERNANCE target this run was asked to measure (signed).
-    # measurement ≠ governance: the runner MEASURES subject_identity; restore requires measured==requested
-    # AND requested==the policy's currently authorized target, so measurement can never SELECT the target.
-    resolved_profile_digest: str | None   # component 1 — which detector code ran (trusted registry)
-    execution_identity_digest: str | None  # component 2 — which measured environment it ran in
+    subject_identity: str | None      # MEASURED composite = H_v{ICV}(runtime_subject) (None on ERROR)
+    requested_subject_identity: str   # the GOVERNANCE target this run was asked to measure (signed)
+    # --- runtime_subject block (the four coordinates the subject digest consumes) ---
+    resolved_profile_digest: str | None   # WHICH detector code ran (trusted registry)
+    trust_policy_digest: str | None       # WHICH observation-trust policy governed it (S3 B1)
+    guard_policy_digest: str | None       # WHICH backend-guard policy governed it (S3 B3)
+    execution_identity_digest: str | None  # WHICH measured environment it ran in
+    # --- calibration_context block (signed as reported; currency re-checked by governance) ---
     set_id: str
     oracle_head: str                # set_head(set_id) at measurement time (the SEALED head)
-    coverage_digest: str            # digest of the exact ground-truth fixtures scored (co-sealed w/ head)
-    tier_generation: str            # policy tier-chain head at measurement (AUDIT provenance only)
+    coverage_digest: str            # digest of the exact ground-truth fixtures scored
+    tier_generation: str            # policy tier-chain head at measurement (AUDIT provenance)
+    # --- issuance metadata ---
     issuer: str                     # the CALIBRATION_GOVERNANCE issuer id (checked vs an allowlist)
     run_id: str
     nonce: str
-    issued_at_ms: int               # v3: integer ms IS the wire field (no lossy float round-trip)
+    issued_at_ms: int               # integer ms IS the wire field (no lossy float round-trip)
     fixture_coverage: tuple[str, ...]
     short_circuit: bool             # MUST be False for a PASS to be a valid restore basis
     fn_failures: tuple[str, ...] = ()
     fp_failures: tuple[str, ...] = ()
     flaky: tuple[str, ...] = ()
     harness_errors: tuple[str, ...] = ()
+    identity_contract_version: int = IDENTITY_CONTRACT_VERSION  # signed; exact-matched calibrate<->enforce
     schema: str = MEASUREMENT_ATTESTATION_SCHEMA  # signed; verifier hard-rejects any other value
     signature: str = field(default="")   # Ed25519 signature (hex) over the canonical envelope
 
+    def _runtime_subject(self) -> dict[str, object]:
+        return {f: getattr(self, f) for f in RUNTIME_SUBJECT_FIELDS}
+
+    def _calibration_context(self) -> dict[str, object]:
+        return {f: getattr(self, f) for f in CALIBRATION_CONTEXT_FIELDS}
+
     def _envelope(self) -> dict[str, object]:
-        """The signed content — a domain-separated, schema-validated ``canonical_digest`` envelope,
-        EXCLUDING ``signature``. Float-free (``issued_at`` is bound as integer ms) and fully specified so
-        the signed bytes are stable and cross-language reproducible (NFR6). Every field except the
-        signature is inside it, so the signature covers the whole record."""
+        """The signed content — a domain-separated ``canonical_digest`` envelope EXCLUDING ``signature``,
+        with ``runtime_subject`` and ``calibration_context`` as explicit nested blocks under one signature."""
         return {
             "schema": self.schema,
+            "identity_contract_version": self.identity_contract_version,
             "outcome": self.outcome.value, "policy_id": self.policy_id,
             "subject_identity": self.subject_identity,
             "requested_subject_identity": self.requested_subject_identity,
-            "resolved_profile_digest": self.resolved_profile_digest,
-            "execution_identity_digest": self.execution_identity_digest,
-            "set_id": self.set_id, "oracle_head": self.oracle_head,
-            "coverage_digest": self.coverage_digest, "tier_generation": self.tier_generation,
+            "runtime_subject": self._runtime_subject(),
+            "calibration_context": self._calibration_context(),
             "issuer": self.issuer, "run_id": self.run_id, "nonce": self.nonce,
             "issued_at_ms": self.issued_at_ms,
             "fixture_coverage": sorted(self.fixture_coverage), "short_circuit": self.short_circuit,
@@ -142,17 +183,16 @@ class MeasurementAttestation:
 
     @property
     def is_clean_pass(self) -> bool:
-        """A PASS eligible to be a restore basis: v2 schema, outcome PASS, short-circuit OFF, non-empty
-        complete coverage, AND both derivation components + the composite subject present (conditional
-        validity — an ERROR that nulled its environment is categorically non-restorable). The restore
-        controller ALSO checks value-currency + tier asymmetry; this is only the intrinsic shape."""
+        """A PASS eligible to be a restore basis: v3 schema, matching ICV, outcome PASS, short-circuit OFF,
+        non-empty coverage, ALL FOUR runtime_subject coordinates present, and the composite subject present.
+        The restore controller ALSO checks value-currency + tier asymmetry; this is the intrinsic shape."""
         return (
             self.schema == MEASUREMENT_ATTESTATION_SCHEMA
+            and self.identity_contract_version == IDENTITY_CONTRACT_VERSION
             and self.outcome is VerdictType.PASS
             and self.short_circuit is False
             and len(self.fixture_coverage) > 0
-            and self.resolved_profile_digest is not None
-            and self.execution_identity_digest is not None
+            and all(getattr(self, f) is not None for f in RUNTIME_SUBJECT_FIELDS)
             and self.subject_identity is not None
         )
 
@@ -161,62 +201,86 @@ def _envelope_digest(attestation: MeasurementAttestation) -> str:
     return canonical_digest(_ATTESTATION_DOMAIN, attestation._envelope())
 
 
-def _check_wire_schema(att: MeasurementAttestation) -> None:
-    """v4 (board P2): validate the COMPLETE wire schema before trusting/signing — not just the identity
-    shape. Enforces the exact schema version and exact field TYPES (``bool`` is an ``int`` subclass, so an
-    ``issued_at_ms`` of ``True`` must be rejected; collection elements must be ``str``). This closes
-    type-coercion laundering (a value that passes a lax check but evaluates differently in app logic)."""
+# ---- the deterministic validation pipeline (board ckpt4: type-check discriminators BEFORE comparing) ----
+
+def _check_discriminator_types(att: MeasurementAttestation) -> None:
+    """Step 1 — the discriminator PRIMITIVE types, before any comparison (comparing an untyped
+    discriminator is not well-defined). ``schema`` is a str; ``identity_contract_version`` is an int (bool
+    is an int subclass — reject it)."""
+    if type(att.schema) is not str:
+        raise MeasurementSchemaError("schema must be a str")
+    if type(att.identity_contract_version) is not int:
+        raise IdentityContractError("identity_contract_version must be an int (not bool / str)")
+
+
+def _check_schema_version(att: MeasurementAttestation) -> None:
     if att.schema != MEASUREMENT_ATTESTATION_SCHEMA:
-        raise AttestationError(
+        raise MeasurementSchemaError(
             f"unsupported attestation schema {att.schema!r} — only {MEASUREMENT_ATTESTATION_SCHEMA!r}")
+
+
+def _check_identity_contract(att: MeasurementAttestation) -> None:
+    if att.identity_contract_version != IDENTITY_CONTRACT_VERSION:
+        raise IdentityContractError(
+            f"unsupported identity_contract_version {att.identity_contract_version!r} — only "
+            f"{IDENTITY_CONTRACT_VERSION!r}")
+
+
+def _check_wire_types(att: MeasurementAttestation) -> None:
+    """The remaining exact wire types (after the discriminators are typed + matched)."""
     if not isinstance(att.outcome, VerdictType):
-        raise AttestationError("outcome must be a VerdictType")
+        raise MeasurementSchemaError("outcome must be a VerdictType")
     if type(att.issued_at_ms) is not int:  # bool is an int subclass — reject it explicitly
-        raise AttestationError("issued_at_ms must be an int (not bool / str / float)")
+        raise MeasurementSchemaError("issued_at_ms must be an int (not bool / str / float)")
     if type(att.short_circuit) is not bool:
-        raise AttestationError("short_circuit must be a bool")
-    for field_name in ("fixture_coverage", "fn_failures", "fp_failures", "flaky", "harness_errors"):
-        seq = getattr(att, field_name)
+        raise MeasurementSchemaError("short_circuit must be a bool")
+    for name in ("fixture_coverage", "fn_failures", "fp_failures", "flaky", "harness_errors"):
+        seq = getattr(att, name)
         if not isinstance(seq, tuple) or not all(type(x) is str for x in seq):
-            raise AttestationError(f"{field_name} must be a tuple of str")
+            raise MeasurementSchemaError(f"{name} must be a tuple of str")
+    for name in RUNTIME_SUBJECT_FIELDS:
+        v = getattr(att, name)
+        if v is not None and type(v) is not str:
+            raise MeasurementSchemaError(f"{name} must be str or None")
 
 
 def _check_conditional_validity(att: MeasurementAttestation) -> None:
-    """v3 (board P2): enforce the outcome-conditional identity-coordinate rules on the WIRE, not just via
-    ``is_clean_pass``. Applied at BOTH sign and verify. Rules:
-      * execution-only (execution digest present, profile absent) is IMPOSSIBLE -> rejected;
-      * PASS / FAIL require BOTH components AND a composite subject;
-      * ERROR may be profile-only (resolution succeeded, environment unattestable) or all-null;
-      * whenever a subject is present it MUST equal H(profile, execution) with both components present."""
-    rpd, eid, subj = att.resolved_profile_digest, att.execution_identity_digest, att.subject_identity
-    if eid is not None and rpd is None:
-        raise AttestationError(
-            "execution_identity_digest present without resolved_profile_digest — a measured environment "
-            "with no resolved detector is incoherent")
+    """Composition + recompute layers. PASS/FAIL require ALL four runtime_subject coordinates AND a
+    composite subject; an ERROR may carry null coordinates (non-restorable evidence). Whenever a subject is
+    present, ALL four coordinates must be present and the subject MUST equal ``H_v{ICV}(runtime_subject)``
+    using the SIGNED ICV as the domain prefix."""
+    coords_present = all(getattr(att, f) is not None for f in RUNTIME_SUBJECT_FIELDS)
+    subj = att.subject_identity
     if att.outcome in (VerdictType.PASS, VerdictType.FAIL):
-        if rpd is None or eid is None or subj is None:
-            raise AttestationError(
-                f"a {att.outcome.value} attestation requires both derivation components and a composite "
-                "subject_identity (conditional v2 validity)")
+        if not coords_present or subj is None:
+            raise SubjectCompositionError(
+                f"a {att.outcome.value} attestation requires all runtime_subject coordinates and a "
+                "composite subject_identity (conditional v3 validity)")
     if subj is not None:
-        if rpd is None or eid is None:
-            raise AttestationError(
-                "subject_identity is present without both derivation components — incoherent "
+        if not coords_present:
+            raise SubjectCompositionError(
+                "subject_identity present without all runtime_subject coordinates — incoherent "
                 "(an unattestable ERROR must not claim a calibrated subject)")
-        if subj != calibrated_subject_identity(rpd, eid):
-            raise AttestationError(
-                "subject_identity != H(resolved_profile_digest, execution_identity_digest) — the "
+        if subj != calibrated_subject_identity(
+            att.resolved_profile_digest, att.trust_policy_digest, att.guard_policy_digest,
+            att.execution_identity_digest, icv=att.identity_contract_version,
+        ):
+            raise SubjectMismatchError(
+                "subject_identity != H(runtime_subject) under the signed identity_contract_version — the "
                 "measurement-derived composite is tampered or inconsistent")
 
 
 def sign_measurement(
     unsigned: MeasurementAttestation, *, signer: signing.Signer
 ) -> MeasurementAttestation:
-    """Return a signed copy of ``unsigned`` (Ed25519 signature over the v2 canonical envelope). 3.5-close
-    #1.4: takes a ``Signer`` OBJECT, not a raw seed. v3/v4: VALIDATE-BEFORE-SIGN — the runner refuses to
-    sign a record that violates the COMPLETE wire schema OR conditional validity, so an invalid attestation
-    is never produced, not merely rejected on read."""
-    _check_wire_schema(unsigned)
+    """Return a signed copy of ``unsigned`` (Ed25519 over the v3 canonical envelope). VALIDATE-BEFORE-SIGN
+    in the deterministic order (minus signature): the runner refuses to sign a record that violates the
+    schema / identity-contract / wire types / conditional validity, so an invalid attestation is never
+    produced, not merely rejected on read."""
+    _check_discriminator_types(unsigned)
+    _check_schema_version(unsigned)
+    _check_identity_contract(unsigned)
+    _check_wire_types(unsigned)
     _check_conditional_validity(unsigned)
     return replace(unsigned, signature=signer.sign(_envelope_digest(unsigned).encode("utf-8")).hex())
 
@@ -224,35 +288,46 @@ def sign_measurement(
 def verify_measurement(
     attestation: MeasurementAttestation, *, verifier: signing.Verifier
 ) -> None:
-    """Raise ``AttestationError`` unless the attestation is a valid v2 record: (1) schema is exactly
-    ``measurement-attestation:v2`` (a v1 record is HARD-REJECTED); (2) the Ed25519 signature over the
-    canonical envelope is valid under ``verifier`` (a public-key-only ``Verifier`` — it cannot forge);
-    (3) conditional validity holds — the outcome-appropriate identity coordinates are present and any
-    ``subject_identity`` equals ``H(resolved_profile_digest, execution_identity_digest)`` (tamper of either
-    component or the composite fails here). Integrity/authenticity only — freshness is the restore CAS."""
-    _check_wire_schema(attestation)  # v4: exact schema + field types before trusting the signature
+    """Raise an ``AttestationError`` subclass unless the attestation is a valid v3 record. Deterministic
+    validation ORDER (board ckpt4) — each layer's failure is a DISTINCT typed error so a negative cannot
+    pass for the wrong reason: (1) discriminator primitive types → (2) schema equality → (3) ICV equality →
+    (4) remaining wire types → (5) Ed25519 signature over the canonical envelope → (6) conditional presence
+    → (7) composite recompute using the SIGNED ICV. Integrity/authenticity only — value-currency + the
+    governance/authorization match are the restore controller's job (a distinct layer)."""
+    _check_discriminator_types(attestation)
+    _check_schema_version(attestation)
+    _check_identity_contract(attestation)
+    _check_wire_types(attestation)
     try:
         sig = bytes.fromhex(attestation.signature)
-    except ValueError:
-        raise AttestationError("measurement signature is not valid hex") from None
+    except (ValueError, TypeError):
+        raise AttestationSignatureError("measurement signature is not valid hex") from None
     if not verifier.verify(_envelope_digest(attestation).encode("utf-8"), sig):
-        raise AttestationError("measurement signature invalid — payload tampered or wrong key")
+        raise AttestationSignatureError("measurement signature invalid — payload tampered or wrong key")
     _check_conditional_validity(attestation)
 
 
 def attestation_ref(attestation: MeasurementAttestation) -> str:
     """A deterministic, content-derived handle binding a ``calibration_pass`` / RE_ATTESTATION record to
-    the EXACT immutable signed measurement (its full v2 envelope + Ed25519 ``signature``). Because the
-    signature can only be produced by the private-seed holder, a ref that resolves to a real signed PASS
-    cannot be fabricated without a valid signature. Replay of an OLD signed attestation is caught
-    separately by the restore CAS (its ``oracle_head`` is no longer current)."""
+    the EXACT immutable signed measurement (its full v3 envelope + Ed25519 ``signature``). A ref that
+    resolves to a real signed PASS cannot be fabricated without a valid signature. Replay of an OLD signed
+    attestation is caught separately by the restore CAS (its ``oracle_head`` is no longer current)."""
     return content_digest({"envelope": attestation._envelope(), "signature": attestation.signature})
 
 
 __all__ = [
     "AttestationError",
+    "MeasurementSchemaError",
+    "IdentityContractError",
+    "AttestationSignatureError",
+    "SubjectCompositionError",
+    "SubjectMismatchError",
+    "PolicyAuthorizationError",
     "MeasurementAttestation",
     "MEASUREMENT_ATTESTATION_SCHEMA",
+    "IDENTITY_CONTRACT_VERSION",
+    "RUNTIME_SUBJECT_FIELDS",
+    "CALIBRATION_CONTEXT_FIELDS",
     "calibrated_subject_identity",
     "sign_measurement",
     "verify_measurement",

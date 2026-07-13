@@ -22,7 +22,9 @@ from gate.calibration_store import AdmissionCapability
 from gate.detector_registry import DetectorRegistry, UnregisteredDetectorError, profile_of
 from gate.recalibration import deterministic_job_id, run_recalibration
 from sandbox.noop import NoOpSandbox
-from tests._backend_optout import allow_any_backend
+from gate.trust_policy import resolve_trust_policy
+from tests._backend_optout import test_guard_policy
+_REF_TP = resolve_trust_policy("trust-policy:completed-only")
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
 _SEED = bytes(range(32))
@@ -81,7 +83,7 @@ def _run(c: CalibrationStore, det: _ScriptedDetector, *, nonce: str = "n1",  # t
         policy_id="p1", set_id="X", calibration_store=c, make_sandbox=_factory(),
         detector_id="d", resolve=resolve or reg.resolve_bundle,
         requested_subject_identity=requested, tier_generation="tier-h", budget=_BUDGET, issuer="cal-gov-1",
-        nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3, backend_guard=allow_any_backend
+        nonce=nonce, now=100.0, signer=SeedSigner(_SEED), trials=3, backend_guard=test_guard_policy, trust_policy=_REF_TP
     )
 
 
@@ -95,11 +97,14 @@ class RunnerOutcomeTests(unittest.TestCase):
         self.assertFalse(att.short_circuit)
         self.assertEqual(att.oracle_head, c.set_head("X"))  # co-sealed head is the live head
         self.assertEqual(att.fixture_coverage, ("b1", "g1"))
-        # P1-3: the signed subject is measurement-derived from BOTH components (present on a PASS).
-        self.assertIsNotNone(att.resolved_profile_digest)
-        self.assertIsNotNone(att.execution_identity_digest)
+        # S3: the signed subject is measurement-derived from ALL FOUR RuntimeSubject coordinates (present
+        # on a clean PASS).
+        for f in ("resolved_profile_digest", "trust_policy_digest", "guard_policy_digest",
+                  "execution_identity_digest"):
+            self.assertIsNotNone(getattr(att, f))
         self.assertEqual(att.subject_identity, calibrated_subject_identity(
-            att.resolved_profile_digest, att.execution_identity_digest))  # type: ignore[arg-type]
+            att.resolved_profile_digest, att.trust_policy_digest, att.guard_policy_digest,
+            att.execution_identity_digest))
 
     def test_missed_known_bad_is_FAIL_and_names_the_fixture(self) -> None:
         c = _store_with_set()
@@ -135,7 +140,8 @@ class RunnerOutcomeTests(unittest.TestCase):
         self.assertNotEqual(att.subject_identity, "totally-spoofed-identity")
         self.assertEqual(att.requested_subject_identity, "totally-spoofed-identity")  # signed governance value
         self.assertEqual(att.subject_identity, calibrated_subject_identity(
-            att.resolved_profile_digest, att.execution_identity_digest))  # type: ignore[arg-type]
+            att.resolved_profile_digest, att.trust_policy_digest, att.guard_policy_digest,
+            att.execution_identity_digest))
 
     def test_unresolved_detector_is_signed_error_and_non_restorable(self) -> None:
         # P1-3 conditional validity: a drifted / unregistered detector yields a SIGNED ERROR audit

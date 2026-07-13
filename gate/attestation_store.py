@@ -18,6 +18,7 @@ from typing import Callable
 
 from core import VerdictType
 from gate.attestation import (
+    IDENTITY_CONTRACT_VERSION,
     MEASUREMENT_ATTESTATION_SCHEMA,
     AttestationError,
     MeasurementAttestation,
@@ -42,33 +43,45 @@ def _strict_int(v: object) -> int:
 
 
 def _reconstruct(payload: dict[str, object], signature: str) -> MeasurementAttestation:
-    """Rebuild a v2 ``MeasurementAttestation`` from a stored envelope. HARD-REJECTS a non-v2 schema (an
-    earlier record cannot be reconstructed as authoritative). ``issued_at`` is recovered from the signed
-    ``issued_at_ms`` (the envelope is float-free); the three P1-3 identity coordinates may be null (an
-    unattestable ERROR)."""
+    """Rebuild a v3 ``MeasurementAttestation`` from a stored envelope. The version GUARD fires FIRST
+    (schema, then identity_contract_version) — an old/unknown record is REFUSED before any field is
+    interpreted (fail-closed migration boundary; no defaulting of a missing identity coordinate). The four
+    ``runtime_subject`` coordinates are read from the nested block and may be null (an unattestable ERROR);
+    ``issued_at`` is recovered from the signed ``issued_at_ms`` (the envelope is float-free)."""
     schema = str(payload.get("schema", ""))
     if schema != MEASUREMENT_ATTESTATION_SCHEMA:
         raise AttestationError(
             f"stored attestation has unsupported schema {schema!r} — only "
             f"{MEASUREMENT_ATTESTATION_SCHEMA!r} is reconstructable")
+    icv = payload.get("identity_contract_version")
+    if type(icv) is not int or icv != IDENTITY_CONTRACT_VERSION:
+        raise AttestationError(
+            f"stored attestation has unsupported identity_contract_version {icv!r} — only "
+            f"{IDENTITY_CONTRACT_VERSION!r} is reconstructable")
+    subject = payload.get("runtime_subject")
+    context = payload.get("calibration_context")
+    if not isinstance(subject, dict) or not isinstance(context, dict):
+        raise AttestationError("stored attestation missing its runtime_subject / calibration_context block")
 
-    def _opt(key: str) -> str | None:
-        v = payload.get(key)
+    def _opt(src: dict[str, object], key: str) -> str | None:
+        v = src.get(key)
         if v is None:
             return None
-        if not isinstance(v, str):  # v4 P2: strict — no coercion of alternate reprs into a str
+        if not isinstance(v, str):  # strict — no coercion of alternate reprs into a str
             raise AttestationError(f"stored {key!r} must be a string or null, got {type(v).__name__}")
         return v
 
     return MeasurementAttestation(
         outcome=VerdictType(payload["outcome"]), policy_id=str(payload["policy_id"]),
-        subject_identity=_opt("subject_identity"),
+        subject_identity=_opt(payload, "subject_identity"),
         requested_subject_identity=str(payload["requested_subject_identity"]),
-        resolved_profile_digest=_opt("resolved_profile_digest"),
-        execution_identity_digest=_opt("execution_identity_digest"),
-        set_id=str(payload["set_id"]),
-        oracle_head=str(payload["oracle_head"]), coverage_digest=str(payload["coverage_digest"]),
-        tier_generation=str(payload["tier_generation"]), issuer=str(payload["issuer"]),
+        resolved_profile_digest=_opt(subject, "resolved_profile_digest"),
+        trust_policy_digest=_opt(subject, "trust_policy_digest"),
+        guard_policy_digest=_opt(subject, "guard_policy_digest"),
+        execution_identity_digest=_opt(subject, "execution_identity_digest"),
+        set_id=str(context["set_id"]),
+        oracle_head=str(context["oracle_head"]), coverage_digest=str(context["coverage_digest"]),
+        tier_generation=str(context["tier_generation"]), issuer=str(payload["issuer"]),
         run_id=str(payload["run_id"]), nonce=str(payload["nonce"]),
         issued_at_ms=_strict_int(payload["issued_at_ms"]),
         fixture_coverage=tuple(payload["fixture_coverage"]),  # type: ignore[arg-type]
@@ -77,6 +90,7 @@ def _reconstruct(payload: dict[str, object], signature: str) -> MeasurementAttes
         fp_failures=tuple(payload["fp_failures"]),  # type: ignore[arg-type]
         flaky=tuple(payload["flaky"]),  # type: ignore[arg-type]
         harness_errors=tuple(payload["harness_errors"]),  # type: ignore[arg-type]
+        identity_contract_version=icv,
         schema=schema, signature=signature,
     )
 
