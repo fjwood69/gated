@@ -46,17 +46,45 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol
 
 from core import Command, Fixtures, RuntimeAssertion, Verdict
-from core.chain import canonical_digest
+from core.chain import canonical_bytes, canonical_digest
 from engine.calibration import ResolvedDetector
 from gate import signing
 
 _PROFILE_DOMAIN = "gated.resolved-detector-profile"
+# A2b: the domain for the registry's IMMUTABLE canonical-bytes snapshot of the trusted behavioral_config,
+# taken ONCE at registration. Distinct from the profile domain — this is the config's own canonical form.
+_CONFIG_DOMAIN = "gated.detector.behavioral_config:v1"
+
+
+def _deep_freeze(value: Any) -> Any:
+    """Recursively freeze a canonical value: dict -> read-only MappingProxyType, list -> tuple. Scalars are
+    already immutable. Closes the v5-P2a shallow-freeze hole (a nested list/dict under a MappingProxyType
+    stayed mutable), so a caller cannot mutate a nested alias after registration to change the executed
+    config."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _deep_freeze(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(v) for v in value)
+    return value
+
+
+def _config_from_bytes(config_bytes: bytes | None) -> Mapping[str, Any] | None:
+    """Reconstruct the deep-frozen canonical config VALUE from the registry's immutable bytes snapshot. The
+    reconstructed value is the NFC-normalised canonical form; because ``canonical_digest`` normalisation is
+    idempotent, feeding it to ``profile_of`` yields the SAME profile digest as the original config (A2b is
+    profile-digest-NEUTRAL — proven by the golden + the registration/resolve round-trip)."""
+    if config_bytes is None:
+        return None
+    payload = json.loads(config_bytes.decode("utf-8"))["payload"]
+    frozen: Mapping[str, Any] = _deep_freeze(payload)
+    return frozen
 
 
 class DetectorResolutionError(RuntimeError):
@@ -160,7 +188,9 @@ def registration_binding(detector_id: str, content_hash: str) -> bytes:
 @dataclass(frozen=True)
 class _Entry:
     accepted_profile_digest: str
-    behavioral_config: Mapping[str, Any] | None
+    # A2b: the trusted behavioral_config as an IMMUTABLE canonical-bytes snapshot taken ONCE at
+    # registration (``canonical_bytes(_CONFIG_DOMAIN, config)``), not a shallow-frozen live Mapping.
+    behavioral_config_bytes: bytes | None
     build: Callable[[], RuntimeAssertion]
 
 
@@ -227,13 +257,16 @@ class DetectorRegistry:
                     f"signed registry: registration of {detector_id!r} needs a valid registrar "
                     "signature over its (id, accepted_profile_digest) binding"
                 )
-        # v4 P1-c: DEEP-FREEZE the trusted behavioral_config at registration (a read-only snapshot copy),
-        # so it can never be mutated after resolution to change the computed digest.
-        frozen_config: Mapping[str, Any] | None = (
-            MappingProxyType(dict(behavioral_config)) if behavioral_config is not None else None
+        # A2b (closes v5-P2a): snapshot the trusted behavioral_config to IMMUTABLE canonical BYTES at
+        # registration. A shallow MappingProxyType left nested lists/dicts mutable; canonical bytes capture
+        # the value at THIS instant, immune to any later mutation of a caller-retained nested alias. The
+        # bytes are the same public canonical encoding used for the cross-repo contract (gated.canonical.v1).
+        config_bytes: bytes | None = (
+            canonical_bytes(_CONFIG_DOMAIN, behavioral_config) if behavioral_config is not None else None
         )
         self._entries[detector_id] = _Entry(
-            accepted_profile_digest=accepted_profile_digest, behavioral_config=frozen_config, build=build,
+            accepted_profile_digest=accepted_profile_digest, behavioral_config_bytes=config_bytes,
+            build=build,
         )
 
     def _resolved(self, detector_id: str) -> _Resolved:
@@ -255,7 +288,10 @@ class DetectorRegistry:
             )
         detector = entry.build()
         command = detector.entrypoint()  # captured ONCE — the executed command binds to the profile below
-        profile = profile_of(detector_id, detector, entry.behavioral_config, command=command)
+        # A2b: reconstruct the deep-frozen config from the immutable registration snapshot. Profile-digest
+        # NEUTRAL — canonical normalisation is idempotent, so this yields the same digest as the original.
+        profile = profile_of(
+            detector_id, detector, _config_from_bytes(entry.behavioral_config_bytes), command=command)
         digest = profile.digest()  # the ONE content read; validated then cached as a STRING
         if digest != entry.accepted_profile_digest:
             raise DetectorIntegrityError(

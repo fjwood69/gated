@@ -96,9 +96,8 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(first, via_profile)  # resolve/resolve_profile/resolve_bundle share ONE computation
 
     def test_behavioral_config_is_frozen_at_registration(self) -> None:
-        # v4 P1-c: the registry deep-freezes a snapshot of behavioral_config at registration and caches the
-        # VALIDATED digest string; mutating the caller's original config dict afterwards must NOT change the
-        # resolved digest. Guard = deep-copy-at-register + cached digest string; remove it and d2 drifts.
+        # v4 P1-c: the registry snapshots behavioral_config at registration and caches the VALIDATED digest
+        # string; mutating the caller's original config dict afterwards must NOT change the resolved digest.
         reg = DetectorRegistry()
         det = _Detector()
         cfg = {"k": "v"}
@@ -108,6 +107,25 @@ class RegistryTests(unittest.TestCase):
         cfg["k"] = "MUTATED-AFTER-REGISTRATION"  # mutate the caller's original mapping
         d2 = reg.resolve_bundle("d").profile_digest
         self.assertEqual(d1, d2)  # frozen snapshot -> post-registration mutation has no effect
+
+    def test_behavioral_config_NESTED_mutation_has_no_effect_A2b(self) -> None:
+        # A2b (closes v5-P2a): a SHALLOW MappingProxyType left nested lists/dicts mutable — a caller could
+        # mutate a nested alias after registration and drift the executed config. The canonical-bytes
+        # snapshot captures the value at registration, so a nested mutation of the caller's retained alias
+        # has NO effect on the resolved profile digest. Remove the bytes snapshot (revert to shallow freeze)
+        # and this test fails.
+        reg = DetectorRegistry()
+        det = _Detector()
+        nested = {"limits": [1, 2, 3], "opts": {"mode": "strict"}}
+        cfg = {"nested": nested}
+        accepted = profile_of("d", det, {"nested": {"limits": [1, 2, 3], "opts": {"mode": "strict"}}}).digest()
+        reg.register("d", lambda: det, accepted_profile_digest=accepted, behavioral_config=cfg)
+        d1 = reg.resolve_bundle("d").profile_digest
+        nested["limits"].append(999)          # mutate a NESTED list the caller still holds a ref to
+        nested["opts"]["mode"] = "permissive"  # and a nested dict
+        d2 = reg.resolve_bundle("d").profile_digest
+        self.assertEqual(d1, d2)              # snapshot immune to nested mutation
+        self.assertEqual(d1, accepted)        # and still equals the accepted digest (neutral)
 
     def test_command_is_captured_once_and_frozen(self) -> None:
         # v4 P1-c: the entrypoint command is captured ONCE at resolution and returned frozen on every
