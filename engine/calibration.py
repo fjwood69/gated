@@ -49,6 +49,7 @@ from core import (
     tree_hash,
 )
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
+from engine.observation_trust import TrustPolicy
 from engine.runner import ExecutionIdentity, TrialReport, run_check
 
 # The default number of trials a calibration run exercises per fixture. Short-circuit is always
@@ -159,6 +160,14 @@ class CalibrationResult:
     # window. None when no digest source was injected, or on the inadequate-set early return (no detector
     # was resolved). The recalibration attestation binds its ``resolved_profile_digest`` from THIS.
     resolved_profile_digest: str | None = None
+    # B1 / B3 (S3): the digests of the observation trust policy + backend guard policy that ACTUALLY
+    # governed this calibration — measured PROVENANCE, bound into the RuntimeSubject. Set ONLY when
+    # consistent across every fixture; a MIXED policy across fixtures fails closed
+    # (``policies_consistent`` False -> ``passed`` False), exactly like a mixed execution identity — so a
+    # run whose trust/guard identity drifted cannot be attested. None when no policy was applied.
+    trust_policy_digest: str | None = None
+    guard_policy_digest: str | None = None
+    policies_consistent: bool = True
 
     def report(self) -> str:
         """The human-facing calibration report — FR3.1's 'theatre of verification' language,
@@ -249,6 +258,7 @@ def calibrate(
     *,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
     backend_guard: BackendGuard,
+    trust_policy: TrustPolicy | None = None,
 ) -> CalibrationResult:
     """Resolve ``detector_id`` through the injected trusted ``resolve`` and run that detector against
     every fixture in ``calibration_set``, returning whether it earns enablement. Two-sided (FR3.1 +
@@ -298,7 +308,7 @@ def calibrate(
             verdict = run_check(
                 factory, detector, artifact, budget,
                 trials=trials, first_fail=False, report_sink=capture, detector_id=detector_id,
-                command=bundle.command,
+                command=bundle.command, trust_policy=trust_policy,
             )
         outcomes.append(
             FixtureOutcome(
@@ -326,12 +336,34 @@ def calibrate(
         and len({i.digest() for i in identities if i is not None}) == 1
     )
     execution_identity = identities[0] if (identity_consistent and identities) else None
-    passed = not (fn or fp or flaky or errs) and identity_consistent
+    # B1 (S3): the trust policy applied to each fixture (recorded on its TrialReport). Bind its digest ONLY
+    # when EVERY fixture ran under the SAME applied policy — a mixed policy is fail-closed like a mixed
+    # execution identity. When no policy was applied, there is nothing to bind (consistent, digest None).
+    if trust_policy is None:
+        trust_policy_digest: str | None = None
+        trust_consistent = True
+    else:
+        tp_digests = [o.trials.trust_policy_digest for o in outcomes if o.trials is not None]
+        trust_consistent = (
+            len(tp_digests) == len(outcomes)
+            and all(d is not None for d in tp_digests)
+            and len(set(tp_digests)) == 1
+        )
+        trust_policy_digest = tp_digests[0] if (trust_consistent and tp_digests) else None
+    # B3 (S3): the guard PROVENANCE — the digest comes from the guard object ACTUALLY APPLIED (read off the
+    # same object, never separately supplied), so policy-A-applied-while-digest-B-supplied is impossible by
+    # construction. One guard governs the whole run, so it is inherently consistent. The test-only opt-out
+    # bears no policy_digest -> None (no bound guard identity, which acceptance/enforcement treat as such).
+    guard_policy_digest: str | None = getattr(backend_guard, "policy_digest", None)
+    policies_consistent = trust_consistent
+    passed = not (fn or fp or flaky or errs) and identity_consistent and policies_consistent
     return CalibrationResult(
         passed=passed, inadequate=False, fn_failures=fn, fp_failures=fp, flaky=flaky,
         harness_errors=errs, outcomes=tuple(outcomes),
         execution_identity=execution_identity, identity_consistent=identity_consistent,
         resolved_profile_digest=resolved_profile_digest,
+        trust_policy_digest=trust_policy_digest, guard_policy_digest=guard_policy_digest,
+        policies_consistent=policies_consistent,
     )
 
 

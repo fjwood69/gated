@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import Callable, Protocol
 
 from core import Sandbox
+from core.chain import canonical_digest
 from sandbox.oci import OCISandbox
 from sandbox.observed import ObservedOCISandbox
 
@@ -95,26 +96,37 @@ def trusted_backend_guard(sandbox: Sandbox) -> None:
         )
 
 
+_GUARD_POLICY_DOMAIN = "gated.backend-guard-policy"
+
+
 class BackendGuardPolicy(Protocol):
-    """Gate-side CONTRACT (B3 / D4): a NAMED, versioned guard policy. ``policy_id`` identifies it (name +
+    """Gate-side CONTRACT (B3): a NAMED, versioned guard policy. ``policy_id`` identifies it (name +
     version); CALLING it applies the guard to a sandbox and RAISES on rejection — it never returns a bool
     (an ignored return value would be a fail-open). It is structurally a ``BackendGuard``
     (``Callable[[Sandbox], None]``), so the engine consumes ``__call__`` as a plain callable and never
-    learns this gate type (engine ⊥ gate). S2 establishes the contract + the injection point ONLY — the
-    ``policy_id`` is NOT written into any signed receipt / pass / snapshot yet; that authoritative binding
-    is deferred to S3's coordinated identity-plane bump (plumbing only, not yet attested)."""
+    learns this gate type (engine ⊥ gate). ``policy_digest`` is measured PROVENANCE — the calibration layer
+    reads it OFF the applied object (never separately supplied), so S3 binds the digest of the guard that
+    actually ran (policy-A-applied-while-digest-B-supplied is impossible by construction)."""
 
     policy_id: str
+
+    @property
+    def policy_digest(self) -> str: ...
 
     def __call__(self, sandbox: Sandbox) -> None: ...
 
 
 class _TrustedBackendGuardPolicy:
     """The one approved guard policy in the reference: it applies ``trusted_backend_guard`` (the audited-
-    backend token check). ``policy_id`` names + versions it for the composition root + diagnostics only."""
+    backend token check). ``policy_id`` names + versions it; ``policy_digest`` is its canonical identity
+    digest, read off THIS object when it is the guard actually applied."""
 
     __slots__ = ()
     policy_id = "trusted-backend:v1"
+
+    @property
+    def policy_digest(self) -> str:
+        return canonical_digest(_GUARD_POLICY_DOMAIN, {"policy_id": self.policy_id})
 
     def __call__(self, sandbox: Sandbox) -> None:
         trusted_backend_guard(sandbox)

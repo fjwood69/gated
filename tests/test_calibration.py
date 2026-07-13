@@ -28,6 +28,7 @@ from engine.calibration import (
     _materialised,
     calibrate,
 )
+from gate.trust_policy import resolve_trust_policy
 from sandbox.noop import NoOpSandbox
 from tests._backend_optout import allow_any_backend
 
@@ -93,6 +94,59 @@ class _ScriptedDetector:
         v = self._verdicts[self._i]
         self._i += 1
         return v
+
+
+class _FakeGuardPolicy:
+    """A guard policy double bearing a ``policy_digest`` (accepts any sandbox) — proves calibrate reads the
+    guard digest OFF the applied object."""
+
+    policy_id = "test-guard:v1"
+
+    @property
+    def policy_digest(self) -> str:
+        return "guard-digest-xyz"
+
+    def __call__(self, sandbox: object) -> None:
+        return None
+
+
+class PolicyProvenanceTests(unittest.TestCase):
+    """S3 ckpt3: the trust + guard policy digests carried through CalibrationResult come from the policies
+    ACTUALLY APPLIED (measured provenance), and are bound only when consistent across the run."""
+
+    def _passing(self):  # type: ignore[no-untyped-def]
+        cset = CalibrationSet(known_good=(_fx(FixtureLabel.KNOWN_GOOD, "g1"),),
+                              known_bad=(_fx(FixtureLabel.KNOWN_BAD, "b1"),))
+        det = _ScriptedDetector([_FAIL] * _TRIALS + [_PASS] * _TRIALS)  # catch b1, pass g1 -> passed
+        return cset, det
+
+    def test_trust_policy_digest_bound_from_applied_policy(self) -> None:
+        policy = resolve_trust_policy("trust-policy:completed-only")
+        cset, det = self._passing()
+        r = calibrate(_hermetic_factory(), _DID, _res(det), cset, _BUDGET, trials=_TRIALS,
+                      backend_guard=allow_any_backend, trust_policy=policy)
+        self.assertTrue(r.passed)
+        self.assertEqual(r.trust_policy_digest, policy.policy_digest)  # provenance, not a caller string
+        self.assertTrue(r.policies_consistent)
+
+    def test_no_trust_policy_binds_nothing(self) -> None:
+        cset, det = self._passing()
+        r = calibrate(_hermetic_factory(), _DID, _res(det), cset, _BUDGET, trials=_TRIALS,
+                      backend_guard=allow_any_backend)  # no trust_policy
+        self.assertIsNone(r.trust_policy_digest)
+        self.assertTrue(r.policies_consistent)  # nothing applied -> nothing to be inconsistent
+
+    def test_guard_policy_digest_from_applied_object(self) -> None:
+        cset, det = self._passing()
+        r = calibrate(_hermetic_factory(), _DID, _res(det), cset, _BUDGET, trials=_TRIALS,
+                      backend_guard=_FakeGuardPolicy())
+        self.assertEqual(r.guard_policy_digest, "guard-digest-xyz")  # read OFF the applied guard object
+
+    def test_optout_guard_has_no_bound_digest(self) -> None:
+        cset, det = self._passing()
+        r = calibrate(_hermetic_factory(), _DID, _res(det), cset, _BUDGET, trials=_TRIALS,
+                      backend_guard=allow_any_backend)  # the test opt-out bears no policy_digest
+        self.assertIsNone(r.guard_policy_digest)
 
 
 def _cal(known_bad, known_good, per_fixture, factory=None, trials=_TRIALS):  # type: ignore[no-untyped-def]
