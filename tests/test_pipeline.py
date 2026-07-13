@@ -35,6 +35,7 @@ from gate.pipeline import (
     extract_to_spec,
     make_check_updater,
     make_job_runner,
+    run_engine_check,
 )
 from gate.queue import GatingEvent
 from gate.store import GatingStore
@@ -259,6 +260,44 @@ class DetectorRegistryEnforcementTests(unittest.TestCase):
         verdict = job(_event())
         self.assertIs(verdict.status, VerdictType.ERROR)
         self.assertIs(verdict.reason, Reason.DETECTOR_UNRESOLVED)
+
+
+class LiveFrozenCommandTests(unittest.TestCase):
+    """v5-P1a behavioural neg: the LIVE enforcement path (run_engine_check) executes the FROZEN resolved
+    command (``bundle.command``, captured once at resolution), NEVER a fresh ``detector.entrypoint()`` — so
+    a stateful detector that resolves one command and would answer another cannot separate the signed
+    profile from what runs. This is the LIVE-path complement to the calibrate-path frozen-command neg.
+    Remove ``command=bundle.command`` in run_engine_check and run_check is handed the default
+    ``command=None`` -> it re-derives from entrypoint(): this test fails, catching that regression."""
+
+    def test_live_path_runs_the_frozen_command_not_a_fresh_entrypoint(self) -> None:
+        from core.sandbox import Command
+        from engine.calibration import ResolvedDetector
+        from engine.retry import RetryCheck
+
+        frozen = Command(argv=("frozen-live-cmd", "/artifact/main.py"))
+        # the bundle carries the FROZEN command; the detector's OWN entrypoint() answers something DIFFERENT
+        # — so if the live path re-derived from entrypoint() the captured command would diverge from frozen.
+        detector = RetryCheck(("entrypoint-value-must-not-run", "/artifact/main.py"))
+        self.assertNotEqual(detector.entrypoint(), frozen)  # precondition: the two genuinely differ
+
+        def resolver(detector_id: str) -> ResolvedDetector:
+            return ResolvedDetector(assertion=detector, profile_digest="pd-frozen", command=frozen)
+
+        captured: dict[str, object] = {}
+
+        def fake_run_check(make_sandbox, detector, artifact, budget, **kw):  # type: ignore[no-untyped-def]
+            captured.update(kw)
+            return Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
+
+        artifact = ArtifactSpec(path=Path(tempfile.mkdtemp(prefix="mv-frozen-")), tree_hash="sha256:x")
+        with mock.patch("gate.pipeline.run_check", side_effect=fake_run_check):
+            verdict = run_engine_check(artifact, image=_IMAGE, resolve=resolver, detector_id="retry")
+        self.assertIs(verdict.status, VerdictType.PASS)
+        # the FROZEN command reached run_check — not None (which would let run_check re-call entrypoint()),
+        # and not the detector's own entrypoint() value.
+        self.assertEqual(captured.get("command"), frozen)
+        self.assertNotEqual(captured.get("command"), detector.entrypoint())
 
 
 class CheckRunProvenanceTests(unittest.TestCase):

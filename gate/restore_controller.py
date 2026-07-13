@@ -38,12 +38,14 @@ from gate.attestation import (
 from gate.attestation_store import MeasurementAttestationStore
 from gate.signing import KeyVerifier
 from gate.policy_state import PolicyState
-from gate.policy_store import PolicyStore, ReAttestConflict, ReAttestGrant
+from gate.policy_store import PolicyStore, ReAttestConflict, _mint_reattest_grant
 
-# The ONE legitimate construction of the re-attest capability (merge-ready #1). The structural
-# no-bypass test asserts no other gate module constructs ReAttestGrant, so a verified restore is the
-# sole path that advances a policy's enforcement evidence.
-_REATTEST_GRANT = ReAttestGrant()
+# The ONE legitimate mint of the re-attest call-path marker. The structural no-bypass test asserts no
+# other gate module calls ``_mint_reattest_grant``, so a verified restore is the sole path in-process
+# that advances a policy's enforcement evidence. This is a call-path convention, not an authorization
+# boundary (the load-bearing controls are reattest's mandatory chain-checked expectations; see
+# gate.policy_store._ReAttestGrant).
+_REATTEST_GRANT = _mint_reattest_grant()
 
 
 class ReAttestCapability:

@@ -20,8 +20,9 @@ from gate.policy_store import (
     IllegalTransitionError,
     PrivilegedOperationError,
     PolicyStore,
-    ReAttestGrant,
+    ReAttestConflict,
     _digest_fields,
+    _mint_reattest_grant,
 )
 
 
@@ -46,7 +47,19 @@ def _enable(s: PolicyStore, pid: str = "p1", *, det: str = "det-1", head: str = 
     return ref
 
 
-_GRANT = ReAttestGrant()
+_GRANT = _mint_reattest_grant()
+
+
+def _reattest(s: PolicyStore, pid: str, *, ref: str, psv: str, det: str,
+              job: str = "j", nonce: str = "n") -> int:
+    """reattest filling the now-MANDATORY CAS expectations from the store's CURRENT state (the
+    non-racing happy path a direct caller uses). Stale-expectation negatives call ``s.reattest``
+    directly with a deliberately wrong expectation."""
+    att = s.current_attestation(pid)
+    subj = att[2] if att is not None else "unused"  # unreached: a not-ENABLED policy fails earlier
+    return s.reattest(pid, grant=_GRANT, calibration_result_ref=ref, pinned_set_version=psv,
+                      detector_identity=det, job_id=job, nonce=nonce,
+                      expect_policy_head=s.policy_head(pid), expect_authorized_subject=subj)
 
 
 class ReAttestPrimitiveTests(unittest.TestCase):
@@ -57,11 +70,19 @@ class ReAttestPrimitiveTests(unittest.TestCase):
         # fixture appended -> new head v2; async re-cal PASS -> new persisted pass -> re-attest.
         s.record_calibration_pass("cal-v2", policy_id="p1", pinned_set_version="v2",
                                   detector_identity="det-1", set_id="X")
-        s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", pinned_set_version="v2",
-                   detector_identity="det-1", job_id="job-abc", nonce="n1")
+        _reattest(s, "p1", ref="cal-v2", psv="v2", det="det-1", job="job-abc", nonce="n1")
         self.assertEqual(s.current_attestation("p1"), ("X", "v2", "det-1"))  # evidence moved forward
         self.assertIs(s.current_state("p1"), PolicyState.ENABLED)            # tier UNCHANGED
         self.assertTrue(s.verify_chain())
+
+    def test_subject_for_pass_is_policy_scoped(self) -> None:
+        # A4 (v5-neg-only): a calibration_pass minted for p1 cannot recover a subject for p2 —
+        # subject_for_pass is scoped by (ref, policy_id, pinned_set_version), so p1's ref can never
+        # enable p2 (GLM's cross-policy concern, already closed in code; this pins it with a negative).
+        s = _store()
+        _enable(s, "p1", det="det-1", head="v1")   # ref cal-p1-v1 bound to p1
+        self.assertEqual(s.subject_for_pass("cal-p1-v1", "p1", "v1"), "det-1")
+        self.assertIsNone(s.subject_for_pass("cal-p1-v1", "p2", "v1"))   # p1's pass can't enable p2
 
     def test_transition_still_refuses_enabled_to_enabled(self) -> None:
         # a re-attest cannot be smuggled through the general governance transition path.
@@ -76,15 +97,13 @@ class ReAttestPrimitiveTests(unittest.TestCase):
         s = _store()
         s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="a"))
         with self.assertRaises(IllegalTransitionError):
-            s.reattest("p1", grant=_GRANT, calibration_result_ref="x", pinned_set_version="v1",
-                       detector_identity="det-1", job_id="j", nonce="n")
+            _reattest(s, "p1", ref="x", psv="v1", det="det-1")
 
     def test_reattest_forged_ref_rejected_gap1(self) -> None:
         s = _store()
         _enable(s)
         with self.assertRaises(PrivilegedOperationError):
-            s.reattest("p1", grant=_GRANT, calibration_result_ref="FORGED", pinned_set_version="v1",
-                       detector_identity="det-1", job_id="j", nonce="n")
+            _reattest(s, "p1", ref="FORGED", psv="v1", det="det-1")
 
     def test_reattest_mismatched_identity_rejected(self) -> None:
         s = _store()
@@ -93,8 +112,7 @@ class ReAttestPrimitiveTests(unittest.TestCase):
                                   detector_identity="det-1", set_id="X")
         # the pass is for det-1; a re-attest claiming det-EVIL must not resolve it.
         with self.assertRaises(PrivilegedOperationError):
-            s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", pinned_set_version="v2",
-                       detector_identity="det-EVIL", job_id="j", nonce="n")
+            _reattest(s, "p1", ref="cal-v2", psv="v2", det="det-EVIL")
 
     def test_policy_head_is_policy_scoped(self) -> None:
         s = _store()
@@ -104,10 +122,49 @@ class ReAttestPrimitiveTests(unittest.TestCase):
         # an append to p2 must NOT move p1's evidence head (avoids cross-policy CAS thrash).
         s.record_calibration_pass("cal-p2-v2", policy_id="p2", pinned_set_version="v2",
                                   detector_identity="det-1", set_id="X")
-        s.reattest("p2", grant=_GRANT, calibration_result_ref="cal-p2-v2", pinned_set_version="v2",
-                   detector_identity="det-1", job_id="j", nonce="n")
+        _reattest(s, "p2", ref="cal-p2-v2", psv="v2", det="det-1")
         self.assertEqual(s.policy_head("p1"), h1)              # untouched
         self.assertNotEqual(s.policy_head("p2"), h1)
+
+
+class ReAttestMandatoryExpectationTests(unittest.TestCase):
+    """v5-P1c: the CAS expectations are the LOAD-BEARING tooth (the grant is only a call-path
+    convention). They are MANDATORY — omitting one is impossible at the API — and a STALE expectation
+    aborts with ReAttestConflict rather than landing a re-attest over a moved head / authorized subject.
+    Remove either check and a stale re-attest lands: that is the failure these pin."""
+
+    def _ready(self) -> PolicyStore:
+        s = _store()
+        _enable(s, head="v1")  # p1 ENABLED, det-1
+        s.record_calibration_pass("cal-v2", policy_id="p1", pinned_set_version="v2",
+                                  detector_identity="det-1", set_id="X")
+        return s
+
+    def test_expectations_are_required_kwargs(self) -> None:
+        s = self._ready()
+        # no expect_policy_head / expect_authorized_subject -> TypeError at the call boundary (they are
+        # mandatory keyword args now); the None opt-out that let a caller skip the CAS is gone.
+        with self.assertRaises(TypeError):
+            s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2",  # type: ignore[call-arg]
+                       pinned_set_version="v2", detector_identity="det-1", job_id="j", nonce="n")
+
+    def test_stale_policy_head_aborts(self) -> None:
+        s = self._ready()
+        att = s.current_attestation("p1")
+        assert att is not None
+        with self.assertRaises(ReAttestConflict):
+            s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", pinned_set_version="v2",
+                       detector_identity="det-1", job_id="j", nonce="n",
+                       expect_policy_head="STALE-head-that-never-matches",
+                       expect_authorized_subject=att[2])
+
+    def test_stale_authorized_subject_aborts(self) -> None:
+        s = self._ready()
+        with self.assertRaises(ReAttestConflict):
+            s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", pinned_set_version="v2",
+                       detector_identity="det-1", job_id="j", nonce="n",
+                       expect_policy_head=s.policy_head("p1"),
+                       expect_authorized_subject="a-DIFFERENT-authorized-subject")
 
 
 class ReAttestChainReplayGuardTests(unittest.TestCase):

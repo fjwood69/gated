@@ -60,15 +60,35 @@ class ReAttestConflict(RuntimeError):
     human may have just demoted)."""
 
 
-class ReAttestGrant:
-    """Merge-ready #1: an unforgeable-by-convention capability proving a re-attestation is going
-    through the RestoreController's full verification (issuer allowlist + Ed25519 signature + clean-PASS
-    + identity-trusted + oracle/policy-head CAS). ``reattest`` REFUSES without it, so there is no
-    low-level path that advances a policy's enforcement evidence while skipping that verification — the
-    bypass is removed. Constructed ONLY by ``gate.restore_controller`` (enforced by the structural
-    no-bypass test)."""
+_REATTEST_MINT = object()  # module-private mint sentinel — the grant constructor refuses any other key
+
+
+class _ReAttestGrant:
+    """A CALL-PATH marker that a re-attestation is entering the store THROUGH the RestoreController —
+    NOT an authorization control. Its constructor refuses any key but the module-private
+    ``_REATTEST_MINT``, so it cannot be minted ACCIDENTALLY elsewhere in the process, and the structural
+    no-bypass test asserts the RestoreController is the ONLY caller that mints one. Be honest about what
+    that buys: it is a trusted-process CALL-PATH CONVENTION — a co-resident, adversarial in-process caller
+    can read the sentinel and mint a grant, so possessing the grant proves call-path, not authority
+    (isinstance/capability ≠ authz). The load-bearing teeth are ``reattest``'s MANDATORY
+    ``expect_policy_head`` + ``expect_authorized_subject``, checked atomically against the hash chain —
+    themselves a concurrency + same-subject CONTINUITY control (replayable, so also not authorization).
+    The REAL authorization is an authenticated service/process boundary in front of the store, which is
+    deploy-tier (see ARCHITECTURE.md residual: in-process trust)."""
 
     __slots__ = ()
+
+    def __init__(self, mint: object) -> None:
+        if mint is not _REATTEST_MINT:
+            raise TypeError("_ReAttestGrant cannot be constructed outside gate.policy_store")
+
+
+def _mint_reattest_grant() -> _ReAttestGrant:
+    """The ONE legitimate mint of a re-attest call-path marker. Module-private; the structural no-bypass
+    test asserts ``gate.restore_controller`` is its only caller in the gate tree. Minting one is not an
+    authorization — see ``_ReAttestGrant`` for the honest hierarchy (call-path convention → mandatory
+    chain-checked expectations → deploy-tier service boundary)."""
+    return _ReAttestGrant(_REATTEST_MINT)
 
 
 def _required_principals(src: PolicyState, dst: PolicyState) -> int:
@@ -231,14 +251,14 @@ class PolicyStore:
         self,
         policy_id: str,
         *,
-        grant: ReAttestGrant,
+        grant: _ReAttestGrant,
         calibration_result_ref: str,
         pinned_set_version: str,
         detector_identity: str,
         job_id: str,
         nonce: str,
-        expect_policy_head: str | None = None,
-        expect_authorized_subject: str | None = None,
+        expect_policy_head: str,
+        expect_authorized_subject: str,
     ) -> int:
         """3.5 job-1: append a RE_ATTESTATION record — an EVIDENCE refresh, NOT a state transition.
 
@@ -257,13 +277,17 @@ class PolicyStore:
         gap-1 still holds: the ref must resolve to a persisted matching ``calibration_pass`` (a fabricated
         ref cannot re-attest, exactly as it cannot enable). Requires the policy to currently be ENABLED.
 
-        Merge-ready #1: a ``ReAttestGrant`` is REQUIRED — the only holder is the RestoreController, which
-        constructs it after full verification, so there is no low-level path that advances evidence while
-        skipping that verification."""
-        if not isinstance(grant, ReAttestGrant):
+        Capability + expectations (honest hierarchy — see ``_ReAttestGrant``): a ``_ReAttestGrant`` is
+        required, which is a trusted-process CALL-PATH convention (accidental-misuse tripwire, NOT authz);
+        the load-bearing controls are the MANDATORY ``expect_policy_head`` + ``expect_authorized_subject``,
+        checked atomically against the chain under this lock — a concurrency + same-subject CONTINUITY
+        guarantee, so a re-attest can never land after a concurrent human DEMOTE or an authorized-target
+        change. Real authorization is an authenticated store boundary (deploy-tier)."""
+        if not isinstance(grant, _ReAttestGrant):
             raise PrivilegedOperationError(
-                "re-attestation may only proceed through the RestoreController (a ReAttestGrant is "
-                "required) — the low-level path that skips measurement verification is removed"
+                "re-attestation must be called through the RestoreController's grant (a "
+                "_ReAttestGrant) — this is a call-path convention that trips accidental low-level use, "
+                "not an authorization boundary (that is a deploy-tier store front)"
             )
         with self._lock:
             prior = self._current_state_unlocked(policy_id)
@@ -272,23 +296,21 @@ class PolicyStore:
                     f"re-attestation requires the policy to be ENABLED; {policy_id} is "
                     f"{prior.value if prior else 'absent'}"
                 )
-            # board D2: the policy-evidence-head CAS must be ATOMIC with the append (both under the
-            # lock) — else a re-attest could land AFTER a concurrent human DEMOTE (or another
-            # re-attest) that moved this policy's head, re-enforcing a policy a human just moved to
-            # ADVISORY. A None expectation opts out (direct/test use); the restore controller always
-            # passes the head it read.
-            if expect_policy_head is not None and \
-                    self._policy_head_unlocked(policy_id) != expect_policy_head:
+            # board D2 + v5-P1c: the policy-evidence-head CAS is ATOMIC with the append (both under the
+            # lock) and MANDATORY — no None opt-out, not even for direct/test callers — else a re-attest
+            # could land AFTER a concurrent human DEMOTE (or another re-attest) that moved this policy's
+            # head, re-enforcing a policy a human just moved to ADVISORY. This is the load-bearing tooth
+            # (the grant is only a call-path convention).
+            if self._policy_head_unlocked(policy_id) != expect_policy_head:
                 raise ReAttestConflict(
                     f"policy-evidence head for {policy_id} moved since the restore CAS read it "
                     f"(expected {expect_policy_head[:12]}..) — aborting re-attestation, will retry"
                 )
-            # v4 P1-b: the AUTHORIZED-SUBJECT check must be ATOMIC with the head CAS (same lock) — else a
-            # concurrent governance change of the authorized target (A->B) between the restore's read and
-            # this append would let a re-attest for the stale subject land. Verify the policy's CURRENT
-            # authorized subject still equals what the restore controller verified against.
-            if expect_authorized_subject is not None and \
-                    self._current_authorized_subject_unlocked(policy_id) != expect_authorized_subject:
+            # v4 P1-b + v5-P1c: the AUTHORIZED-SUBJECT check is ATOMIC with the head CAS (same lock) and
+            # MANDATORY — else a concurrent governance change of the authorized target (A->B) between the
+            # restore's read and this append would let a re-attest for the stale subject land. Verify the
+            # policy's CURRENT authorized subject still equals what the restore controller verified against.
+            if self._current_authorized_subject_unlocked(policy_id) != expect_authorized_subject:
                 raise ReAttestConflict(
                     f"authorized subject for {policy_id} moved since the restore CAS read it "
                     f"(expected {expect_authorized_subject!r}) — aborting re-attestation, will retry"
@@ -531,5 +553,7 @@ __all__ = [
     "IllegalTransitionError",
     "ChainIntegrityError",
     "ReAttestConflict",
-    "ReAttestGrant",
 ]
+# ``_ReAttestGrant`` / ``_mint_reattest_grant`` are deliberately NOT exported — they are a module-private
+# call-path convention (see ``_ReAttestGrant``). The RestoreController imports the mint by its private
+# name; the structural no-bypass test asserts it is the only caller.

@@ -1,11 +1,14 @@
-"""3.5 merge-ready #1 — the low-level bypasses are REMOVED, machine-enforced. Run:
-python3 -m unittest discover -s tests
+"""3.5 merge-ready #1 — the low-level paths are capability-gated by a CALL-PATH convention, machine-
+enforced. Run: python3 -m unittest discover -s tests
 
-A fixture can enter the oracle ONLY through the admission gate, and a policy's enforcement evidence can
-advance ONLY through the verified RestoreController. This is structural ABSENCE, not an additional safe
-path: the raw ADD-append and reattest are capability-gated, and this test proves the ONLY constructions
-of those capabilities in the gate tree are the two legitimate ones — so no bypass exists in the codebase
-and none can be reintroduced without failing here (the same discipline as the observe-mode no-flag gate).
+A fixture enters the oracle through the admission gate, and a policy's enforcement evidence advances
+through the verified RestoreController. These capabilities are a trusted-process CALL-PATH convention
+(accidental-reintroduction tripwire), NOT an in-process authorization boundary — a co-resident adversary
+could mint one, so the load-bearing controls live elsewhere (for re-attest: reattest's MANDATORY
+chain-checked expectations; at deploy tier: an authenticated store boundary). What this test proves is
+STRUCTURAL: the ONLY minters of those capabilities in the gate tree are the two legitimate ones, so the
+low-level path cannot be reintroduced by accident without failing here (the same discipline as the
+observe-mode no-flag gate). Honest about scope: structural absence of a second minter, not unforgeability.
 """
 from __future__ import annotations
 
@@ -23,20 +26,20 @@ from gate.calibration_store import PrivilegedOperationError as CalibrationPrivil
 from gate.policy_state import PolicyState
 from gate.policy_store import PolicyStore
 from gate.policy_store import PrivilegedOperationError as PolicyPrivilegedError
-from gate.policy_store import ReAttestGrant
+from gate.policy_store import _mint_reattest_grant
 
 _GATE = Path(__file__).resolve().parent.parent / "gate"
 
 
 def _constructions(symbol: str) -> dict[str, int]:
-    """Map each gate module -> how many times it CONSTRUCTS ``symbol`` (``Symbol(``), excluding the
-    class definition itself. A construction is the capability being minted."""
+    """Map each gate module -> how many times it MINTS ``symbol`` (``Symbol()``), excluding the symbol's
+    own class/def line. A mint is the capability being produced."""
     out: dict[str, int] = {}
     for p in _GATE.glob("*.py"):
         n = 0
         for line in p.read_text().splitlines():
             stripped = line.strip()
-            if stripped.startswith(f"class {symbol}"):
+            if stripped.startswith(f"class {symbol}") or stripped.startswith(f"def {symbol}"):
                 continue
             n += stripped.count(f"{symbol}()")
         if n:
@@ -49,9 +52,11 @@ class StructuralNoBypassTests(unittest.TestCase):
         # the ONLY place a fixture-ADD capability is minted is gate/admission.py.
         self.assertEqual(_constructions("AdmissionCapability"), {"admission.py": 1})
 
-    def test_reattest_grant_constructed_only_by_restore_controller(self) -> None:
-        # the ONLY place a re-attest grant is minted is gate/restore_controller.py.
-        self.assertEqual(_constructions("ReAttestGrant"), {"restore_controller.py": 1})
+    def test_reattest_grant_minted_only_by_restore_controller(self) -> None:
+        # the ONLY caller of the re-attest mint in the gate tree is gate/restore_controller.py. This is
+        # a call-path convention (accidental-reintroduction tripwire), NOT an authorization boundary —
+        # the load-bearing controls are reattest's mandatory chain-checked expectations.
+        self.assertEqual(_constructions("_mint_reattest_grant"), {"restore_controller.py": 1})
 
 
 class RuntimeGateTests(unittest.TestCase):
@@ -88,13 +93,20 @@ class RuntimeGateTests(unittest.TestCase):
                      calibration_result_ref="cal", pinned_set_version="v", detector_identity="d")
         s.record_calibration_pass("cal2", policy_id="p1", pinned_set_version="v2",
                                   detector_identity="d", set_id="X")
-        # a re-attest WITHOUT the grant is refused (mypy: pass a non-grant to prove the runtime gate).
+        head = s.policy_head("p1")
+        att = s.current_attestation("p1")
+        assert att is not None
+        subj = att[2]  # the policy's currently authorized subject
+        # an accidental NON-grant call is refused at the call-path tripwire. Not framed as a bypass —
+        # a co-resident adversary could mint a grant; the teeth are the mandatory expectations below.
         with self.assertRaises(PolicyPrivilegedError):
             s.reattest("p1", grant=None, calibration_result_ref="cal2",  # type: ignore[arg-type]
-                       pinned_set_version="v2", detector_identity="d", job_id="j", nonce="n")
-        # with the grant it proceeds (this is what the RestoreController does).
-        seq = s.reattest("p1", grant=ReAttestGrant(), calibration_result_ref="cal2",
-                         pinned_set_version="v2", detector_identity="d", job_id="j", nonce="n")
+                       pinned_set_version="v2", detector_identity="d", job_id="j", nonce="n",
+                       expect_policy_head=head, expect_authorized_subject=subj)
+        # through the mint it proceeds (this is what the RestoreController does).
+        seq = s.reattest("p1", grant=_mint_reattest_grant(), calibration_result_ref="cal2",
+                         pinned_set_version="v2", detector_identity="d", job_id="j", nonce="n",
+                         expect_policy_head=head, expect_authorized_subject=subj)
         self.assertGreater(seq, 0)
 
 
