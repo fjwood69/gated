@@ -180,19 +180,86 @@ class ReAttestMandatoryExpectationTests(unittest.TestCase):
                        expect_authorized_subject="a-DIFFERENT-authorized-subject", identity_contract_version=1)
 
 
+class ChainPassLinkageTests(unittest.TestCase):
+    """S3 ckpt4-fix2b: the hash-chained record and its unchained calibration_pass row stay LINKED for
+    EVERY ->ENABLED record (initial enable AND re-attest). Tampering the pass beneath an INITIAL enable —
+    which the earlier code did NOT check — must break verify_chain."""
+
+    def test_tampering_pass_beneath_initial_enable_breaks_verify(self) -> None:
+        for col, val in (("identity_contract_version", 99), ("detector_identity", "det-EVIL"),
+                         ("pinned_set_version", "v-EVIL")):
+            s = _store()
+            _enable(s, head="v1")  # an INITIAL enable (CALIBRATING -> ENABLED)
+            self.assertTrue(s.verify_chain())
+            s._conn().execute(  # tamper the unchained pass row beneath the enable
+                f"UPDATE calibration_pass SET {col}=? WHERE policy_id=?", (val, "p1"))
+            self.assertFalse(s.verify_chain(), f"tampering pass.{col} beneath an initial enable not detected")
+
+    def test_tampering_chain_detector_or_ref_breaks_verify(self) -> None:
+        for col, val in (("detector_identity", "chain-EVIL"), ("calibration_result_ref", "ref-EVIL")):
+            s = _store()
+            _enable(s, head="v1")
+            s._conn().execute(
+                f"UPDATE tier_transition_chain SET {col}=? WHERE new_state=? AND policy_id=?",
+                (val, PolicyState.ENABLED.value, "p1"))
+            self.assertFalse(s.verify_chain(), f"chain.{col} is not hashed")
+
+    def test_conflicting_pass_metadata_is_rejected(self) -> None:
+        s = _store()
+        s.record_calibration_pass("cal-x", policy_id="p1", pinned_set_version="v1", detector_identity="d",
+                                  set_id="X", identity_contract_version=1)
+        s.record_calibration_pass("cal-x", policy_id="p1", pinned_set_version="v1", detector_identity="d",
+                                  set_id="X", identity_contract_version=1)  # identical -> idempotent
+        with self.assertRaises(PrivilegedOperationError):  # conflicting metadata under the same ref
+            s.record_calibration_pass("cal-x", policy_id="p1", pinned_set_version="v1",
+                                      detector_identity="DIFFERENT", set_id="X",
+                                      identity_contract_version=1)
+
+
+class MixedIcvChainTests(unittest.TestCase):
+    """The replay-against-recorded-ICV path proven for its design scenario: a chain with records under
+    DIFFERENT valid ICVs verifies, because each ->ENABLED record is replayed against ITS OWN recorded ICV."""
+
+    def test_chain_with_mixed_icvs_verifies(self) -> None:
+        s = _store()
+        _enable(s, head="v1")  # initial enable at ICV=1 (+ a pass at ICV=1)
+        # a matching pass + a hand-crafted re-attest record recorded under ICV=2 (a future contract).
+        s.record_calibration_pass("cal-v2icv2", policy_id="p1", pinned_set_version="v2",
+                                  detector_identity="det-1", set_id="X", identity_contract_version=2)
+        prev = s.head_hash()
+        fields = {
+            "policy_id": "p1", "prior_state": PolicyState.ENABLED.value,
+            "new_state": PolicyState.ENABLED.value, "calibration_result_ref": "cal-v2icv2",
+            "pinned_set_version": "v2", "detector_identity": "det-1", "identity_contract_version": 2,
+            "principals": "[]", "purpose": "re-attestation", "rationale": "j", "operation_id": "n",
+            "added_at": 1234.0,
+        }
+        rec = chain_hash(prev, _digest_fields(fields))
+        s._conn().execute(
+            "INSERT INTO tier_transition_chain (policy_id, prior_state, new_state,"
+            " calibration_result_ref, pinned_set_version, detector_identity, identity_contract_version,"
+            " principals, purpose, rationale, operation_id, added_at, prev_hash, record_hash)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("p1", PolicyState.ENABLED.value, PolicyState.ENABLED.value, "cal-v2icv2", "v2", "det-1", 2,
+             "[]", "re-attestation", "j", "n", 1234.0, prev, rec),
+        )
+        # each ->ENABLED record replays against its OWN recorded ICV (1 then 2) -> the whole chain verifies.
+        self.assertTrue(s.verify_chain())
+
+
 class ReAttestChainReplayGuardTests(unittest.TestCase):
     """Board: verify_chain must reject a re-attest record whose referenced calibration_pass does not
     match the record's own (pinned_set_version, detector_identity) — the direct-DB replay/forge guard,
     beyond the write-time gap-1 check. We hand-craft a hash-valid record bypassing reattest()."""
 
     def _craft_reattest_row(self, s: PolicyStore, pid: str, *, ref: str, head: str,
-                            det: str, job: str = "j", nonce: str = "n") -> None:
+                            det: str, job: str = "j", nonce: str = "n", icv: int = 1) -> None:
         prev = s.head_hash()
         fields = {
             "policy_id": pid, "prior_state": PolicyState.ENABLED.value,
             "new_state": PolicyState.ENABLED.value, "calibration_result_ref": ref,
             "pinned_set_version": head, "detector_identity": det,
-            "identity_contract_version": 1, "principals": "[]",
+            "identity_contract_version": icv, "principals": "[]",
             "purpose": "re-attestation", "rationale": job, "operation_id": nonce,
             "added_at": 1234.0,
         }
@@ -202,7 +269,7 @@ class ReAttestChainReplayGuardTests(unittest.TestCase):
             " calibration_result_ref, pinned_set_version, detector_identity, identity_contract_version,"
             " principals, purpose, rationale, operation_id, added_at, prev_hash, record_hash)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (pid, PolicyState.ENABLED.value, PolicyState.ENABLED.value, ref, head, det, 1, "[]",
+            (pid, PolicyState.ENABLED.value, PolicyState.ENABLED.value, ref, head, det, icv, "[]",
              "re-attestation", job, nonce, 1234.0, prev, rec),
         )
 

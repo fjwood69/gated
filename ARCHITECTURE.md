@@ -257,6 +257,20 @@ valid record from a superseded contract stays verifiable); CURRENT enablement / 
 require the ICV to equal the process contract (old evidence inadmissible now). The `calibration_pass` also
 carries the ICV and the read paths exact-match the current one.
 
+**Chain↔pass linkage:** EVERY `-> ENABLED` record (the INITIAL enable AND every re-attest) is replayed in
+`verify_chain` against a `calibration_pass` matching that record's OWN coordinates (ref + pinned_set_version
++ detector_identity + recorded ICV), so a direct edit of the unchained pass row beneath an enable is
+detected. `current_attestation` / `_current_authorized_subject_unlocked` match the pass against the
+hash-chained record's coordinates and return the TRANSITION-bound values (not the pass-row values), and a
+conflicting `record_calibration_pass` under an existing ref is REJECTED (a ref binds one immutable pass).
+
+**IDENTITY_CONTRACT_VERSION bump blast radius (named residual):** bumping the ICV changes the subject
+digest's domain prefix (`gated.calibrated-subject.v{ICV}`), so every ENABLED policy's `authorized_subject`
+(composed under the old ICV) no longer matches a new measurement's subject (new ICV) — restore is refused
+and the policy stays UNATTESTABLE until **re-ratified** (a fresh ENABLED transition under the new contract).
+This is **fail-closed and correct**, and it is the same shape as the detector-registry-update blast radius:
+an ICV bump is a BREAKING change requiring re-ratification of all ENABLED policies.
+
 **PARTIAL v3 bump — NOT closed (S3-completion dependencies):**
 - **Live-gatekeeper 4-tuple enforcement is UNWIRED.** `pipeline` / `live_app` do not yet match a running
   detector's measured 4-tuple against the attested subject. A post-hoc match alone does not satisfy the
