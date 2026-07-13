@@ -90,7 +90,8 @@ class RuntimeGateTests(unittest.TestCase):
         s.record_calibration_pass("cal", policy_id="p1", pinned_set_version="v",
                                   detector_identity="d", set_id="X", identity_contract_version=1)
         s.transition("p1", PolicyState.ENABLED, approval=appr("g1", op="3"),
-                     calibration_result_ref="cal", pinned_set_version="v", detector_identity="d", identity_contract_version=1)
+                     calibration_result_ref="cal", set_id="X", pinned_set_version="v",
+                     detector_identity="d", identity_contract_version=1)
         s.record_calibration_pass("cal2", policy_id="p1", pinned_set_version="v2",
                                   detector_identity="d", set_id="X", identity_contract_version=1)
         head = s.policy_head("p1")
@@ -100,11 +101,11 @@ class RuntimeGateTests(unittest.TestCase):
         # an accidental NON-grant call is refused at the call-path tripwire. Not framed as a bypass —
         # a co-resident adversary could mint a grant; the teeth are the mandatory expectations below.
         with self.assertRaises(PolicyPrivilegedError):
-            s.reattest("p1", grant=None, calibration_result_ref="cal2",  # type: ignore[arg-type]
+            s.reattest("p1", grant=None, calibration_result_ref="cal2", set_id="X",  # type: ignore[arg-type]
                        pinned_set_version="v2", detector_identity="d", job_id="j", nonce="n",
                        expect_policy_head=head, expect_authorized_subject=subj, identity_contract_version=1)
         # through the mint it proceeds (this is what the RestoreController does).
-        seq = s.reattest("p1", grant=_mint_reattest_grant(), calibration_result_ref="cal2",
+        seq = s.reattest("p1", grant=_mint_reattest_grant(), calibration_result_ref="cal2", set_id="X",
                          pinned_set_version="v2", detector_identity="d", job_id="j", nonce="n",
                          expect_policy_head=head, expect_authorized_subject=subj, identity_contract_version=1)
         self.assertGreater(seq, 0)

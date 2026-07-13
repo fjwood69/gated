@@ -40,7 +40,7 @@ def _enable(store: PolicyStore, pid: str, *, detector: str = "det-1") -> None:
     store.record_calibration_pass("cal-1", policy_id=pid, pinned_set_version="fx-head",
                                   detector_identity=detector, identity_contract_version=1)
     store.transition(pid, PolicyState.ENABLED, approval=_appr("gov1", op=f"{pid}-3"),
-                     calibration_result_ref="cal-1", pinned_set_version="fx-head",
+                     calibration_result_ref="cal-1", set_id="default", pinned_set_version="fx-head",
                      detector_identity=detector, identity_contract_version=1)
 
 

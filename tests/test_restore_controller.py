@@ -97,7 +97,8 @@ def _policy_store_enabled(head: str) -> PolicyStore:
     s.record_calibration_pass("cal-0", policy_id="p1", pinned_set_version=head,
                               detector_identity=_DET, set_id="X", identity_contract_version=1)
     s.transition("p1", PolicyState.ENABLED, approval=_appr("g1", op="c"),
-                 calibration_result_ref="cal-0", pinned_set_version=head, detector_identity=_DET, identity_contract_version=1)
+                 calibration_result_ref="cal-0", set_id="X", pinned_set_version=head,
+                 detector_identity=_DET, identity_contract_version=1)
     return s
 
 
@@ -251,7 +252,7 @@ class RestoreControllerTests(unittest.TestCase):
         s.record_calibration_pass("cal-p2", policy_id="p2", pinned_set_version=c.set_head("X"),
                                   detector_identity=_DET, set_id="X", identity_contract_version=1)
         s.transition("p2", PolicyState.ENABLED, approval=_appr("g1", op="p2c"),
-                     calibration_result_ref="cal-p2", pinned_set_version=c.set_head("X"),
+                     calibration_result_ref="cal-p2", set_id="X", pinned_set_version=c.set_head("X"),
                      detector_identity=_DET, identity_contract_version=1)
         self.assertNotEqual(s.policy_head("p1"), s.head_hash())  # p1's head != global head
         c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
@@ -306,7 +307,7 @@ class V3GovernanceTargetTests(unittest.TestCase):
         cap = ReAttestCapability(s)
         with self.assertRaises(ReAttestConflict):
             cap.reattest(
-                "p1", calibration_result_ref="cal-0", pinned_set_version=c.set_head("X"),
+                "p1", calibration_result_ref="cal-0", set_id="X", pinned_set_version=c.set_head("X"),
                 detector_identity=_DET, identity_contract_version=1, job_id="j", nonce="n",
                 expect_policy_head=s.policy_head("p1"),
                 expect_authorized_subject="a-DIFFERENT-authorized-subject")  # != current -> conflict

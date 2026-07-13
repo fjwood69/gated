@@ -43,7 +43,8 @@ def _enable(s: PolicyStore, pid: str = "p1", *, det: str = "det-1", head: str = 
     s.record_calibration_pass(ref, policy_id=pid, pinned_set_version=head, detector_identity=det,
                               set_id=set_id, identity_contract_version=1)
     s.transition(pid, PolicyState.ENABLED, approval=_appr("g1", op=f"{pid}-{head}-3"),
-                 calibration_result_ref=ref, pinned_set_version=head, detector_identity=det, identity_contract_version=1)
+                 calibration_result_ref=ref, set_id=set_id, pinned_set_version=head,
+                 detector_identity=det, identity_contract_version=1)
     return ref
 
 
@@ -51,14 +52,14 @@ _GRANT = _mint_reattest_grant()
 
 
 def _reattest(s: PolicyStore, pid: str, *, ref: str, psv: str, det: str,
-              job: str = "j", nonce: str = "n") -> int:
+              set_id: str = "X", job: str = "j", nonce: str = "n") -> int:
     """reattest filling the now-MANDATORY CAS expectations from the store's CURRENT state (the
     non-racing happy path a direct caller uses). Stale-expectation negatives call ``s.reattest``
     directly with a deliberately wrong expectation."""
     att = s.current_attestation(pid)
     subj = att[2] if att is not None else "unused"  # unreached: a not-ENABLED policy fails earlier
-    return s.reattest(pid, grant=_GRANT, calibration_result_ref=ref, pinned_set_version=psv,
-                      detector_identity=det, job_id=job, nonce=nonce,
+    return s.reattest(pid, grant=_GRANT, calibration_result_ref=ref, set_id=set_id,
+                      pinned_set_version=psv, detector_identity=det, job_id=job, nonce=nonce,
                       expect_policy_head=s.policy_head(pid), expect_authorized_subject=subj, identity_contract_version=1)
 
 
@@ -158,7 +159,7 @@ class ReAttestMandatoryExpectationTests(unittest.TestCase):
         # no expect_policy_head / expect_authorized_subject -> TypeError at the call boundary (they are
         # mandatory keyword args now); the None opt-out that let a caller skip the CAS is gone.
         with self.assertRaises(TypeError):
-            s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2",  # type: ignore[call-arg]
+            s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", set_id="X",  # type: ignore[call-arg]
                        pinned_set_version="v2", detector_identity="det-1", job_id="j", nonce="n", identity_contract_version=1)
 
     def test_stale_policy_head_aborts(self) -> None:
@@ -166,7 +167,8 @@ class ReAttestMandatoryExpectationTests(unittest.TestCase):
         att = s.current_attestation("p1")
         assert att is not None
         with self.assertRaises(ReAttestConflict):
-            s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", pinned_set_version="v2",
+            s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", set_id="X",
+                       pinned_set_version="v2",
                        detector_identity="det-1", job_id="j", nonce="n",
                        expect_policy_head="STALE-head-that-never-matches",
                        expect_authorized_subject=att[2], identity_contract_version=1)
@@ -174,7 +176,8 @@ class ReAttestMandatoryExpectationTests(unittest.TestCase):
     def test_stale_authorized_subject_aborts(self) -> None:
         s = self._ready()
         with self.assertRaises(ReAttestConflict):
-            s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", pinned_set_version="v2",
+            s.reattest("p1", grant=_GRANT, calibration_result_ref="cal-v2", set_id="X",
+                       pinned_set_version="v2",
                        detector_identity="det-1", job_id="j", nonce="n",
                        expect_policy_head=s.policy_head("p1"),
                        expect_authorized_subject="a-DIFFERENT-authorized-subject", identity_contract_version=1)
@@ -186,8 +189,10 @@ class ChainPassLinkageTests(unittest.TestCase):
     which the earlier code did NOT check — must break verify_chain."""
 
     def test_tampering_pass_beneath_initial_enable_breaks_verify(self) -> None:
+        # S3 ckpt4-fix2c adds set_id: a direct edit of the unchained pass.set_id beneath an initial enable
+        # no longer matches the hash-chained record's set_id -> the replay pass-match fails -> verify False.
         for col, val in (("identity_contract_version", 99), ("detector_identity", "det-EVIL"),
-                         ("pinned_set_version", "v-EVIL")):
+                         ("pinned_set_version", "v-EVIL"), ("set_id", "set-EVIL")):
             s = _store()
             _enable(s, head="v1")  # an INITIAL enable (CALIBRATING -> ENABLED)
             self.assertTrue(s.verify_chain())
@@ -196,7 +201,9 @@ class ChainPassLinkageTests(unittest.TestCase):
             self.assertFalse(s.verify_chain(), f"tampering pass.{col} beneath an initial enable not detected")
 
     def test_tampering_chain_detector_or_ref_breaks_verify(self) -> None:
-        for col, val in (("detector_identity", "chain-EVIL"), ("calibration_result_ref", "ref-EVIL")):
+        # set_id is IN the record hash (ckpt4-fix2c) — altering it on a stored record breaks the digest.
+        for col, val in (("detector_identity", "chain-EVIL"), ("calibration_result_ref", "ref-EVIL"),
+                         ("set_id", "set-EVIL")):
             s = _store()
             _enable(s, head="v1")
             s._conn().execute(
@@ -230,18 +237,20 @@ class MixedIcvChainTests(unittest.TestCase):
         fields = {
             "policy_id": "p1", "prior_state": PolicyState.ENABLED.value,
             "new_state": PolicyState.ENABLED.value, "calibration_result_ref": "cal-v2icv2",
-            "pinned_set_version": "v2", "detector_identity": "det-1", "identity_contract_version": 2,
+            "set_id": "X", "pinned_set_version": "v2", "detector_identity": "det-1",
+            "identity_contract_version": 2,
             "principals": "[]", "purpose": "re-attestation", "rationale": "j", "operation_id": "n",
             "added_at": 1234.0,
         }
         rec = chain_hash(prev, _digest_fields(fields))
         s._conn().execute(
             "INSERT INTO tier_transition_chain (policy_id, prior_state, new_state,"
-            " calibration_result_ref, pinned_set_version, detector_identity, identity_contract_version,"
+            " calibration_result_ref, set_id, pinned_set_version, detector_identity,"
+            " identity_contract_version,"
             " principals, purpose, rationale, operation_id, added_at, prev_hash, record_hash)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            ("p1", PolicyState.ENABLED.value, PolicyState.ENABLED.value, "cal-v2icv2", "v2", "det-1", 2,
-             "[]", "re-attestation", "j", "n", 1234.0, prev, rec),
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("p1", PolicyState.ENABLED.value, PolicyState.ENABLED.value, "cal-v2icv2", "X", "v2", "det-1",
+             2, "[]", "re-attestation", "j", "n", 1234.0, prev, rec),
         )
         # each ->ENABLED record replays against its OWN recorded ICV (1 then 2) -> the whole chain verifies.
         self.assertTrue(s.verify_chain())
@@ -253,12 +262,13 @@ class ReAttestChainReplayGuardTests(unittest.TestCase):
     beyond the write-time gap-1 check. We hand-craft a hash-valid record bypassing reattest()."""
 
     def _craft_reattest_row(self, s: PolicyStore, pid: str, *, ref: str, head: str,
-                            det: str, job: str = "j", nonce: str = "n", icv: int = 1) -> None:
+                            det: str, set_id: str = "X", job: str = "j", nonce: str = "n",
+                            icv: int = 1) -> None:
         prev = s.head_hash()
         fields = {
             "policy_id": pid, "prior_state": PolicyState.ENABLED.value,
             "new_state": PolicyState.ENABLED.value, "calibration_result_ref": ref,
-            "pinned_set_version": head, "detector_identity": det,
+            "set_id": set_id, "pinned_set_version": head, "detector_identity": det,
             "identity_contract_version": icv, "principals": "[]",
             "purpose": "re-attestation", "rationale": job, "operation_id": nonce,
             "added_at": 1234.0,
@@ -266,10 +276,11 @@ class ReAttestChainReplayGuardTests(unittest.TestCase):
         rec = chain_hash(prev, _digest_fields(fields))
         s._conn().execute(
             "INSERT INTO tier_transition_chain (policy_id, prior_state, new_state,"
-            " calibration_result_ref, pinned_set_version, detector_identity, identity_contract_version,"
+            " calibration_result_ref, set_id, pinned_set_version, detector_identity,"
+            " identity_contract_version,"
             " principals, purpose, rationale, operation_id, added_at, prev_hash, record_hash)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (pid, PolicyState.ENABLED.value, PolicyState.ENABLED.value, ref, head, det, icv, "[]",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (pid, PolicyState.ENABLED.value, PolicyState.ENABLED.value, ref, set_id, head, det, icv, "[]",
              "re-attestation", job, nonce, 1234.0, prev, rec),
         )
 

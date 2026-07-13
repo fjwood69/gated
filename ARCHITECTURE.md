@@ -258,11 +258,16 @@ require the ICV to equal the process contract (old evidence inadmissible now). T
 carries the ICV and the read paths exact-match the current one.
 
 **Chain↔pass linkage:** EVERY `-> ENABLED` record (the INITIAL enable AND every re-attest) is replayed in
-`verify_chain` against a `calibration_pass` matching that record's OWN coordinates (ref + pinned_set_version
-+ detector_identity + recorded ICV), so a direct edit of the unchained pass row beneath an enable is
-detected. `current_attestation` / `_current_authorized_subject_unlocked` match the pass against the
-hash-chained record's coordinates and return the TRANSITION-bound values (not the pass-row values), and a
-conflicting `record_calibration_pass` under an existing ref is REJECTED (a ref binds one immutable pass).
+`verify_chain` against a `calibration_pass` matching that record's OWN coordinates (ref + `set_id` +
+pinned_set_version + detector_identity + recorded ICV), so a direct edit of the unchained pass row beneath an
+enable is detected. `set_id` is bound into the `tier_transition_chain` record hash (`_digest_fields`) exactly
+as the ICV is — it was the LAST attestation coordinate still read off the mutable pass row, so
+`current_attestation` (which returns `set_id` to the gatekeeper's oracle-drift check) previously trusted an
+unchained value; it now returns the TRANSITION-bound `set_id`, and the enable path derives it from the
+persisted pass via `pass_binding` (measurement-derived, not caller-supplied). `current_attestation` /
+`_current_authorized_subject_unlocked` match the pass against the hash-chained record's coordinates and
+return the TRANSITION-bound values (not the pass-row values), and a conflicting `record_calibration_pass`
+under an existing ref is REJECTED (a ref binds one immutable pass).
 
 **IDENTITY_CONTRACT_VERSION bump blast radius (named residual):** bumping the ICV changes the subject
 digest's domain prefix (`gated.calibrated-subject.v{ICV}`), so every ENABLED policy's `authorized_subject`

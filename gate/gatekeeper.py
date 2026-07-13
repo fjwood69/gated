@@ -321,14 +321,17 @@ def ratify_enable(
     enables THAT. A caller can no longer rewrite the enabled identity; a fabricated ref recovers no subject
     and cannot enable. ``approval`` carries the ratifier principal(s). The store enforces the legal edge
     (state must be CALIBRATING)."""
-    subject = store.subject_for_pass(calibration_result_ref, policy_id, pinned_set_version)
-    if subject is None:
+    binding = store.pass_binding(calibration_result_ref, policy_id, pinned_set_version)
+    if binding is None:
         raise ConfigurationError(
             f"no persisted calibration_pass matches ref={calibration_result_ref!r} for "
             f"({policy_id}, set={pinned_set_version}) — a fabricated reference cannot enable")
+    subject, set_id = binding  # S3 ckpt4-fix2c: the set_id is measurement-derived (from the pass), so the
+    # ENABLED record binds the set the RUN calibrated against — not a caller-supplied value.
     return store.transition(
         policy_id, PolicyState.ENABLED, approval=approval,
-        calibration_result_ref=calibration_result_ref, pinned_set_version=pinned_set_version,
+        calibration_result_ref=calibration_result_ref, set_id=set_id,
+        pinned_set_version=pinned_set_version,
         detector_identity=subject, identity_contract_version=IDENTITY_CONTRACT_VERSION,
     )
 
