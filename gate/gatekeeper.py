@@ -306,11 +306,12 @@ def run_calibration(
     rpd = result.resolved_profile_digest
     tpd = result.trust_policy_digest
     gpd = result.guard_policy_digest
-    # correction 2 (defence-in-depth) — POST-run verify on EVERY conclusive result (PASS AND FAIL): whenever
-    # the run measured its profile/trust/guard digests, they MUST equal the intent's EXPECTED digests, else a
-    # WRONG-POLICY run is being recorded (a FAIL of some other policy must NOT be recorded as this one's
-    # rejection). Near-tautological here (same frozen objects under resolve-once), load-bearing for the async
-    # worker where boot objects could differ; fail-closed on any divergence.
+    # correction 2 (defence-in-depth) — POST-run verify WHENEVER all three digests were measured (PASS or
+    # FAIL alike; a FAIL with incomplete measured coords has nothing to verify): the run's MEASURED
+    # profile/trust/guard digests MUST equal the intent's EXPECTED digests, else a WRONG-POLICY run is being
+    # recorded (a FAIL of some other policy must NOT be recorded as this one's rejection). Near-tautological
+    # here (same frozen objects under resolve-once), load-bearing for the async worker where boot objects
+    # could differ; fail-closed on any divergence.
     if rpd is not None and tpd is not None and gpd is not None and (rpd, tpd, gpd) != (
         str(_intent["expected_profile_digest"]), str(_intent["expected_trust_policy_digest"]),
         str(_intent["expected_guard_policy_digest"])):

@@ -241,35 +241,51 @@ class Done3_PerPolicyIsolationTests(unittest.TestCase):
         self.assertIs(_resolve(s, "pB").disposition, Disposition.RUN_ENFORCING)
 
 
+class _MutatingTrust:
+    """A trust policy whose ``policy_digest`` MUTATES between the first read (enter_calibrating captures the
+    intent's EXPECTED digest) and later reads (the run MEASURES it) — so the post-run verify FIRES, proving
+    it is not a tautology under frozen objects."""
+
+    def __init__(self, base: object) -> None:
+        self._base = base
+        self._n = 0
+
+    @property
+    def policy_digest(self) -> str:
+        self._n += 1
+        return "tp-v1" if self._n == 1 else "tp-v2"
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._base, name)  # delegate evaluate() etc. to the real trust policy
+
+
 class Cp4PostVerifyTests(unittest.TestCase):
-    def test_post_run_verify_fires_on_a_mutating_applied_object(self) -> None:
-        # 3.5 CP4 D3 (prove-it-bites): a trust-policy object whose digest MUTATES between enter_calibrating
-        # (which captures the intent's EXPECTED digest) and the run (which MEASURES it) makes the post-run
-        # verify FIRE — proving it is NOT a tautology under frozen objects. Fail-closed (ConfigurationError).
-        class _MutatingTrust:
-            def __init__(self, base: object) -> None:
-                self._base = base
-                self._n = 0
+    """3.5 CP4 D3 (prove-it-bites): the post-run verify fires on a mutating applied object — asserted on BOTH
+    a would-PASS and a would-FAIL run, because the verify runs BEFORE the PASS/FAIL branch (a wrong-policy
+    FAIL must be refused, not recorded as this policy's rejection)."""
 
-            @property
-            def policy_digest(self) -> str:
-                self._n += 1
-                return "tp-v1" if self._n == 1 else "tp-v2"  # enter reads first (v1); the run measures v2
-
-            def __getattr__(self, name: str) -> object:
-                return getattr(self._base, name)  # delegate evaluate() etc. to the real trust policy
-
+    def _run_with_mutating_trust(self, detector: object) -> None:
         s = _store()
         s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op="p1-1"))
         cset = CalibrationSet(known_good=(Fixture("g", FixtureLabel.KNOWN_GOOD, b"z"),),
                               known_bad=(Fixture("b", FixtureLabel.KNOWN_BAD, b"y"),))
-        det = _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3)  # would PASS, but the verify fires first
         with self.assertRaises(ConfigurationError):
             run_calibration("p1", store=s, make_sandbox=_hermetic_factory(), detector_id="d",
-                            resolve=_bundle(det), calibration_set=cset, budget=_BUDGET,
+                            resolve=_bundle(detector), calibration_set=cset, budget=_BUDGET,
                             calibration_chain_head="fx", approval=_appr("gov1", op="p1-cal"), trials=3,
                             backend_guard=test_guard_policy,
                             trust_policy=_MutatingTrust(_REF_TP))  # type: ignore[arg-type]
+        # neither a pass nor a rejection is recorded — the wrong-policy run is refused.
+        self.assertIsNone(s.subject_for_pass("any", "p1", "fx"))
+        self.assertIs(s.current_state("p1"), PolicyState.CALIBRATING)
+
+    def test_verify_fires_on_a_would_pass_run(self) -> None:
+        self._run_with_mutating_trust(_ScriptedDetector([_FAIL] * 3 + [_PASS] * 3))  # catches bad -> PASS
+
+    def test_verify_fires_on_a_would_fail_run(self) -> None:
+        # a would-FAIL run (misses the known-bad) is ALSO refused by the pre-branch verify — the FAIL branch
+        # never records a rejection for a wrong-policy run (P2-3: assert, don't merely imply).
+        self._run_with_mutating_trust(_ScriptedDetector([_PASS] * 3 + [_PASS] * 3))  # misses bad -> FAIL
 
 
 class EnablePathTests(unittest.TestCase):

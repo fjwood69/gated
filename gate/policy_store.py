@@ -379,9 +379,11 @@ class PolicyStore:
         profile/trust/guard objects against (reject before calibrating on mismatch). ``policy_generation`` is
         DERIVED from the appended record_hash (the new policy head), never caller-supplied; ``target_revision``
         starts at 0. A live active (pending/dispatched) intent for this policy is refused with
-        ``ActiveCalibrationIntentExists`` (an explicit check, not a raw DB-unique violation) — re-entry must
-        first terminalize the prior intent via ``supersede_active_intent``. Degenerate-value guarded: every
-        routing string non-empty, ICV the exact current int contract."""
+        ``ActiveCalibrationIntentExists`` (an explicit check, not a raw DB-unique violation) — re-entry
+        follows the lifecycle: exit CALIBRATING (which supersedes the intent ATOMICALLY inside
+        ``transition``), then re-enter. An un-cleared ``failed_churn`` intent refuses with
+        ``FailedChurnNotCleared`` (governance ``clear_failed_churn`` required first). Degenerate-value
+        guarded: every routing string non-empty, ICV the exact current int contract."""
         for name, val in (("set_id", set_id), ("pinned_set_version", pinned_set_version),
                           ("detector_id", detector_id),
                           ("expected_profile_digest", expected_profile_digest),
