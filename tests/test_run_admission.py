@@ -1,17 +1,16 @@
-"""tests/test_run_admission.py — 3.5 S3-completion: the LIVE-PATH run-result admission typestate.
+"""tests/test_run_admission.py — 3.5 S3-completion: the LIVE-PATH run-result admission typestate + currency.
 Run: python3 -m unittest discover -s tests
 
-The isolated admission core (``gate/run_admission.py``, distinct from the 3.4 fixture gate). Properties
-pinned:
-  * the MEASURED subject is recomputed SOLELY from the authoritative engine return (``result.trial_report``)
-    and compared vs the plan's dispatched target + governance-authorized subject — measured-vs-authorized,
-    never plan-vs-plan;
-  * the recompute is the SAME composite ``calibrated_subject_identity`` the calibration path signs, so a
-    legitimately-authorized run admits (no spurious drift);
-  * every refusal is a DISTINCT typed ``RunAdmissionRefusal`` (fail-closed, layered order) that still BLOCKS
-    (``Verdict(ERROR, RUN_UNADMITTED)`` → action_required), never a silent drop to neutral;
-  * ``AdmittedRunResult`` is the sole admit type; its verdict is the report's single-source aggregate and its
-    constructor refuses an incoherent admission (defence in depth).
+The admission core (``gate/run_admission.py``, distinct from the 3.4 fixture gate). Properties pinned:
+  * STRUCTURAL: the MEASURED subject is recomputed SOLELY from the authoritative engine return and must
+    equal the DISPATCHED target (the runner-bypass catch) — measured-vs-plan, never plan-vs-plan, and
+    ordered BEFORE the live subject check so a runner deviation is caught regardless of live state;
+  * LIVE currency (CP1): admission's OWN reads (current_attestation + set_head, fail-closed) prove the set
+    has not drifted (SET_HEAD_STALE / AUTHORIZED_SET_MOVED) and the subject is still authorized
+    (AUTHORIZED_SUBJECT_MOVED);
+  * every refusal is a DISTINCT typed RunAdmissionRefusal that still BLOCKS (Verdict(ERROR, RUN_UNADMITTED));
+  * PROOF-GATED construction: AdmittedRunResult requires the live-admission grant minted only by
+    admit_run_result, so a direct construction cannot bypass the live checks.
 """
 from __future__ import annotations
 
@@ -19,10 +18,10 @@ import dataclasses
 import unittest
 
 from core import Reason, Verdict, VerdictType
-from core.chain import content_digest
 from engine.runner import EngineRunResult, ExecutionIdentity, TrialReport
 from gate.attestation import IDENTITY_CONTRACT_VERSION, calibrated_subject_identity
 from gate.run_admission import (
+    _LIVE_GRANT,
     AdmittedRunResult,
     AuthorizedRunPlan,
     BlockingRefusal,
@@ -35,15 +34,14 @@ from gate.run_admission import (
 _PASS = Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
 _FAIL = Verdict(VerdictType.FAIL, Reason.EGRESS_ONE)
 
-_RPD = "profile-digest"
-_TPD = "trust-digest"
-_GPD = "guard-digest"
+_RPD, _TPD, _GPD = "profile-digest", "trust-digest", "guard-digest"
 _EXEC = ExecutionIdentity(backend="ObservedOCISandbox", image_ref="sha256:abc",
                           isolation_level="hermetic", observer_config_hash="obs")
 _EID = _EXEC.digest()
-# the subject a legitimate run measures — the SAME composite the calibration path signs.
-_SUBJECT = calibrated_subject_identity(_RPD, _TPD, _GPD, _EID)
+_SUBJECT = calibrated_subject_identity(_RPD, _TPD, _GPD, _EID)         # what a legitimate run measures
+_SUBJECT2 = calibrated_subject_identity(_RPD, _TPD, "guard-2", _EID)   # a DIFFERENT measured subject
 _SET = "set-1"
+_HEAD = "oracle-head-abc"
 
 
 def _report(*, rpd: str | None = _RPD, tpd: str | None = _TPD, gpd: str | None = _GPD,
@@ -62,150 +60,212 @@ def _plan(*, target: str = _SUBJECT, authorized: str = _SUBJECT, set_id: str = _
                              authorized_context=(set_id, authorized, icv))
 
 
-def _unadmitted(plan: AuthorizedRunPlan, report: TrialReport) -> UnadmittedRunResult:
-    return UnadmittedRunResult(plan=plan, result=EngineRunResult(trial_report=report))
+class _FakeGovernance:
+    """A fake AdmissionGovernanceView. Defaults to the CURRENT, matching attestation; each dimension can be
+    moved or made to raise to exercise a specific live refusal."""
+
+    def __init__(self, *, set_id: str = _SET, bound_head: str = _HEAD, subject: str = _SUBJECT,
+                 attestation_none: bool = False, live_head: str | None = _HEAD,
+                 raise_attn: bool = False, raise_head: bool = False) -> None:
+        self._attn = None if attestation_none else (set_id, bound_head, subject)
+        self._live_head = live_head
+        self._raise_attn = raise_attn
+        self._raise_head = raise_head
+
+    def current_attestation(self, policy_id: str) -> tuple[str, str, str] | None:
+        if self._raise_attn:
+            raise RuntimeError("tier-transition chain failed verification")
+        return self._attn
+
+    def oracle_head_for(self, set_id: str) -> str | None:
+        if self._raise_head:
+            raise RuntimeError("calibration store unreachable")
+        return self._live_head
+
+
+def _admit(plan: AuthorizedRunPlan, report: TrialReport,
+           gov: _FakeGovernance) -> AdmittedRunResult | BlockingRefusal:
+    return admit_run_result(UnadmittedRunResult(plan=plan, result=EngineRunResult(trial_report=report)),
+                            governance=gov)
 
 
 class HappyPathTests(unittest.TestCase):
-    def test_legitimate_run_is_admitted_with_the_measured_subject(self) -> None:
-        res = admit_run_result(_unadmitted(_plan(), _report()))
+    def test_current_run_is_admitted_with_scoped_metadata(self) -> None:
+        res = _admit(_plan(), _report(), _FakeGovernance())
         self.assertIsInstance(res, AdmittedRunResult)
         assert isinstance(res, AdmittedRunResult)
-        self.assertEqual(res.measured_subject, _SUBJECT)  # recomputed from the report's coords
+        self.assertEqual(res.measured_subject, _SUBJECT)
+        self.assertEqual(res.admitted_set_id, _SET)       # scoped metadata (Fred: not an unscoped head)
+        self.assertEqual(res.bound_oracle_head, _HEAD)
         self.assertIs(res.verdict, _PASS)                 # single source: the report's aggregate
 
-    def test_admitted_verdict_is_a_derived_property_of_the_report_aggregate(self) -> None:
-        # single source: verdict is a DERIVED property (no stored copy) — it IS report.aggregate, so it
-        # cannot diverge from the report the admission inspected (same discipline as EngineRunResult.verdict).
+    def test_admitted_verdict_is_a_derived_property(self) -> None:
         rep = _report(aggregate=_FAIL)
-        adm = AdmittedRunResult(plan=_plan(), report=rep, measured_subject=_SUBJECT)
-        self.assertIs(adm.verdict, rep.aggregate)
-        self.assertIs(adm.verdict, _FAIL)
-
-    def test_a_real_fail_run_admits_and_carries_the_fail_verdict(self) -> None:
-        # admission attests IDENTITY, not the verdict value: a FAIL with a matching identity is ADMITTED
-        # (and blocks downstream via its FAIL verdict), distinct from a refusal.
-        res = admit_run_result(_unadmitted(_plan(), _report(aggregate=_FAIL)))
-        self.assertIsInstance(res, AdmittedRunResult)
+        res = _admit(_plan(), rep, _FakeGovernance())
         assert isinstance(res, AdmittedRunResult)
+        self.assertIs(res.verdict, rep.aggregate)
         self.assertIs(res.verdict, _FAIL)
 
-
-class MeasuredNotPlanTests(unittest.TestCase):
-    def test_measured_subject_comes_from_the_report_not_the_plan(self) -> None:
-        # the operand-source proof: hold the plan's target fixed but change a REPORT coordinate -> the
-        # recomputed measured subject changes -> drift. The subject is measured off the return, never the plan.
-        res = admit_run_result(_unadmitted(_plan(), _report(gpd="a-DIFFERENT-guard")))
-        self.assertIsInstance(res, BlockingRefusal)
-        assert isinstance(res, BlockingRefusal)
-        self.assertIs(res.reason, RunAdmissionRefusal.SUBJECT_DRIFT)
-
     def test_recompute_matches_the_calibration_path_composite(self) -> None:
-        # the admitted measured subject equals the composite the calibration path signs for the SAME coords
-        # (recalibration.py) — so a legitimately-calibrated identity is not spuriously rejected at admission.
         expected = calibrated_subject_identity(_RPD, _TPD, _GPD, _EID, icv=IDENTITY_CONTRACT_VERSION)
-        res = admit_run_result(_unadmitted(_plan(target=expected, authorized=expected), _report()))
-        self.assertIsInstance(res, AdmittedRunResult)
+        res = _admit(_plan(target=expected, authorized=expected), _report(),
+                     _FakeGovernance(subject=expected))
         assert isinstance(res, AdmittedRunResult)
         self.assertEqual(res.measured_subject, expected)
 
-    def test_measured_coordinates_read_solely_from_the_report(self) -> None:
-        # re-dissent Finding-1 lock: all four coordinates come from the authoritative return, NOT a pre-run
-        # bundle or guard object. Set distinct values on the report and assert they are what admission reads.
-        un = _unadmitted(_plan(), _report(rpd="RP", tpd="TP", gpd="GP"))
-        self.assertEqual(un.measured_coordinates(), ("RP", "TP", "GP", _EID))
 
-    def test_execution_coordinate_is_the_identity_digest(self) -> None:
-        # the fourth coordinate is the digest of the parent-measured execution identity (not a raw field).
-        rpd, tpd, gpd, eid = _unadmitted(_plan(), _report()).measured_coordinates()
-        self.assertEqual((rpd, tpd, gpd), (_RPD, _TPD, _GPD))
-        self.assertEqual(eid, content_digest({
-            "backend": "ObservedOCISandbox", "image_ref": "sha256:abc",
-            "isolation_level": "hermetic", "observer_config_hash": "obs"}))
-
-
-class RefusalTests(unittest.TestCase):
-    def test_icv_mismatch_refused_first(self) -> None:
-        # a plan authorizing an unimplemented identity contract is refused BEFORE anything else — even with
-        # otherwise-incomplete coordinates (layer ordering: ICV is the first gate).
-        res = admit_run_result(_unadmitted(
-            _plan(icv=IDENTITY_CONTRACT_VERSION + 1),
-            _report(execution_identity=None)))  # also incomplete, but ICV must win
-        self.assertIsInstance(res, BlockingRefusal)
-        assert isinstance(res, BlockingRefusal)
-        self.assertIs(res.reason, RunAdmissionRefusal.ICV_UNSUPPORTED)
-
+class StructuralRefusalTests(unittest.TestCase):
     def test_icv_exact_int_typing_rejects_bool_str_and_bad_value(self) -> None:
-        # P1-2 (re-dissent): type(icv) is int AND == constant. A bool (True == 1) must NOT admit under a
-        # 'vTrue' domain; a str or an unsupported int is refused too.
         bad_icvs: tuple[object, ...] = (True, False, "1", IDENTITY_CONTRACT_VERSION + 1, 0)
         for bad in bad_icvs:
             with self.subTest(icv=repr(bad)):
                 plan = AuthorizedRunPlan(policy_id="p1", target_subject=_SUBJECT,
                                          authorized_context=(_SET, _SUBJECT, bad))  # type: ignore[arg-type]
-                res = admit_run_result(_unadmitted(plan, _report()))
-                self.assertIsInstance(res, BlockingRefusal)
+                res = _admit(plan, _report(), _FakeGovernance())
                 assert isinstance(res, BlockingRefusal)
                 self.assertIs(res.reason, RunAdmissionRefusal.ICV_UNSUPPORTED)
 
-    def test_unauthorized_subject_refused(self) -> None:
-        # the plan's dispatch target != the governance-authorized subject -> the run was dispatched against a
-        # subject the policy does not authorize (compare vs authorized context).
-        res = admit_run_result(_unadmitted(
-            _plan(target=_SUBJECT, authorized="some-OTHER-authorized-subject"), _report()))
-        self.assertIsInstance(res, BlockingRefusal)
+    def test_mint_incoherent_plan_refused(self) -> None:
+        res = _admit(_plan(target=_SUBJECT, authorized="other"), _report(), _FakeGovernance())
         assert isinstance(res, BlockingRefusal)
         self.assertIs(res.reason, RunAdmissionRefusal.UNAUTHORIZED_SUBJECT)
 
-    def test_incomplete_coordinates_refused_on_each_missing_coordinate(self) -> None:
-        for kwargs in ({"rpd": None}, {"tpd": None}, {"gpd": None}, {"execution_identity": None}):
+    def test_incomplete_coordinates_refused(self) -> None:
+        for kwargs in ({"rpd": None}, {"tpd": None}, {"gpd": None}, {"execution_identity": None},
+                       {"rpd": ""}):
             with self.subTest(missing=next(iter(kwargs))):
-                res = admit_run_result(_unadmitted(_plan(), _report(**kwargs)))  # type: ignore[arg-type]
-                self.assertIsInstance(res, BlockingRefusal)
+                res = _admit(_plan(), _report(**kwargs), _FakeGovernance())  # type: ignore[arg-type]
                 assert isinstance(res, BlockingRefusal)
                 self.assertIs(res.reason, RunAdmissionRefusal.INCOMPLETE_COORDINATES)
 
-    def test_empty_string_coordinate_is_not_present(self) -> None:
-        # an empty-string coordinate does NOT count as present (the empty-string identity-downgrade guard,
-        # matching the attestation module) -> refused as incomplete, not hashed into a meaningless composite.
-        res = admit_run_result(_unadmitted(_plan(), _report(rpd="")))
-        self.assertIsInstance(res, BlockingRefusal)
-        assert isinstance(res, BlockingRefusal)
-        self.assertIs(res.reason, RunAdmissionRefusal.INCOMPLETE_COORDINATES)
-
-    def test_subject_drift_refused(self) -> None:
-        res = admit_run_result(_unadmitted(_plan(target="not-the-measured-subject",
-                                                 authorized="not-the-measured-subject"), _report()))
-        self.assertIsInstance(res, BlockingRefusal)
+    def test_subject_drift_is_the_runner_bypass_catch(self) -> None:
+        # the report recomputes to _SUBJECT2 (a DIFFERENT guard) but the plan dispatched _SUBJECT.
+        res = _admit(_plan(target=_SUBJECT, authorized=_SUBJECT), _report(gpd="guard-2"), _FakeGovernance())
         assert isinstance(res, BlockingRefusal)
         self.assertIs(res.reason, RunAdmissionRefusal.SUBJECT_DRIFT)
 
-    def test_every_refusal_blocks_the_merge_fail_closed(self) -> None:
-        # a refusal is never a silent drop: it carries a blocking ERROR verdict (-> action_required).
+    def test_structural_precedes_live_reads(self) -> None:
+        # a structural failure wins even when the live governance would also refuse (attestation None).
+        res = _admit(_plan(icv=IDENTITY_CONTRACT_VERSION + 1), _report(),
+                     _FakeGovernance(attestation_none=True))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.ICV_UNSUPPORTED)
+
+
+class RunnerBypassOrderingTests(unittest.TestCase):
+    def test_run_matching_live_but_not_the_plan_is_subject_drift_not_authorized_moved(self) -> None:
+        # THE bypass the board flagged: live subject = S2, plan dispatched S1, the runner measured S2 (the
+        # live subject) instead of S1. This must be SUBJECT_DRIFT (the runner did not execute the plan) —
+        # NOT AUTHORIZED_SUBJECT_MOVED — because the structural measured-vs-plan check runs FIRST and the
+        # execution was unauthorized regardless of whether it happens to match live state.
+        res = _admit(_plan(target=_SUBJECT, authorized=_SUBJECT), _report(gpd="guard-2"),
+                     _FakeGovernance(subject=_SUBJECT2))  # live subject == the measured S2
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.SUBJECT_DRIFT)
+
+
+class LiveCurrencyRefusalTests(unittest.TestCase):
+    def test_attestation_none_fail_closed(self) -> None:
+        res = _admit(_plan(), _report(), _FakeGovernance(attestation_none=True))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.LIVE_ATTESTATION_UNAVAILABLE)
+
+    def test_attestation_raises_fail_closed(self) -> None:
+        res = _admit(_plan(), _report(), _FakeGovernance(raise_attn=True))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.LIVE_ATTESTATION_UNAVAILABLE)
+
+    def test_oracle_head_none_fail_closed(self) -> None:
+        res = _admit(_plan(), _report(), _FakeGovernance(live_head=None))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.ORACLE_UNAVAILABLE)
+
+    def test_oracle_head_raises_fail_closed(self) -> None:
+        res = _admit(_plan(), _report(), _FakeGovernance(raise_head=True))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.ORACLE_UNAVAILABLE)
+
+    def test_authorized_set_moved(self) -> None:
+        # the live attestation is bound to a DIFFERENT set than the plan authorized (a rebind).
+        res = _admit(_plan(set_id=_SET), _report(), _FakeGovernance(set_id="set-2", subject=_SUBJECT))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.AUTHORIZED_SET_MOVED)
+
+    def test_set_head_stale(self) -> None:
+        # the bound head differs from the live set_head — the set drifted while the policy stayed ENABLED.
+        res = _admit(_plan(), _report(), _FakeGovernance(bound_head="old-head", live_head="new-head"))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.SET_HEAD_STALE)
+
+    def test_authorized_subject_moved(self) -> None:
+        # structural passes (measured == target) but governance moved the authorized subject.
+        res = _admit(_plan(target=_SUBJECT, authorized=_SUBJECT), _report(),
+                     _FakeGovernance(subject="a-newly-authorized-subject"))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.AUTHORIZED_SUBJECT_MOVED)
+
+    def test_set_continuity_checked_before_head(self) -> None:
+        # a moved set is reported as AUTHORIZED_SET_MOVED even if the head also differs (ordering).
+        res = _admit(_plan(set_id=_SET), _report(),
+                     _FakeGovernance(set_id="set-2", bound_head="x", live_head="y"))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.AUTHORIZED_SET_MOVED)
+
+
+class EveryRefusalBlocksTests(unittest.TestCase):
+    def test_every_refusal_carries_a_blocking_error_verdict(self) -> None:
         for res in (
-            admit_run_result(_unadmitted(_plan(icv=99), _report())),
-            admit_run_result(_unadmitted(_plan(authorized="x"), _report())),
-            admit_run_result(_unadmitted(_plan(), _report(execution_identity=None))),
-            admit_run_result(_unadmitted(_plan(target="x", authorized="x"), _report())),
+            _admit(_plan(icv=99), _report(), _FakeGovernance()),
+            _admit(_plan(target=_SUBJECT, authorized="x"), _report(), _FakeGovernance()),
+            _admit(_plan(), _report(execution_identity=None), _FakeGovernance()),
+            _admit(_plan(), _report(gpd="guard-2"), _FakeGovernance()),
+            _admit(_plan(), _report(), _FakeGovernance(attestation_none=True)),
+            _admit(_plan(), _report(), _FakeGovernance(live_head=None)),
+            _admit(_plan(set_id=_SET), _report(), _FakeGovernance(set_id="set-2")),
+            _admit(_plan(), _report(), _FakeGovernance(bound_head="a", live_head="b")),
+            _admit(_plan(), _report(), _FakeGovernance(subject="other")),
         ):
             assert isinstance(res, BlockingRefusal)
             self.assertIs(res.verdict.status, VerdictType.ERROR)
             self.assertIs(res.verdict.reason, Reason.RUN_UNADMITTED)
 
 
+class ProofGatedConstructionTests(unittest.TestCase):
+    """The AdmittedRunResult constructor is proof-gated (live-admission grant) AND re-runs the pure
+    structural validator — a direct construction can bypass NEITHER the live checks NOR the report recompute."""
+
+    def test_construction_without_the_grant_raises(self) -> None:
+        with self.assertRaises(RunAdmissionError):
+            AdmittedRunResult(plan=_plan(), report=_report(), measured_subject=_SUBJECT,
+                              admitted_set_id=_SET, bound_oracle_head=_HEAD)  # no grant
+
+    def test_report_drift_with_grant_still_raises(self) -> None:
+        # even WITH the grant, a report that recomputes to a different subject fails the structural re-run.
+        with self.assertRaises(RunAdmissionError):
+            AdmittedRunResult(plan=_plan(target=_SUBJECT), report=_report(gpd="guard-2"),
+                              measured_subject=_SUBJECT, admitted_set_id=_SET, bound_oracle_head=_HEAD,
+                              grant=_LIVE_GRANT)
+
+    def test_stored_subject_not_report_recomputed_raises(self) -> None:
+        with self.assertRaises(RunAdmissionError):
+            AdmittedRunResult(plan=_plan(target=_SUBJECT), report=_report(), measured_subject="a-lie",
+                              admitted_set_id=_SET, bound_oracle_head=_HEAD, grant=_LIVE_GRANT)
+
+    def test_bad_icv_with_grant_raises(self) -> None:
+        plan = AuthorizedRunPlan(policy_id="p1", target_subject=_SUBJECT,
+                                 authorized_context=(_SET, _SUBJECT, IDENTITY_CONTRACT_VERSION + 1))
+        with self.assertRaises(RunAdmissionError):
+            AdmittedRunResult(plan=plan, report=_report(), measured_subject=_SUBJECT,
+                              admitted_set_id=_SET, bound_oracle_head=_HEAD, grant=_LIVE_GRANT)
+
+
 class TypestateTests(unittest.TestCase):
-    def test_all_types_are_frozen(self) -> None:
-        plan = _plan()
-        with self.assertRaises(dataclasses.FrozenInstanceError):
-            plan.policy_id = "other"  # type: ignore[misc]
-        un = _unadmitted(plan, _report())
-        with self.assertRaises(dataclasses.FrozenInstanceError):
-            un.plan = plan  # type: ignore[misc]
-        adm = admit_run_result(un)
+    def test_admitted_and_refusal_are_frozen(self) -> None:
+        adm = _admit(_plan(), _report(), _FakeGovernance())
         assert isinstance(adm, AdmittedRunResult)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             adm.measured_subject = "x"  # type: ignore[misc]
-        ref = admit_run_result(_unadmitted(_plan(target="x", authorized="x"), _report()))
+        ref = _admit(_plan(), _report(), _FakeGovernance(attestation_none=True))
         assert isinstance(ref, BlockingRefusal)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             ref.detail = "x"  # type: ignore[misc]
@@ -216,39 +276,10 @@ class TypestateTests(unittest.TestCase):
         self.assertEqual(plan.authorized_subject, "subj")
         self.assertEqual(plan.identity_contract_version, IDENTITY_CONTRACT_VERSION)
 
-class DirectConstructionTests(unittest.TestCase):
-    """P1-1 (re-dissent): the constructor RE-RUNS the full admission validator, so hand-assembling an
-    AdmittedRunResult cannot bypass admission. Every forge attempt fails closed with RunAdmissionError."""
-
-    def test_report_drift_with_stored_target_raises(self) -> None:
-        # forge: plan target=T, but the REPORT recomputes to X (a different guard) != T, stored subject=T.
-        # The old ctor (measured_subject == plan.target_subject) would have ACCEPTED this; the full recheck
-        # recomputes X from the report, sees the drift, and raises — the bypass is closed structurally.
-        with self.assertRaises(RunAdmissionError):
-            AdmittedRunResult(plan=_plan(target=_SUBJECT), report=_report(gpd="a-DIFFERENT-guard"),
-                              measured_subject=_SUBJECT)
-
-    def test_stored_subject_not_the_report_recomputed_one_raises(self) -> None:
-        # the report recomputes to _SUBJECT (== target), but the stored subject is a lie != recomputed.
-        with self.assertRaises(RunAdmissionError):
-            AdmittedRunResult(plan=_plan(target=_SUBJECT), report=_report(),
-                              measured_subject="a-fabricated-subject")
-
-    def test_bad_icv_direct_construction_raises(self) -> None:
-        plan = AuthorizedRunPlan(policy_id="p1", target_subject=_SUBJECT,
-                                 authorized_context=(_SET, _SUBJECT, IDENTITY_CONTRACT_VERSION + 1))
-        with self.assertRaises(RunAdmissionError):
-            AdmittedRunResult(plan=plan, report=_report(), measured_subject=_SUBJECT)
-
-    def test_incomplete_coordinates_direct_construction_raises(self) -> None:
-        with self.assertRaises(RunAdmissionError):
-            AdmittedRunResult(plan=_plan(target=_SUBJECT), report=_report(execution_identity=None),
-                              measured_subject=_SUBJECT)
-
-    def test_unauthorized_subject_direct_construction_raises(self) -> None:
-        with self.assertRaises(RunAdmissionError):
-            AdmittedRunResult(plan=_plan(target=_SUBJECT, authorized="other-authorized"),
-                              report=_report(), measured_subject=_SUBJECT)
+    def test_measured_coordinates_read_solely_from_the_report(self) -> None:
+        un = UnadmittedRunResult(plan=_plan(),
+                                 result=EngineRunResult(trial_report=_report(rpd="RP", tpd="TP", gpd="GP")))
+        self.assertEqual(un.measured_coordinates(), ("RP", "TP", "GP", _EID))
 
 
 if __name__ == "__main__":

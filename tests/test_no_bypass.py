@@ -58,6 +58,14 @@ class StructuralNoBypassTests(unittest.TestCase):
         # the load-bearing controls are reattest's mandatory chain-checked expectations.
         self.assertEqual(_constructions("_mint_reattest_grant"), {"restore_controller.py": 1})
 
+    def test_live_admission_grant_constructed_only_by_run_admission(self) -> None:
+        # 3.5 S3-completion CP1: the ONLY construction of the live-admission grant in the gate tree is the
+        # single module-level singleton in gate/run_admission.py — so no other gate module can mint one to
+        # forge an AdmittedRunResult that skipped the live governance-currency checks. Same honest scope as
+        # the two above: structural absence of a second minter, NOT unforgeability (the load-bearing control
+        # is that admit_run_result actually ran the live reads before minting).
+        self.assertEqual(_constructions("_LiveAdmissionGrant"), {"run_admission.py": 1})
+
 
 class RuntimeGateTests(unittest.TestCase):
     def _cal(self) -> CalibrationStore:
