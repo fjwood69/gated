@@ -274,18 +274,25 @@ def run_calibration(
         sealed, resolve=resolve, detector_id=detector_id,
         trust_policy=trust_policy, backend_guard=backend_guard,
     )
+    # ALL routing digests come from the ONE prepared context — never a SECOND live read of the mutable
+    # trust/guard objects between preparation and intent creation (which could shift durable routing under
+    # us). Validate each prepared witness is present + non-empty (a None guard witness = a digestless
+    # backend guard → unroutable) BEFORE entering CALIBRATING; fail-closed on any absence.
+    prof_w, trust_w, guard_w = prepared.profile_witness, prepared.trust_witness, prepared.guard_witness
+    if not prof_w or not trust_w or not guard_w:
+        raise ConfigurationError(
+            "run_calibration: a prepared routing witness is absent "
+            f"(profile={prof_w!r}, trust={trust_w!r}, guard={guard_w!r}) — an intent with a null routing "
+            "coordinate is unroutable (fail-closed)")
     # enter CALIBRATING via the atomic enter_calibrating (tier transition + the re-calibration RECOVERY
     # INTENT in one transaction), so a crash between the transition and the run cannot strand the policy
     # (the ENABLED-only relay would never re-trigger it). The intent carries model-(b) ROUTING (detector
     # registry name + expected profile/trust/guard digests the worker verifies boot objects against) bound
-    # to the MEASURED head; the four-tuple is MEASURED by the run.
+    # to the MEASURED head — all from the prepared witnesses; the four-tuple is MEASURED by the run.
     store.enter_calibrating(
         policy_id, approval=approval, set_id=set_id, pinned_set_version=sealed.oracle_head,
-        detector_id=detector_id, expected_profile_digest=prepared.profile_witness,
-        expected_trust_policy_digest=trust_policy.policy_digest,
-        # the guard OBJECT's policy digest (read as the runner reads it — off the applied object); a guard
-        # with no policy_digest yields "" and enter_calibrating fail-closes (an unroutable intent).
-        expected_guard_policy_digest=getattr(backend_guard, "policy_digest", ""),
+        detector_id=detector_id, expected_profile_digest=prof_w,
+        expected_trust_policy_digest=trust_w, expected_guard_policy_digest=guard_w,
         identity_contract_version=IDENTITY_CONTRACT_VERSION,
     )
     # REQUIRE the active intent (fail-closed on None): a lost intent must not silently skip provenance

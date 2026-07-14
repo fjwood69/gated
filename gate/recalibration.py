@@ -37,12 +37,12 @@ from engine.calibration import (
     DEFAULT_CALIBRATION_TRIALS,
     BackendGuard,
     BundleResolver,
-    CalibrationResult,
 )
 from engine.observation_trust import TrustPolicy
 from gate.attestation import MeasurementAttestation, sign_measurement
 from gate.calibration_store import CalibrationStore
 from gate.candidate_measurement import (
+    CandidateMeasurement,
     WitnessInconsistencyError,
     prepare_candidate,
     produce_candidate_measurement,
@@ -64,15 +64,20 @@ def deterministic_job_id(
     })
 
 
-def _outcome_of(result: CalibrationResult) -> VerdictType:
-    """Map a CalibrationResult to the measurement outcome. An INADEQUATE set, any HARNESS ERROR, or an
-    UNATTESTABLE environment (the fixtures did not all run under one parent-measured execution identity)
-    is ERROR (inconclusive — not a PASS, and not a clean FAIL that would mis-attribute an environment
-    problem to the detector); a real miss/false-positive/flake is FAIL; only a clean two-sided pass in a
-    single attested environment is PASS."""
-    if result.inadequate or result.harness_errors or not result.identity_consistent:
+def _outcome_of(measurement: CandidateMeasurement) -> VerdictType:
+    """Map a measurement to its outcome. ERROR (inconclusive) whenever the run is UNATTESTABLE — an
+    INADEQUATE set, any HARNESS ERROR, an inconsistent execution identity, INCONSISTENT POLICIES (a mixed
+    trust/guard policy across fixtures), or ANY absent runtime-subject coordinate (no composite subject).
+    Only a fully-attested run yields PASS/FAIL: a real miss/false-positive/flake is FAIL; a clean two-sided
+    pass is PASS. Classifying from the ``CandidateMeasurement`` (which carries the four coordinates + the
+    composite subject) means the outcome CANNOT be PASS/FAIL while a coordinate is missing — so it always
+    satisfies ``sign_measurement``'s conditional-validity rule (a PASS/FAIL requires all four coordinates +
+    a subject), and a mixed-policy / digestless-guard run becomes signed ERROR evidence, never a crash."""
+    r = measurement.result
+    if (r.inadequate or r.harness_errors or not r.identity_consistent
+            or not r.policies_consistent or measurement.subject_identity is None):
         return VerdictType.ERROR
-    return VerdictType.PASS if result.passed else VerdictType.FAIL
+    return VerdictType.PASS if r.passed else VerdictType.FAIL
 
 
 def run_recalibration(
@@ -117,8 +122,10 @@ def run_recalibration(
 
     def _signed_error(marker: str) -> MeasurementAttestation:
         # a signed ERROR AUDIT attestation with null components: categorically non-restorable
-        # (is_clean_pass False), never a measurement that could restore a tier. The runner ALWAYS emits
-        # signed evidence — a fail-closed measurement condition becomes ERROR evidence, never a crash.
+        # (is_clean_pass False), never a measurement that could restore a tier. For the DEFINED measurement
+        # failures — detector resolution, a mutated-policy witness mismatch, and (via _outcome_of) a mixed /
+        # digestless / otherwise-unattested provenance — the runner emits signed ERROR evidence rather than
+        # raising. It does NOT normalise arbitrary execution exceptions (sandbox/budget faults propagate).
         return sign_measurement(MeasurementAttestation(
             outcome=VerdictType.ERROR, policy_id=policy_id, subject_identity=None,
             requested_subject_identity=requested_subject_identity,
@@ -161,7 +168,7 @@ def run_recalibration(
     eid = measurement.execution_identity_digest
     subject = measurement.subject_identity
     unsigned = MeasurementAttestation(
-        outcome=_outcome_of(result), policy_id=policy_id, subject_identity=subject,
+        outcome=_outcome_of(measurement), policy_id=policy_id, subject_identity=subject,
         requested_subject_identity=requested_subject_identity,
         resolved_profile_digest=rpd, trust_policy_digest=tpd, guard_policy_digest=gpd,
         execution_identity_digest=eid, set_id=set_id,

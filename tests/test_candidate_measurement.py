@@ -126,25 +126,45 @@ class WitnessTeethTests(unittest.TestCase):
 
 
 class RunnerNeverCrashesTests(unittest.TestCase):
-    def test_run_recalibration_emits_signed_error_on_mutating_policy(self) -> None:
-        # the runner's contract is "always emit signed evidence, never crash". A mid-run policy mutation
-        # (which trips the spine's witness check) must become a SIGNED ERROR attestation, not an uncaught
-        # WitnessInconsistencyError. Import locally to keep the spine-unit module free of the recal setup.
-        from gate.signing import KeyVerifier, SeedSigner, public_key
+    """The runner's contract: for a DEFINED measurement failure it ALWAYS emits a valid SIGNED ERROR
+    attestation (audit evidence, non-restorable), never an uncaught crash at the signing boundary. These
+    exercise run_recalibration THROUGH sign_measurement — which rejects a PASS/FAIL that lacks the four
+    coordinates + subject — so the outcome must be ERROR for every unattested-provenance path."""
+
+    def _recal_error(self, backend_guard: object):  # type: ignore[no-untyped-def]
         from gate.attestation import verify_measurement
+        from gate.signing import KeyVerifier, SeedSigner, public_key
         cal = _cal_store(known_bad=_KB, known_good=_KG)
         seed = bytes(range(32))
         att = run_recalibration(
             policy_id="p1", set_id="default", calibration_store=cal, make_sandbox=_fac(),
             detector_id="d", resolve=golden_resolver(_det()), requested_subject_identity="req-1",
             tier_generation="tier-h", budget=_BUDGET, issuer="cal-gov-1", nonce="n1", now=100.0,
-            signer=SeedSigner(seed), trials=3, backend_guard=_MutatingGuard(), trust_policy=_REF_TP,
+            signer=SeedSigner(seed), trials=3, backend_guard=backend_guard,  # type: ignore[arg-type]
+            trust_policy=_REF_TP,
         )
-        verify_measurement(att, verifier=KeyVerifier(public_key(seed)))  # still a valid signed record
+        verify_measurement(att, verifier=KeyVerifier(public_key(seed)))  # a valid signed record
         self.assertIs(att.outcome, VerdictType.ERROR)
         self.assertIsNone(att.subject_identity)
         self.assertFalse(att.is_clean_pass)
+        return att
+
+    def test_signed_error_on_mutating_policy(self) -> None:
+        # a mid-run mutation trips the spine's WITNESS check -> caught -> signed ERROR (not a crash).
+        att = self._recal_error(_MutatingGuard())
         self.assertIn("policy-witness-inconsistent", att.harness_errors)
+
+    def test_signed_error_on_mixed_guard_across_fixtures(self) -> None:
+        # board P1: a guard whose digest is inconsistent across fixtures -> guard_policy_digest None ->
+        # subject None. The outcome MUST classify ERROR (not FAIL) or sign_measurement's conditional-validity
+        # rule raises SubjectCompositionError. Exercises the signing boundary the spine-only test missed.
+        self._recal_error(_MixedGuard())
+
+    def test_signed_error_on_digestless_guard(self) -> None:
+        # a backend guard bearing NO policy_digest (an unattested guard coordinate) -> gpd None -> subject
+        # None -> signed ERROR, never a PASS/FAIL the signer would reject.
+        from tests._backend_optout import allow_any_backend
+        self._recal_error(allow_any_backend)
 
 
 class MixedGuardAggregationTests(unittest.TestCase):
