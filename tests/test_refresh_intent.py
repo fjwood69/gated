@@ -74,7 +74,7 @@ class EnterCalibratingTests(unittest.TestCase):
         self.assertEqual(row["expected_profile_digest"], "pd")
         self.assertEqual(row["expected_trust_policy_digest"], "tp")
         self.assertEqual(row["expected_guard_policy_digest"], "gp")
-        self.assertEqual(row["churn_count"], 0)
+        self.assertEqual(row["set_churn_count"], 0)
         # no measured subject on the intent — routing only.
         self.assertNotIn("detector_identity", row.keys())
 
@@ -139,7 +139,7 @@ class EnterCalibratingTests(unittest.TestCase):
         s._conn().execute(
             "INSERT INTO refresh_intent (policy_id, set_id, target_head, policy_generation, target_revision,"
             " detector_id, expected_profile_digest, expected_trust_policy_digest, expected_guard_policy_digest,"
-            " identity_contract_version, churn_count, status, created_at, updated_at) "
+            " identity_contract_version, set_churn_count, status, created_at, updated_at) "
             "VALUES ('p1','setA','h','gen',0,'d','pd','tp','gp',1,0,'pending',0,0)")
         with self.assertRaises(ActiveCalibrationIntentExists):
             _enter(s)
@@ -223,11 +223,11 @@ class ChurnAdvanceTests(unittest.TestCase):
         _enter(s)
         self.assertEqual(self._adv(s, 0, "oracle-head-1", "H2"), "advanced")
         r1 = s.active_intent("p1")
-        self.assertEqual((r1["target_head"], r1["target_revision"], r1["churn_count"]), ("H2", 1, 1))
+        self.assertEqual((r1["target_head"], r1["target_revision"], r1["set_churn_count"]), ("H2", 1, 1))
         # a genuinely-distinct successive head increments again.
         self.assertEqual(self._adv(s, 1, "H2", "H3"), "advanced")
         r2 = s.active_intent("p1")
-        self.assertEqual((r2["target_head"], r2["target_revision"], r2["churn_count"]), ("H3", 2, 2))
+        self.assertEqual((r2["target_head"], r2["target_revision"], r2["set_churn_count"]), ("H3", 2, 2))
 
     def test_stale_delayed_advance_no_ops(self) -> None:
         # the split-generation fence: a lagging advance (still expecting revision 0 / the old head) after the
@@ -239,7 +239,7 @@ class ChurnAdvanceTests(unittest.TestCase):
         self._adv(s, 1, "H2", "H3")
         self.assertEqual(self._adv(s, 0, "oracle-head-1", "H2-again"), "no_op")
         r = s.active_intent("p1")
-        self.assertEqual((r["target_head"], r["target_revision"], r["churn_count"]), ("H3", 2, 2))
+        self.assertEqual((r["target_head"], r["target_revision"], r["set_churn_count"]), ("H3", 2, 2))
 
     def test_same_head_advance_rejected(self) -> None:
         # a same-head advance does not churn — rejected (the coalescing invariant: only DISTINCT heads churn).

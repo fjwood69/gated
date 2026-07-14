@@ -38,6 +38,14 @@ class JobStatus(str, Enum):
     DEAD_LETTER = "dead_letter"
 
 
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """Idempotent ADD COLUMN (SQLite has no ``ADD COLUMN IF NOT EXISTS``): ALTER only when ``PRAGMA
+    table_info`` shows the column absent. A non-NULL column MUST carry a DEFAULT so existing rows backfill."""
+    existing = {str(r["name"]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def intent_candidate_job_id(
     *, intent_seq: int, policy_generation: str, target_revision: int, target_head: str,
 ) -> str:
@@ -130,6 +138,14 @@ class RecalQueue:
         self._lock = threading.Lock()
         conn = self._conn()
         conn.executescript(_SCHEMA)
+        # 3.5 CP4 Slice C: idempotent ALTER migration — a queue database created before these columns retains
+        # the old schema, so upgrade it in place (CREATE TABLE IF NOT EXISTS never adds columns). ``kind``
+        # carries DEFAULT 'outbox' so EVERY pre-existing row backfills to an outbox job — kind-filtered
+        # leasing then correctly excludes them from the intent worker.
+        _add_column_if_missing(conn, "recal_queue", "kind", "TEXT NOT NULL DEFAULT 'outbox'")
+        _add_column_if_missing(conn, "recal_queue", "intent_seq", "INTEGER")
+        _add_column_if_missing(conn, "recal_queue", "policy_generation", "TEXT")
+        _add_column_if_missing(conn, "recal_queue", "target_revision", "INTEGER")
         conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
@@ -165,20 +181,35 @@ class RecalQueue:
             )
             return bool(cur.rowcount)
 
-    def lease(self, *, lease_token: str, visibility_timeout: float, now: float | None = None) -> RecalJob | None:
+    def lease(
+        self, *, lease_token: str, visibility_timeout: float, now: float | None = None,
+        kind: str | None = None,
+    ) -> RecalJob | None:
         """Atomically claim one runnable job (PENDING, or PROCESSING whose lease expired) — oldest
         first. Sets it PROCESSING, stamps ``lease_token`` + ``locked_until = now + visibility_timeout``,
-        bumps ``attempts``. Returns the leased job, or None if nothing is runnable."""
+        bumps ``attempts``. Returns the leased job, or None if nothing is runnable.
+
+        3.5 CP4 Slice C: ``kind`` filters the claim by job source. The queue holds BOTH ``'outbox'`` jobs
+        (ENABLED-policy restore work) and ``'intent'`` jobs (CALIBRATING-policy candidates); the intent
+        worker MUST pass ``kind='intent'`` so it never leases — and drop as stale — an outbox job (whose
+        intent fence is null). ``kind=None`` preserves the unfiltered legacy claim for existing consumers."""
         ts = self._clock() if now is None else now
         with self._lock:
             conn = self._conn()
             conn.execute("BEGIN IMMEDIATE")
             try:
-                row = conn.execute(
-                    "SELECT * FROM recal_queue WHERE status=? OR (status=? AND locked_until < ?)"
-                    " ORDER BY enqueued_at ASC LIMIT 1",
-                    (JobStatus.PENDING.value, JobStatus.PROCESSING.value, ts),
-                ).fetchone()
+                if kind is None:
+                    row = conn.execute(
+                        "SELECT * FROM recal_queue WHERE status=? OR (status=? AND locked_until < ?)"
+                        " ORDER BY enqueued_at ASC LIMIT 1",
+                        (JobStatus.PENDING.value, JobStatus.PROCESSING.value, ts),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT * FROM recal_queue WHERE kind=? AND (status=? OR (status=? AND"
+                        " locked_until < ?)) ORDER BY enqueued_at ASC LIMIT 1",
+                        (kind, JobStatus.PENDING.value, JobStatus.PROCESSING.value, ts),
+                    ).fetchone()
                 if row is None:
                     conn.execute("COMMIT")
                     return None

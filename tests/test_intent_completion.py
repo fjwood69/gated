@@ -126,7 +126,7 @@ class ReactivateFailedDetectorTests(unittest.TestCase):
         self.assertEqual(row["status"], "pending")
         self.assertEqual(row["target_head"], "oracle-head-2")
         self.assertEqual(int(row["target_revision"]), f["target_revision"] + 1)
-        self.assertEqual(int(row["churn_count"]), 1)
+        self.assertEqual(int(row["set_churn_count"]), 1)
 
     def test_same_head_reactivation_is_rejected(self) -> None:
         s = _store()
@@ -148,7 +148,7 @@ class ReactivateFailedDetectorTests(unittest.TestCase):
     def test_churn_bound_exhaustion_fails_churn(self) -> None:
         s = _store()
         f = self._to_failed_detector(s)
-        # churn_count is 0; a bound of 0 means +1 > 0 -> failed_churn, never reactivated.
+        # set_churn_count is 0; a bound of 0 means +1 > 0 -> failed_churn, never reactivated.
         self.assertEqual(
             s.reactivate_failed_detector("p1", expect_policy_generation=f["policy_generation"],
                                          expect_target_revision=f["target_revision"],
@@ -157,22 +157,119 @@ class ReactivateFailedDetectorTests(unittest.TestCase):
         self.assertTrue(s.has_failed_churn("p1"))
 
 
-class IntentsToReconcileTests(unittest.TestCase):
-    def test_scan_includes_active_and_failed_detector_excludes_terminal_and_failed_churn(self) -> None:
+class ReactivateSatisfiedTests(unittest.TestCase):
+    def _satisfied(self, s: PolicyStore):  # type: ignore[no-untyped-def]
+        f = _fence(_calibrating(s))
+        _satisfy(s, "p1", f, ref="ref-1")
+        return f
+
+    def test_distinct_head_rearms_to_pending_clearing_ref_incrementing_set_churn(self) -> None:
         s = _store()
-        # p1 pending (active)
+        f = self._satisfied(s)
+        self.assertEqual(
+            s.reactivate_satisfied("p1", expect_policy_generation=f["policy_generation"],
+                                   expect_target_revision=f["target_revision"],
+                                   expect_target_head=f["target_head"], new_target_head="oracle-head-2",
+                                   churn_bound=32), "reactivated")
+        row = s.active_intent("p1")
+        assert row is not None
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["target_head"], "oracle-head-2")
+        self.assertEqual(int(row["target_revision"]), f["target_revision"] + 1)
+        self.assertEqual(int(row["set_churn_count"]), 1)          # counts SET churn once
+        self.assertIsNone(row["calibration_result_ref"])          # stale H1 ref cleared
+
+    def test_race_guard_no_op_when_policy_no_longer_calibrating(self) -> None:
+        # between the reconciler's read and this CAS a human ratified the pass -> policy ENABLED. Reactivating
+        # would arm a pending intent for an ENABLED policy; the in-lock current_state check no-ops instead.
+        s = _store()
+        f = self._satisfied(s)
+        from gate.gatekeeper import ratify_enable  # noqa: PLC0415 — test-local to avoid a cycle
+        ratify_enable("p1", store=s, approval=_appr("g1", op="p1-ratify"),
+                      calibration_result_ref="ref-1", pinned_set_version=f["target_head"])
+        self.assertIs(s.current_state("p1"), PolicyState.ENABLED)
+        self.assertEqual(
+            s.reactivate_satisfied("p1", expect_policy_generation=f["policy_generation"],
+                                   expect_target_revision=f["target_revision"],
+                                   expect_target_head=f["target_head"], new_target_head="oracle-head-2",
+                                   churn_bound=32), "no_op")
+
+    def test_same_head_rejected(self) -> None:
+        s = _store()
+        f = self._satisfied(s)
+        with self.assertRaises(ValueError):
+            s.reactivate_satisfied("p1", expect_policy_generation=f["policy_generation"],
+                                   expect_target_revision=f["target_revision"],
+                                   expect_target_head=f["target_head"], new_target_head=f["target_head"],
+                                   churn_bound=32)
+
+
+class SetChurnBudgetTests(unittest.TestCase):
+    def test_replayed_advance_does_not_double_increment(self) -> None:
+        # crash replay: an advance under the OLD fence after a newer advance already landed no-ops (the fence
+        # moved), so set_churn_count is not double-incremented.
+        s = _store()
+        f = _fence(_calibrating(s))
+        self.assertEqual(
+            s.advance_intent("p1", expect_policy_generation=f["policy_generation"],
+                             expect_target_revision=f["target_revision"], expect_target_head=f["target_head"],
+                             new_target_head="oracle-head-2", churn_bound=32), "advanced")
+        self.assertEqual(int(s.active_intent("p1")["set_churn_count"]), 1)  # type: ignore[index]
+        # replay of the SAME (now-stale) advance -> no_op, no double count
+        self.assertEqual(
+            s.advance_intent("p1", expect_policy_generation=f["policy_generation"],
+                             expect_target_revision=f["target_revision"], expect_target_head=f["target_head"],
+                             new_target_head="oracle-head-2", churn_bound=32), "no_op")
+        self.assertEqual(int(s.active_intent("p1")["set_churn_count"]), 1)  # type: ignore[index]
+
+
+class MigrationTests(unittest.TestCase):
+    def test_pre_slice_c_database_migrates_in_place(self) -> None:
+        import sqlite3
+        d = Path(tempfile.mkdtemp(prefix="mv-mig-")) / "p.db"
+        # hand-build a PRE-Slice-C refresh_intent (old churn_count, no calibration_result_ref).
+        conn = sqlite3.connect(str(d))
+        conn.execute(
+            "CREATE TABLE refresh_intent (seq INTEGER PRIMARY KEY AUTOINCREMENT, policy_id TEXT NOT NULL, "
+            "set_id TEXT NOT NULL, target_head TEXT NOT NULL, policy_generation TEXT NOT NULL, "
+            "target_revision INTEGER NOT NULL DEFAULT 0, detector_id TEXT NOT NULL, "
+            "expected_profile_digest TEXT NOT NULL, expected_trust_policy_digest TEXT NOT NULL, "
+            "expected_guard_policy_digest TEXT NOT NULL, identity_contract_version INTEGER NOT NULL, "
+            "churn_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, created_at REAL NOT NULL, "
+            "updated_at REAL NOT NULL)")
+        conn.execute(
+            "INSERT INTO refresh_intent (policy_id, set_id, target_head, policy_generation, target_revision, "
+            "detector_id, expected_profile_digest, expected_trust_policy_digest, expected_guard_policy_digest, "
+            "identity_contract_version, churn_count, status, created_at, updated_at) "
+            "VALUES ('p1','s','h','g',0,'d','pd','tp','gp',?,7,'pending',0,0)", (IDENTITY_CONTRACT_VERSION,))
+        conn.commit()
+        conn.close()
+        # opening it via PolicyStore runs the migrations in place.
+        s = PolicyStore(d)
+        cols = {r["name"] for r in s._conn().execute("PRAGMA table_info(refresh_intent)").fetchall()}
+        self.assertIn("set_churn_count", cols)         # renamed
+        self.assertNotIn("churn_count", cols)
+        self.assertIn("calibration_result_ref", cols)  # added
+        row = s._conn().execute("SELECT set_churn_count FROM refresh_intent WHERE policy_id='p1'").fetchone()
+        self.assertEqual(int(row["set_churn_count"]), 7)  # value PRESERVED across the rename
+
+
+class IntentsToReconcileTests(unittest.TestCase):
+    def test_scan_includes_active_failed_detector_and_satisfied_excludes_failed_churn(self) -> None:
+        s = _store()
+        # p1 pending (active) — included
         _calibrating(s, "p1")
-        # p2 failed_detector
+        # p2 failed_detector — included (a distinct head can retry it)
         f2 = _fence(_calibrating(s, "p2"))
         s.mark_intent_failed_detector("p2", **f2)
-        # p3 satisfied (terminal) -> excluded
+        # p3 satisfied — INCLUDED (board P1: a candidate awaiting ratify is still driftable)
         f3 = _fence(_calibrating(s, "p3"))
         _satisfy(s, "p3", f3, ref="ref-3")
-        # p4 failed_churn -> excluded
+        # p4 failed_churn — EXCLUDED (human clear_failed_churn required)
         f4 = _fence(_calibrating(s, "p4"))
         s.mark_intent_failed_churn("p4", **f4)
         pids = {r["policy_id"] for r in s.intents_to_reconcile()}
-        self.assertEqual(pids, {"p1", "p2"})
+        self.assertEqual(pids, {"p1", "p2", "p3"})
 
 
 if __name__ == "__main__":

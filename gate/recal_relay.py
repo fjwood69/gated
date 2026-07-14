@@ -61,13 +61,20 @@ def relay_outbox(
     return enqueued
 
 
+DEFAULT_SET_CHURN_BOUND = 32
+"""3.5 CP4 Slice C (board): the distinct-head advance budget before ``failed_churn`` — the ORACLE-MOVEMENT
+budget only (the calibration-failure budget is ``RecalQueue.max_attempts``, ~3-5). Sized generously (a
+churning set is expected) and configurable; a future refinement is to make it time-windowed/decaying so a
+slow, indefinite append stream cannot eventually false-trigger a static bound."""
+
+
 def relay_intents(
     *,
     policy_store: PolicyStore,
     calibration_store: CalibrationStore,
     queue: RecalQueue,
     now: float,
-    churn_bound: int,
+    churn_bound: int = DEFAULT_SET_CHURN_BOUND,
 ) -> int:
     """3.5 CP4 Slice C: the durable RECONCILER that connects a CALIBRATING policy's ``refresh_intent`` to the
     queue — the intent-side counterpart to ``relay_outbox`` (which is ENABLED-only, so a CALIBRATING policy is
@@ -88,32 +95,51 @@ def relay_intents(
     for intent in policy_store.intents_to_reconcile():
         policy_id = str(intent["policy_id"])
         set_id = str(intent["set_id"])
+        seq = int(intent["seq"])
+        status = str(intent["status"])
         pg, tr, th = str(intent["policy_generation"]), int(intent["target_revision"]), str(intent["target_head"])
         current_head = calibration_store.set_head(set_id)
-        if current_head != th:
-            # DISTINCT-head drift: advance the fence to reality FIRST, then enqueue at the new head.
-            if str(intent["status"]) == "failed_detector":
-                result = policy_store.reactivate_failed_detector(
-                    policy_id, expect_policy_generation=pg, expect_target_revision=tr,
-                    expect_target_head=th, new_target_head=current_head, churn_bound=churn_bound)
-                advanced = result == "reactivated"
-            else:
-                result = policy_store.advance_intent(
-                    policy_id, expect_policy_generation=pg, expect_target_revision=tr,
-                    expect_target_head=th, new_target_head=current_head, churn_bound=churn_bound)
-                advanced = result == "advanced"
-            if not advanced:
-                continue  # no_op (a concurrent advance already landed) or failed_churn — nothing to enqueue
-            fresh = policy_store.active_intent(policy_id)
-            if fresh is None:
-                continue  # superseded between the advance and the re-read — fail-closed, skip
-            pg, tr, th = str(fresh["policy_generation"]), int(fresh["target_revision"]), str(fresh["target_head"])
-        job_id = intent_candidate_job_id(
-            intent_seq=int(intent["seq"]), policy_generation=pg, target_revision=tr, target_head=th)
+        if current_head == th:
+            # NO drift. Enqueue a candidate ONLY for an active intent with no candidate produced yet; a
+            # ``failed_detector`` (deterministic failure at THIS head) and a ``satisfied`` (candidate awaiting
+            # human ratify) do NOT re-enqueue at the same head — they wait for a DISTINCT new head.
+            if status in ("pending", "dispatched"):
+                if queue.enqueue(
+                    job_id=intent_candidate_job_id(intent_seq=seq, policy_generation=pg, target_revision=tr,
+                                                   target_head=th),
+                    policy_id=policy_id, set_id=set_id, oracle_head=th,
+                    detector_identity=str(intent["detector_id"]), tier_generation=pg, now=now,
+                    kind="intent", intent_seq=seq, policy_generation=pg, target_revision=tr,
+                ):
+                    enqueued += 1
+            continue
+        # DISTINCT-head drift: advance/reactivate the fence to the current head FIRST (by status), then
+        # enqueue at the new head. ``satisfied`` (stale candidate) and ``failed_detector`` (retry on a new
+        # head) reactivate; an active intent advances in place.
+        if status == "failed_detector":
+            advanced = policy_store.reactivate_failed_detector(
+                policy_id, expect_policy_generation=pg, expect_target_revision=tr, expect_target_head=th,
+                new_target_head=current_head, churn_bound=churn_bound) == "reactivated"
+        elif status == "satisfied":
+            advanced = policy_store.reactivate_satisfied(
+                policy_id, expect_policy_generation=pg, expect_target_revision=tr, expect_target_head=th,
+                new_target_head=current_head, churn_bound=churn_bound) == "reactivated"
+        else:  # pending / dispatched
+            advanced = policy_store.advance_intent(
+                policy_id, expect_policy_generation=pg, expect_target_revision=tr, expect_target_head=th,
+                new_target_head=current_head, churn_bound=churn_bound) == "advanced"
+        if not advanced:
+            continue  # no_op (raced / not CALIBRATING) or failed_churn — nothing to enqueue
+        fresh = policy_store.active_intent(policy_id)
+        if fresh is None:
+            continue  # superseded between the advance and the re-read — fail-closed, skip
+        pg, tr, th = str(fresh["policy_generation"]), int(fresh["target_revision"]), str(fresh["target_head"])
         if queue.enqueue(
-            job_id=job_id, policy_id=policy_id, set_id=set_id, oracle_head=th,
+            job_id=intent_candidate_job_id(intent_seq=seq, policy_generation=pg, target_revision=tr,
+                                           target_head=th),
+            policy_id=policy_id, set_id=set_id, oracle_head=th,
             detector_identity=str(intent["detector_id"]), tier_generation=pg, now=now,
-            kind="intent", intent_seq=int(intent["seq"]), policy_generation=pg, target_revision=tr,
+            kind="intent", intent_seq=seq, policy_generation=pg, target_revision=tr,
         ):
             enqueued += 1
     return enqueued

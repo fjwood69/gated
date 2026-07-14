@@ -41,6 +41,24 @@ from gate.authority import GovernanceApproval
 from gate.policy_state import PolicyState, is_legal_transition, is_weakening
 
 
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """Idempotent ADD COLUMN: SQLite has no ``ADD COLUMN IF NOT EXISTS``, so read the live columns via
+    ``PRAGMA table_info`` and ALTER only when the column is absent. A non-NULL column MUST carry a DEFAULT in
+    ``decl`` (SQLite backfills existing rows with it). This is the migration tail of a ``CREATE TABLE IF NOT
+    EXISTS`` schema — it upgrades a pre-existing database in place."""
+    existing = {str(r["name"]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+def _rename_column_if_present(conn: sqlite3.Connection, table: str, old: str, new: str) -> None:
+    """Idempotent RENAME COLUMN, preserving the value — rename only when the OLD column is present AND the
+    NEW one is absent (a fresh database already has the new name from the DDL, so this no-ops there)."""
+    existing = {str(r["name"]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if old in existing and new not in existing:
+        conn.execute(f"ALTER TABLE {table} RENAME COLUMN {old} TO {new}")
+
+
 class IntentSatisfyOutcome(Enum):
     """3.5 CP4 Slice C: the result of ``satisfy_intent_with_pass`` — the UNIFIED atomic completion of a
     re-calibration intent + its candidate pass. ``SATISFIED`` = the active intent at the given fence was
@@ -179,7 +197,7 @@ CREATE TABLE IF NOT EXISTS calibration_pass (
 -- at CALIBRATING (fences a policy transition); ``target_revision`` = a MONOTONIC advance counter (fences a
 -- stale oracle-head advance); ``target_head`` = the oracle head to seal+calibrate at (routing). A distinct
 -- oracle-head advance is ONE in-place CAS UPDATE on the (policy_generation, target_revision, target_head)
--- triple, incrementing target_revision + churn_count; completion fences on the same triple. Generation is
+-- triple, incrementing target_revision + set_churn_count; completion fences on the same triple. Generation is
 -- FENCING only, never evidence identity (the candidate pass ref is content-bound via _result_ref).
 CREATE TABLE IF NOT EXISTS refresh_intent (
     seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,7 +211,11 @@ CREATE TABLE IF NOT EXISTS refresh_intent (
     expected_trust_policy_digest TEXT NOT NULL,  -- the observation-trust policy digest the worker verifies boot-injected trust against
     expected_guard_policy_digest TEXT NOT NULL,  -- the backend-guard policy digest the worker verifies boot-injected guard against
     identity_contract_version INTEGER NOT NULL,  -- routing: the ICV the candidate must compose under
-    churn_count            INTEGER NOT NULL DEFAULT 0,  -- cumulative per policy; bumped only on a DISTINCT target_head advance
+    set_churn_count        INTEGER NOT NULL DEFAULT 0,  -- 3.5 CP4 Slice C (SPLIT): ORACLE-MOVEMENT budget —
+                                             -- bumped only on a DISTINCT target_head advance (advance_intent /
+                                             -- reactivate_failed_detector / reactivate_satisfied). The
+                                             -- calibration-FAILURE budget is RecalQueue.attempts (separate)
+                                             -- so a churning set can't false-trigger failed_churn.
     calibration_result_ref TEXT,             -- 3.5 CP4 Slice C: the candidate pass ref, stored ATOMICALLY with
                                              -- the satisfied transition (satisfy_intent_with_pass) so a satisfied
                                              -- intent durably identifies its pass — closes the orphan-record window
@@ -238,6 +260,14 @@ class PolicyStore:
         self._lock = threading.Lock()
         conn = self._conn()
         conn.executescript(_SCHEMA)
+        # CREATE TABLE IF NOT EXISTS never ADDS columns to an existing table, so a database created before a
+        # column was added retains the old schema and later queries raise OperationalError. Every schema
+        # change ships an idempotent ALTER migration, run after CREATE and before any application query.
+        _add_column_if_missing(conn, "refresh_intent", "calibration_result_ref", "TEXT")  # 3.5 CP4 Slice C
+        # 3.5 CP4 Slice C (board SPLIT): churn_count -> set_churn_count (oracle movement only), preserving the
+        # existing value. The calibration-FAILURE budget lives in RecalQueue.attempts/max_attempts, so no
+        # second policy-store counter is added.
+        _rename_column_if_present(conn, "refresh_intent", "churn_count", "set_churn_count")
         conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
@@ -465,7 +495,7 @@ class PolicyStore:
                 conn.execute(
                     "INSERT INTO refresh_intent (policy_id, set_id, target_head, policy_generation,"
                     " target_revision, detector_id, expected_profile_digest, expected_trust_policy_digest,"
-                    " expected_guard_policy_digest, identity_contract_version, churn_count, status,"
+                    " expected_guard_policy_digest, identity_contract_version, set_churn_count, status,"
                     " created_at, updated_at) VALUES (?,?,?,?,0,?,?,?,?,?,0,'pending',?,?)",
                     (policy_id, set_id, pinned_set_version, record_hash, detector_id, expected_profile_digest,
                      expected_trust_policy_digest, expected_guard_policy_digest, identity_contract_version,
@@ -560,7 +590,7 @@ class PolicyStore:
         the fence no longer matches (a stale/delayed advance after the row moved on) → ``"no_op"`` (no
         double-increment, no stale overwrite). Otherwise: if incrementing would exceed ``churn_bound`` the
         intent ATOMICALLY transitions to ``failed_churn`` (the policy never converged) → ``"failed_churn"``;
-        else ``target_head`` is set, ``target_revision`` + ``churn_count`` increment → ``"advanced"``. The
+        else ``target_head`` is set, ``target_revision`` + ``set_churn_count`` increment → ``"advanced"``. The
         read + conditional write are serialised under the single store lock."""
         if new_target_head == expect_target_head:
             raise ValueError(
@@ -569,14 +599,14 @@ class PolicyStore:
             raise ValueError("churn_bound must be an int")
         with self._lock:
             row = self._conn().execute(
-                "SELECT churn_count FROM refresh_intent WHERE policy_id=? AND status IN "
+                "SELECT set_churn_count FROM refresh_intent WHERE policy_id=? AND status IN "
                 "('pending','dispatched') AND policy_generation=? AND target_revision=? AND target_head=?",
                 (policy_id, expect_policy_generation, expect_target_revision, expect_target_head),
             ).fetchone()
             if row is None:
                 return "no_op"  # the fence no longer matches — a newer advance already landed
             now = self._clock()
-            if int(row["churn_count"]) + 1 > churn_bound:
+            if int(row["set_churn_count"]) + 1 > churn_bound:
                 self._conn().execute(
                     "UPDATE refresh_intent SET status='failed_churn', updated_at=? "
                     "WHERE policy_id=? AND status IN ('pending','dispatched') AND policy_generation=? "
@@ -586,7 +616,7 @@ class PolicyStore:
                 return "failed_churn"
             self._conn().execute(
                 "UPDATE refresh_intent SET target_head=?, target_revision=target_revision+1, "
-                "churn_count=churn_count+1, updated_at=? "
+                "set_churn_count=set_churn_count+1, updated_at=? "
                 "WHERE policy_id=? AND status IN ('pending','dispatched') AND policy_generation=? "
                 "AND target_revision=? AND target_head=?",
                 (new_target_head, now, policy_id, expect_policy_generation, expect_target_revision,
@@ -625,7 +655,8 @@ class PolicyStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT status, calibration_result_ref FROM refresh_intent "
+                    "SELECT status, calibration_result_ref, set_id, identity_contract_version "
+                    "FROM refresh_intent "
                     "WHERE policy_id=? AND policy_generation=? AND target_revision=? AND target_head=? "
                     "ORDER BY seq DESC LIMIT 1",
                     (policy_id, policy_generation, target_revision, target_head),
@@ -633,14 +664,29 @@ class PolicyStore:
                 if row is None:
                     conn.execute("COMMIT")
                     return IntentSatisfyOutcome.STALE
+                # the pass metadata MUST bind to THIS intent (an atomic primitive must never satisfy target
+                # H1 while storing a pass for H2). ``target_head`` is already fenced by the WHERE, so the
+                # caller's ``pinned_set_version`` must equal it, and ``set_id`` / ICV must equal the intent's.
+                if (pinned_set_version != target_head or set_id != str(row["set_id"])
+                        or identity_contract_version != int(row["identity_contract_version"])):
+                    raise PrivilegedOperationError(
+                        f"pass metadata does not bind to the intent for {policy_id} "
+                        f"(pinned_set_version/set_id/ICV != intent target_head/set_id/ICV) — refusing to "
+                        "satisfy an intent with a pass for a different (head/set/contract)")
                 status = str(row["status"])
                 if status == "satisfied":
-                    if str(row["calibration_result_ref"] or "") == calibration_result_ref:
-                        conn.execute("COMMIT")
-                        return IntentSatisfyOutcome.ALREADY_SATISFIED
-                    raise PrivilegedOperationError(
-                        f"intent for {policy_id} at this fence is already satisfied under a DIFFERENT "
-                        f"calibration_result_ref — refusing to rebind (a satisfied intent binds one pass)")
+                    if str(row["calibration_result_ref"] or "") != calibration_result_ref:
+                        raise PrivilegedOperationError(
+                            f"intent for {policy_id} at this fence is already satisfied under a DIFFERENT "
+                            "calibration_result_ref — refusing to rebind (a satisfied intent binds one pass)")
+                    # verify the EXISTING pass row's full metadata matches this binding (not merely the
+                    # ref STRING) — a matching ref over mismatched metadata is cross-wiring corruption.
+                    self._record_calibration_pass_unlocked(
+                        calibration_result_ref, policy_id=policy_id, pinned_set_version=pinned_set_version,
+                        detector_identity=detector_identity,
+                        identity_contract_version=identity_contract_version, set_id=set_id)
+                    conn.execute("COMMIT")
+                    return IntentSatisfyOutcome.ALREADY_SATISFIED
                 if status not in ("pending", "dispatched"):
                     conn.execute("COMMIT")  # superseded / failed_* — not satisfiable at this fence
                     return IntentSatisfyOutcome.STALE
@@ -684,7 +730,7 @@ class PolicyStore:
         ``(policy_generation, target_revision, target_head)`` with ``status='failed_detector'``;
         ``new_target_head`` MUST be distinct (else ``ValueError``). Churn-bounded exactly as ``advance_intent``
         (exceeding the bound -> ``failed_churn``). On success the row goes back to ``status='pending'`` at the
-        new head with ``target_revision`` + ``churn_count`` incremented. Returns
+        new head with ``target_revision`` + ``set_churn_count`` incremented. Returns
         ``'reactivated' | 'no_op' | 'failed_churn'``. ``failed_churn`` is NEVER reactivated here (human-only)."""
         if new_target_head == expect_target_head:
             raise ValueError(
@@ -694,14 +740,14 @@ class PolicyStore:
             raise ValueError("churn_bound must be an int")
         with self._lock:
             row = self._conn().execute(
-                "SELECT churn_count FROM refresh_intent WHERE policy_id=? AND status='failed_detector' "
+                "SELECT set_churn_count FROM refresh_intent WHERE policy_id=? AND status='failed_detector' "
                 "AND policy_generation=? AND target_revision=? AND target_head=?",
                 (policy_id, expect_policy_generation, expect_target_revision, expect_target_head),
             ).fetchone()
             if row is None:
                 return "no_op"  # the fence no longer matches a failed_detector row
             now = self._clock()
-            if int(row["churn_count"]) + 1 > churn_bound:
+            if int(row["set_churn_count"]) + 1 > churn_bound:
                 self._conn().execute(
                     "UPDATE refresh_intent SET status='failed_churn', updated_at=? "
                     "WHERE policy_id=? AND status='failed_detector' AND policy_generation=? "
@@ -711,7 +757,7 @@ class PolicyStore:
                 return "failed_churn"
             self._conn().execute(
                 "UPDATE refresh_intent SET status='pending', target_head=?, "
-                "target_revision=target_revision+1, churn_count=churn_count+1, updated_at=? "
+                "target_revision=target_revision+1, set_churn_count=set_churn_count+1, updated_at=? "
                 "WHERE policy_id=? AND status='failed_detector' AND policy_generation=? "
                 "AND target_revision=? AND target_head=?",
                 (new_target_head, now, policy_id, expect_policy_generation, expect_target_revision,
@@ -721,15 +767,74 @@ class PolicyStore:
 
     def intents_to_reconcile(self) -> list[sqlite3.Row]:
         """3.5 CP4 Slice C: the intents the durable reconciler considers each pass — ``pending``,
-        ``dispatched``, OR ``failed_detector`` (a distinct new head can reactivate the last). Terminal
-        ``satisfied`` / ``superseded`` are done; ``failed_churn`` is EXCLUDED (a human ``clear_failed_churn``
-        is required first). Returns full rows (fences + routing + ``seq``) so the reconciler can compare each
-        against the live ``set_head`` and enqueue a fenced candidate job (or advance/reactivate on drift)."""
+        ``dispatched``, ``failed_detector``, OR ``satisfied``. ``satisfied`` is INCLUDED (board P1) because a
+        candidate awaiting human ratification is still driftable: if the set advances before ratify, the H1
+        pass is stale and an H2 candidate must be produced, else the policy is stuck CALIBRATING. A distinct
+        new head reactivates ``failed_detector`` and ``satisfied`` alike. ``superseded`` is done; ``failed_churn``
+        is EXCLUDED (human ``clear_failed_churn`` required). Returns full rows (fences + routing + ``seq``)."""
         with self._lock:
             return self._conn().execute(
                 "SELECT * FROM refresh_intent "
-                "WHERE status IN ('pending','dispatched','failed_detector') ORDER BY seq ASC"
+                "WHERE status IN ('pending','dispatched','failed_detector','satisfied') ORDER BY seq ASC"
             ).fetchall()
+
+    def reactivate_satisfied(
+        self,
+        policy_id: str,
+        *,
+        expect_policy_generation: str,
+        expect_target_revision: int,
+        expect_target_head: str,
+        new_target_head: str,
+        churn_bound: int,
+    ) -> str:
+        """3.5 CP4 Slice C (board P1): a DISTINCT-head reactivation of a ``satisfied`` (awaiting-ratify) intent
+        when the set drifts before a human ratifies it — the H1 pass is stale, so re-arm for H2. Triple-CAS on
+        ``(policy_generation, target_revision, target_head)`` with ``status='satisfied'``; ``new_target_head``
+        MUST be distinct (else ``ValueError``); churn-bounded exactly as ``advance_intent``. On success the row
+        goes to ``status='pending'`` at the new head, ``target_revision`` + ``set_churn_count`` increment, and the
+        stale ``calibration_result_ref`` is CLEARED to NULL (a new pass must be produced for H2). Returns
+        ``'reactivated' | 'no_op' | 'failed_churn'``.
+
+        RACE GUARD: between the reconciler's read and this CAS a human ``ratify_enable`` may have moved the
+        policy to ENABLED (a satisfied intent HAS a pass, so it is ratifiable). Reactivating then would arm a
+        ``pending`` intent for an ENABLED policy. So this checks the policy is STILL ``CALIBRATING`` (a
+        same-database read — the tier chain and the intent share this store) and no-ops otherwise; the
+        ENABLED policy's own restore path owns its re-calibration."""
+        if new_target_head == expect_target_head:
+            raise ValueError(
+                "reactivate_satisfied requires a DISTINCT new_target_head — a same-head reactivation is a no-op")
+        if type(churn_bound) is not int:
+            raise ValueError("churn_bound must be an int")
+        with self._lock:
+            if self._current_state_unlocked(policy_id) is not PolicyState.CALIBRATING:
+                return "no_op"  # ratified/rejected between scan and CAS — leave the satisfied intent as-is
+            row = self._conn().execute(
+                "SELECT set_churn_count FROM refresh_intent WHERE policy_id=? AND status='satisfied' "
+                "AND policy_generation=? AND target_revision=? AND target_head=?",
+                (policy_id, expect_policy_generation, expect_target_revision, expect_target_head),
+            ).fetchone()
+            if row is None:
+                return "no_op"
+            now = self._clock()
+            if int(row["set_churn_count"]) + 1 > churn_bound:
+                self._conn().execute(
+                    "UPDATE refresh_intent SET status='failed_churn', updated_at=? "
+                    "WHERE policy_id=? AND status='satisfied' AND policy_generation=? "
+                    "AND target_revision=? AND target_head=?",
+                    (now, policy_id, expect_policy_generation, expect_target_revision, expect_target_head),
+                )
+                return "failed_churn"
+            self._conn().execute(
+                "UPDATE refresh_intent SET status='pending', target_head=?, "
+                "target_revision=target_revision+1, set_churn_count=set_churn_count+1, "
+                "calibration_result_ref=NULL, updated_at=? "
+                "WHERE policy_id=? AND status='satisfied' AND policy_generation=? "
+                "AND target_revision=? AND target_head=?",
+                (new_target_head, now, policy_id, expect_policy_generation, expect_target_revision,
+                 expect_target_head),
+            )
+            return "reactivated"
 
     def _has_failed_churn_unlocked(self, policy_id: str) -> bool:
         return self._conn().execute(
