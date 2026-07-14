@@ -95,7 +95,7 @@ def _present(coord: str | None) -> str:
 
 
 class RunAdmissionError(RuntimeError):
-    """An ``AdmittedRunResult`` was constructed incoherently — without the live-admission grant, or with a
+    """An ``AdmittedRunResult`` was constructed incoherently — without a valid live-admission proof, or with a
     report that does not structurally re-admit (its stored subject is not the report-recomputed one).
     Raised by the constructor's defence-in-depth check so a mis-assembled admitted result fails closed
     rather than publishing an enforcement verdict for the wrong identity."""

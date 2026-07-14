@@ -9,7 +9,7 @@ The admission core (``gate/run_admission.py``, distinct from the 3.4 fixture gat
     has not drifted (SET_HEAD_STALE / AUTHORIZED_SET_MOVED) and the subject is still authorized
     (AUTHORIZED_SUBJECT_MOVED);
   * every refusal is a DISTINCT typed RunAdmissionRefusal that still BLOCKS (Verdict(ERROR, RUN_UNADMITTED));
-  * PROOF-GATED construction: AdmittedRunResult requires the live-admission grant minted only by
+  * PROOF-GATED construction: AdmittedRunResult requires a result-bound live-admission proof minted only by
     admit_run_result, so a direct construction cannot bypass the live checks.
 """
 from __future__ import annotations
