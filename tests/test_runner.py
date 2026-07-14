@@ -109,7 +109,7 @@ class ParentMeasuredIdentityTests(unittest.TestCase):
     def test_consistent_run_has_attested_parent_measured_identity(self) -> None:
         cap = _Capture()
         v = run_check(lambda: _HermeticNoOp(), _Scripted([_PASS] * 3), self._artifact, _BUDGET,
-                      trials=3, first_fail=False, report_sink=cap)
+                      trials=3, first_fail=False, report_sink=cap).verdict
         self.assertEqual(v.status, VerdictType.PASS)
         ident = cap.last.execution_identity  # type: ignore[union-attr]
         self.assertIsInstance(ident, ExecutionIdentity)
@@ -121,7 +121,7 @@ class ParentMeasuredIdentityTests(unittest.TestCase):
         # every trial PASSes, but each RECORDED a different image digest -> fail-closed ERROR, no identity.
         cap = _Capture()
         v = run_check(_digest_drift_factory(), _Scripted([_PASS] * 3), self._artifact, _BUDGET,
-                      trials=3, first_fail=False, report_sink=cap)
+                      trials=3, first_fail=False, report_sink=cap).verdict
         self.assertEqual(v.status, VerdictType.ERROR)
         self.assertEqual(v.reason, Reason.OBSERVATION_INCOMPLETE)
         self.assertIsNone(cap.last.execution_identity)  # type: ignore[union-attr]
@@ -131,7 +131,7 @@ class ParentMeasuredIdentityTests(unittest.TestCase):
         # ran), not a tag or a late resolution.
         cap = _Capture()
         v = run_check(lambda: _DigestNoOp("sha256:deadbeef"), _Scripted([_PASS] * 3), self._artifact,
-                      _BUDGET, trials=3, first_fail=False, report_sink=cap)
+                      _BUDGET, trials=3, first_fail=False, report_sink=cap).verdict
         self.assertEqual(v.status, VerdictType.PASS)
         self.assertEqual(cap.last.execution_identity.image_ref, "sha256:deadbeef")  # type: ignore[union-attr]
 
@@ -139,7 +139,7 @@ class ParentMeasuredIdentityTests(unittest.TestCase):
     def test_image_gone_before_run_is_fatal_error_not_silent_pass(self) -> None:
         cap = _Capture()
         v = run_check(lambda: _ImageGoneNoOp(), _Scripted([_PASS] * 3), self._artifact, _BUDGET,
-                      trials=3, first_fail=False, report_sink=cap)
+                      trials=3, first_fail=False, report_sink=cap).verdict
         self.assertEqual(v.status, VerdictType.ERROR)          # NOT pass — the detector never got to fire
         self.assertEqual(v.reason, Reason.IMAGE_UNRESOLVED)    # distinct fatal identity reason
         self.assertIsNone(cap.last.execution_identity)  # type: ignore[union-attr]

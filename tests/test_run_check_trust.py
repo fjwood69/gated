@@ -84,7 +84,7 @@ class TrustPolicyApplicationTests(unittest.TestCase):
         det = _AlwaysPass()
         cap = _Capture()
         v = run_check(lambda: _OutcomeNoOp(outcome, exit_code, egress), det, _artifact(tmp), _BUDGET,
-                      trials=1, trust_policy=_POLICY, report_sink=cap)
+                      trials=1, trust_policy=_POLICY, report_sink=cap).verdict
         return v, det, cap.reports[0]
 
     def test_always_pass_not_called_on_timeout(self) -> None:

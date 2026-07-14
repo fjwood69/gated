@@ -119,7 +119,7 @@ class ShortCircuitTests(unittest.TestCase):
     def _run(self, verdicts, calls, **kw):  # type: ignore[no-untyped-def]
         return run_check(
             _counting_factory(calls), _ScriptedCheck(verdicts), _artifact(), _BUDGET, **kw
-        )
+        ).verdict
 
     def test_first_fail_short_circuits_second_sandbox_never_created(self) -> None:
         calls: list[int] = []
@@ -181,7 +181,7 @@ class TeardownOnBreakTests(unittest.TestCase):
         v = run_check(
             _recording_factory(events, made), _ScriptedCheck([_FAIL, _PASS]),
             _artifact(), _BUDGET, trials=2, first_fail=True,
-        )
+        ).verdict
         self.assertIs(v.status, VerdictType.FAIL)
         self.assertEqual(made, [1])  # one sandbox created (short-circuit)
         # THE proof: that one sandbox was prepared AND torn down — no orphan on break.
@@ -230,7 +230,7 @@ class TrialReportAuditTests(unittest.TestCase):
             v = run_check(
                 _counting_factory([]), _ScriptedCheck([_FAIL]), _artifact(), _BUDGET,
                 trials=1, report_sink=_ThrowingSink(),
-            )
+            ).verdict
         self.assertIs(v.status, VerdictType.FAIL)  # verdict returned despite sink failure
 
 

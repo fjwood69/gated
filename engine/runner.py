@@ -105,6 +105,14 @@ class TrialReport:
     # It is measured PROVENANCE — the digest of the policy that actually governed the observation, carried up
     # so calibration can bind it into the signed identity (only when consistent across all trials).
     trust_policy_digest: str | None = None
+    # S3-completion: the remaining two RuntimeSubject coordinates, carried on the report so the LIVE path's
+    # authoritative return supplies the FULL measured 4-tuple to admission (not just calibration). Both are
+    # FROZEN provenance resolved ONCE by the caller before the trial loop — ``resolved_profile_digest`` is
+    # the digest of the bundle actually run (never re-resolved per trial), and ``guard_policy_digest`` is
+    # read off the guard object ACTUALLY APPLIED to every sandbox (None for the test-only opt-out). ICV is
+    # NOT here: it is contract metadata (checked against the process constant), not a measured coordinate.
+    resolved_profile_digest: str | None = None
+    guard_policy_digest: str | None = None
     # 3.5-close #1.1 (board amendment 3): the NAME of the detector that judged these trials. Lives HERE
     # (enforcement metadata), NOT on ExecutionResult — the sandbox produces facts about the run and does
     # not know which detector judged its result. Set by the caller (calibration / live enforcement) that
@@ -114,6 +122,23 @@ class TrialReport:
     @property
     def trials_run(self) -> int:
         return len(self.trials)
+
+
+@dataclass(frozen=True)
+class EngineRunResult:
+    """S3-completion: the AUTHORITATIVE, immutable result of an engine run — the ``TrialReport`` returned
+    DIRECTLY up the call stack (not emitted to a swallowable observer sink). Admission evidence travels via
+    the return value, immune to a sink's ``try/except`` or a mutable capture's staleness. There is ONE
+    source of truth: ``verdict`` is a DERIVED property (``trial_report.aggregate``), never a stored second
+    copy that could diverge from the report the admission layer inspects. Being frozen prevents ordinary
+    accidental mutation in trusted code (it is not an absolute runtime immutability boundary)."""
+
+    trial_report: TrialReport
+
+    @property
+    def verdict(self) -> Verdict:
+        # single source of truth: the report's aggregate IS the verdict — no duplication to diverge.
+        return self.trial_report.aggregate
 
 
 class TrialReportSink(Protocol):
@@ -175,14 +200,22 @@ def run_check(
     detector_id: str | None = None,
     command: Command | None = None,
     trust_policy: TrustPolicy | None = None,
-) -> Verdict:
+    resolved_profile_digest: str | None = None,
+    guard_policy_digest: str | None = None,
+) -> EngineRunResult:
     """Run ``check`` on ``artifact`` across up to ``trials`` isolated trials -> one
     Verdict. ``make_sandbox`` is a factory so each trial gets a fresh sandbox instance
     (and, via its prepare(), a fresh network/proxy/container).
 
     ``first_fail`` (default True) stops after the first FAIL (see module docstring).
-    ``report_sink`` receives a ``TrialReport`` (the audit record of what ran). ``detector_id`` (the
-    trusted-registry name of ``check``) is recorded on the report for the Check Run payload (§1.5).
+
+    S3-completion: returns an AUTHORITATIVE, immutable ``EngineRunResult`` carrying the always-constructed
+    ``TrialReport`` DIRECTLY (the verdict is a derived property of that report — one source of truth). The
+    ``report_sink`` is now a SECONDARY audit copy: it receives the SAME report AFTER it is built, and a
+    sink failure is logged, never affecting the returned evidence. ``resolved_profile_digest`` (the digest
+    of the bundle actually run — resolved ONCE by the caller, never re-resolved per trial) and
+    ``guard_policy_digest`` (read off the guard object ACTUALLY APPLIED) are frozen provenance recorded on
+    the report so the LIVE admission path gets the full measured 4-tuple, not just calibration.
 
     3.5 #3 + 3.5-close #1.1: the runner PARENT-MEASURES each trial's execution identity — backend +
     isolation + observer-config from the trusted sandbox object, and the IMMUTABLE image digest the
@@ -232,21 +265,27 @@ def run_check(
         # the run's identity is not attestable -> fail-closed. A resolution failure already ERRORs
         # (IMAGE_UNRESOLVED) and is preserved; this only covers the mixed-identity-but-all-observed case.
         result_verdict = Verdict(VerdictType.ERROR, Reason.OBSERVATION_INCOMPLETE)
+    # S3-completion: the report is ALWAYS constructed — it is the AUTHORITATIVE return, not an audit
+    # artifact contingent on a sink being wired. Every measured coordinate lives on it: the aggregate
+    # verdict, the parent-measured execution identity, and the frozen profile / trust / guard provenance.
+    report = TrialReport(
+        trials=tuple(verdicts),
+        trials_configured=trials,
+        short_circuited=len(verdicts) < trials,
+        aggregate=result_verdict,
+        execution_identity=identity,
+        detector_id=detector_id,
+        trust_policy_digest=trust_policy.policy_digest if trust_policy is not None else None,
+        resolved_profile_digest=resolved_profile_digest,
+        guard_policy_digest=guard_policy_digest,
+    )
     if report_sink is not None:
-        report = TrialReport(
-            trials=tuple(verdicts),
-            trials_configured=trials,
-            short_circuited=len(verdicts) < trials,
-            aggregate=result_verdict,
-            execution_identity=identity,
-            detector_id=detector_id,
-            trust_policy_digest=trust_policy.policy_digest if trust_policy is not None else None,
-        )
-        # The audit sink is an OBSERVER — it must never crash the engine or suppress the
-        # Verdict (the merge gate's source of truth). Emit-failure is logged, not
-        # swallowed: a missing audit record is an operational alert, not a dev halt.
+        # The audit sink is now a SECONDARY consumer of a COPY — it receives the authoritative report but
+        # its failure can NEVER remove admission evidence (the report is already the return value). An
+        # emit-failure is logged, not swallowed: a missing audit record is an operational alert, not a halt.
         try:
             report_sink.record(report)
         except Exception:
-            _log.warning("trial-report sink failed to record; verdict still returned", exc_info=True)
-    return result_verdict
+            _log.warning("trial-report sink failed to record; authoritative result still returned",
+                         exc_info=True)
+    return EngineRunResult(trial_report=report)

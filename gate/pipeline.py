@@ -35,7 +35,7 @@ from core import (
 )
 from engine.calibration import BundleResolver, DetectorResolver
 from engine.retry import RetryCheck
-from engine.runner import TrialReport, TrialReportSink, run_check
+from engine.runner import EngineRunResult, TrialReport, TrialReportSink, run_check
 from sandbox.observed import ObservedOCISandbox
 
 from .artifact import build_artifact_spec, extraction_workspace, safe_extract_tarball
@@ -144,8 +144,10 @@ def run_engine_check(
     budget: ResourceBudget = DEFAULT_ENGINE_BUDGET,
     first_fail: bool = True,
     report_sink: TrialReportSink | None = None,
-) -> Verdict:
-    """Run the REAL hermetic engine (ObservedOCISandbox + multi-trial) and return the aggregated Verdict.
+) -> EngineRunResult:
+    """Run the REAL hermetic engine (ObservedOCISandbox + multi-trial) and return the AUTHORITATIVE
+    ``EngineRunResult`` (S3-completion) — the immutable ``TrialReport`` DIRECTLY, with the verdict as its
+    derived property. The live enforcement/admission path consumes this return, never a mutable sink.
 
     3.5-close #1.3: the detector is resolved through the SAME trusted registry calibration uses
     (enforced == accepted). The registry refuses an unregistered id or a detector whose content-address
@@ -166,7 +168,7 @@ def run_engine_check(
     return run_check(
         make_sandbox, detector, artifact, budget,
         trials=trials, first_fail=first_fail, report_sink=report_sink, detector_id=detector_id,
-        command=bundle.command,
+        command=bundle.command, resolved_profile_digest=bundle.profile_digest,
     )
 
 
@@ -191,10 +193,13 @@ def make_job_runner(
         with extraction_workspace() as ws:
             artifact = artifact_source(event, ws)
             try:
+                # S3-completion: consume run_engine_check's AUTHORITATIVE EngineRunResult return; the verdict
+                # is its derived property. (The full admission typestate — UnadmittedRunResult ->
+                # admit_run_result -> AdmittedRunResult|BlockingRefusal — is the CP2 wiring increment.)
                 return run_engine_check(
                     artifact, image=image, resolve=resolve, detector_id=detector_id, trials=trials,
                     budget=budget, first_fail=first_fail, report_sink=report_sink,
-                )
+                ).verdict
             except ArtifactHashMismatchError:
                 # NOT a generic infra ERROR: the SHA-bind caught the mounted tree
                 # differing from its verified hash — a possible TOCTOU tamper. Blocks

@@ -213,16 +213,6 @@ class CalibrationResult:
         )
 
 
-class _TrialReportCapture:
-    """A one-shot TrialReportSink that keeps the last report (the per-fixture distribution)."""
-
-    def __init__(self) -> None:
-        self.last: TrialReport | None = None
-
-    def record(self, report: TrialReport) -> None:
-        self.last = report
-
-
 def _require_hermetic(make_sandbox: Callable[[], Sandbox]) -> None:
     """Board Prescription 2: calibration runs `known_bad` fixtures — ADVERSARIAL code (env-
     fingerprinting, proxy-bypass, state-forge). A WEAK sandbox could let one escape and corrupt
@@ -299,24 +289,31 @@ def calibrate(
     bundle = resolve(detector_id)  # trusted registry only — an unregistered id is refused here
     detector = bundle.assertion
     resolved_profile_digest = bundle.profile_digest
+    # B3 (S3): the guard PROVENANCE digest is read off the guard object ACTUALLY APPLIED (never separately
+    # supplied), resolved ONCE before the loop and passed into every run so it rides the authoritative
+    # TrialReport. The test-only opt-out bears no policy_digest -> None (no bound guard identity).
+    guard_policy_digest: str | None = getattr(backend_guard, "policy_digest", None)
 
     outcomes: list[FixtureOutcome] = []
     # v4 P1-c: execute the FROZEN resolved command (bundle.command), not a fresh detector.entrypoint().
+    # S3-completion: read the TrialReport from run_check's AUTHORITATIVE return (EngineRunResult), NOT a
+    # mutable capture sink — the calibration decision sources its provenance from the direct return.
     for fixture in (*calibration_set.known_bad, *calibration_set.known_good):
-        capture = _TrialReportCapture()
         with _materialised(fixture) as artifact:
-            verdict = run_check(
+            run_result = run_check(
                 factory, detector, artifact, budget,
-                trials=trials, first_fail=False, report_sink=capture, detector_id=detector_id,
+                trials=trials, first_fail=False, detector_id=detector_id,
                 command=bundle.command, trust_policy=trust_policy,
+                resolved_profile_digest=resolved_profile_digest,
+                guard_policy_digest=guard_policy_digest,
             )
         outcomes.append(
             FixtureOutcome(
                 fixture_id=fixture.fixture_id,
                 label=fixture.label,
-                verdict=verdict,
-                classification=_classify(fixture.label, verdict),
-                trials=capture.last,
+                verdict=run_result.verdict,
+                classification=_classify(fixture.label, run_result.verdict),
+                trials=run_result.trial_report,
             )
         )
 
@@ -350,11 +347,9 @@ def calibrate(
             and len(set(tp_digests)) == 1
         )
         trust_policy_digest = tp_digests[0] if (trust_consistent and tp_digests) else None
-    # B3 (S3): the guard PROVENANCE — the digest comes from the guard object ACTUALLY APPLIED (read off the
-    # same object, never separately supplied), so policy-A-applied-while-digest-B-supplied is impossible by
-    # construction. One guard governs the whole run, so it is inherently consistent. The test-only opt-out
-    # bears no policy_digest -> None (no bound guard identity, which acceptance/enforcement treat as such).
-    guard_policy_digest: str | None = getattr(backend_guard, "policy_digest", None)
+    # B3 (S3): ``guard_policy_digest`` was read off the guard object ACTUALLY APPLIED before the loop and
+    # bound into every fixture's TrialReport. One guard governs the whole run, so it is inherently
+    # consistent; policy-A-applied-while-digest-B-supplied is impossible by construction.
     policies_consistent = trust_consistent
     passed = not (fn or fp or flaky or errs) and identity_consistent and policies_consistent
     return CalibrationResult(

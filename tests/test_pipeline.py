@@ -286,14 +286,18 @@ class LiveFrozenCommandTests(unittest.TestCase):
 
         captured: dict[str, object] = {}
 
+        from engine.runner import EngineRunResult, TrialReport
+
         def fake_run_check(make_sandbox, detector, artifact, budget, **kw):  # type: ignore[no-untyped-def]
             captured.update(kw)
-            return Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
+            _pass = Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
+            return EngineRunResult(trial_report=TrialReport(
+                trials=(_pass,), trials_configured=1, short_circuited=False, aggregate=_pass))
 
         artifact = ArtifactSpec(path=Path(tempfile.mkdtemp(prefix="mv-frozen-")), tree_hash="sha256:x")
         with mock.patch("gate.pipeline.run_check", side_effect=fake_run_check):
-            verdict = run_engine_check(artifact, image=_IMAGE, resolve=resolver, detector_id="retry")
-        self.assertIs(verdict.status, VerdictType.PASS)
+            result = run_engine_check(artifact, image=_IMAGE, resolve=resolver, detector_id="retry")
+        self.assertIs(result.verdict.status, VerdictType.PASS)  # authoritative return; verdict derived
         # the FROZEN command reached run_check — not None (which would let run_check re-call entrypoint()),
         # and not the detector's own entrypoint() value.
         self.assertEqual(captured.get("command"), frozen)

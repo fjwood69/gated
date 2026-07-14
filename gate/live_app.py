@@ -185,10 +185,14 @@ def build(
         with extraction_workspace() as ws:
             artifact = artifact_source(event, ws)
             try:
+                # S3-completion: consume run_engine_check's AUTHORITATIVE EngineRunResult return (verdict is
+                # its derived property). The report_sink/report_capture summary is now audit-SECONDARY — the
+                # merge DECISION (verdict) is the direct return, never report_capture.last. (The full
+                # admit_run_result typestate is the CP2 wiring increment.)
                 return run_engine_check(
                     artifact, image=IMAGE, resolve=detector_registry.resolve_bundle, detector_id=DETECTOR_ID,
                     trials=TRIALS, first_fail=SHORT_CIRCUIT, report_sink=report_sink,
-                )
+                ).verdict
             except DetectorResolutionError:
                 # enforced detector unregistered / drifted -> block (never enforce an unverified detector).
                 return Verdict(VerdictType.ERROR, Reason.DETECTOR_UNRESOLVED)
