@@ -83,10 +83,11 @@ def _expected(profile: str | None = None) -> dict[str, object]:
     )
 
 
-def _scenario(*, profile_override: str | None = None):  # type: ignore[no-untyped-def]
-    """A CALIBRATING policy p1 with a routing intent + an enqueued 'intent' job at the current head."""
-    cal = _cal_store()
-    s = PolicyStore(Path(tempfile.mkdtemp(prefix="mv-wk-p-")) / "p.db")
+def _scenario(*, profile_override: str | None = None, cal=None, s=None):  # type: ignore[no-untyped-def]
+    """A CALIBRATING policy p1 with a routing intent + an enqueued 'intent' job at the current head. ``cal`` /
+    ``s`` may be injected wrapper stores (for drift-injection interleaving tests)."""
+    cal = _cal_store() if cal is None else cal
+    s = PolicyStore(Path(tempfile.mkdtemp(prefix="mv-wk-p-")) / "p.db") if s is None else s
     q = RecalQueue(Path(tempfile.mkdtemp(prefix="mv-wk-q-")) / "q.db")
     head = cal.set_head("default")
     s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="p1-1"))
@@ -100,9 +101,23 @@ def _scenario(*, profile_override: str | None = None):  # type: ignore[no-untype
 def _run(cal, s, q, det, **over):  # type: ignore[no-untyped-def]
     kw = dict(queue=q, policy_store=s, calibration_store=cal, resolve=golden_resolver(det),
               make_sandbox=_fac(), trust_policy=_REF_TP, backend_guard=test_guard_policy, budget=_BUDGET,
-              lease_token="T", visibility_timeout=_VIS, now=_NOW, trials=3)
+              lease_token="T", visibility_timeout=_VIS, clock=lambda: _NOW, trials=3)
     kw.update(over)
     return run_one(**kw)  # type: ignore[arg-type]
+
+
+class _AdvancingClock:
+    """A deterministic clock returning successive values (repeating the last). run_one reads it once at the
+    lease and once AFTER measurement, so [lease_t, post_measure_t] controls whether the lease expired."""
+
+    def __init__(self, values: list[float]) -> None:
+        self._v = list(values)
+        self._i = 0
+
+    def __call__(self) -> float:
+        v = self._v[min(self._i, len(self._v) - 1)]
+        self._i += 1
+        return v
 
 
 class WorkerTaxonomyTests(unittest.TestCase):
@@ -138,6 +153,37 @@ class WorkerTaxonomyTests(unittest.TestCase):
         cal, s, q = _scenario()
         with self.assertRaises(ValueError):
             _run(cal, s, q, _pass_det(), lease_token="")
+
+
+class _ErrDet(GoldenScriptedDetector):
+    """A detector whose known-bad fixture ERRORs (harness error) while the environment stays attestable — so
+    the measurement has ALL FOUR coordinates + a non-null subject, yet is an ERROR. `subject is None` alone
+    would misclassify it; classify_measurement must check harness_errors."""
+
+
+class WorkerClassifierAndClockTests(unittest.TestCase):
+    def test_harness_error_with_measurable_subject_retries_not_failed_detector(self) -> None:
+        # P1-1: a harness ERROR can carry a non-null subject; the worker must classify ERROR -> RETRY, NOT
+        # terminalize failed_detector. (Verified separately: this scenario yields subject!=None, harness_errors
+        # non-empty.)
+        cal, s, q = _scenario()
+        err = _ErrDet([Verdict(VerdictType.ERROR, Reason.TELEMETRY_MISSING)] * 3 + [_PASS] * 3)
+        self.assertIs(_run(cal, s, q, err), WorkerOutcome.RETRY)
+        row = s._conn().execute("SELECT status FROM refresh_intent WHERE policy_id='p1'").fetchone()
+        self.assertIn(row["status"], ("pending", "dispatched"))     # NOT failed_detector
+        self.assertIs(q.get(next(iter(_job_ids(q)))).status, JobStatus.PROCESSING)  # released, not DONE
+
+    def test_lease_expiry_during_measurement_fails_renewal_zero_mutation(self) -> None:
+        # P1-2: the clock advances beyond the visibility timeout DURING measurement (no other worker claimed
+        # the job). Renewal reads the FRESH time, sees the lease expired, refuses -> ABORTED, zero mutation.
+        cal, s, q = _scenario()
+        clock = _AdvancingClock([_NOW, _NOW + _VIS + 1.0])  # lease at _NOW; renew reads _NOW+_VIS+1 (expired)
+        before = s._conn().execute("SELECT status FROM refresh_intent WHERE policy_id='p1'").fetchone()[0]
+        self.assertIs(_run(cal, s, q, _pass_det(), clock=clock), WorkerOutcome.ABORTED_LEASE_LOST)
+        after = s._conn().execute("SELECT status FROM refresh_intent WHERE policy_id='p1'").fetchone()[0]
+        self.assertEqual(before, after)                              # ZERO PolicyStore mutation
+        cnt = s._conn().execute("SELECT COUNT(*) AS n FROM calibration_pass WHERE policy_id='p1'").fetchone()
+        self.assertEqual(int(cnt["n"]), 0)                           # no pass recorded
 
 
 class WorkerCrashAndRaceTests(unittest.TestCase):
@@ -188,54 +234,138 @@ def _job_ids(q: RecalQueue) -> set[str]:
     return {r["job_id"] for r in q._conn().execute("SELECT job_id FROM recal_queue").fetchall()}
 
 
+def _drift(cal: CalibrationStore, tag: str) -> None:
+    cal.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT, approval=_appr("g1", "g2", op=f"drift-{tag}"),
+               fixture_id=f"d{tag}", set_id="default", label=FixtureLabel.KNOWN_BAD, payload=b"q")
+
+
+class _DriftOnSetHead(CalibrationStore):
+    """Once ARMED, appends a fixture the next time ``set_head`` is read — injects a set-head DRIFT precisely at
+    the worker's LIVE-HEAD recheck (``seal_set`` computes the head directly, not via ``set_head``, so the
+    pre-run oracle check still passes; only the post-measure live-head read observes the drift)."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.arm = False
+
+    def set_head(self, set_id: str) -> str:
+        if self.arm:
+            self.arm = False
+            _drift(self, "lh")
+        return super().set_head(set_id)
+
+
+class _AdvanceBeforeSatisfy(PolicyStore):
+    """Once ARMED, advances the intent to a new head the next time ``satisfy_intent_with_pass`` runs — injects
+    a concurrent relay advance BETWEEN the worker's renew and its completion CAS. The CAS then fences on the
+    stale fence and MISSES → STALE, recording no wrong-head pass."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.arm = False
+
+    def satisfy_intent_with_pass(self, policy_id: str, **kw: object):  # type: ignore[no-untyped-def, override]
+        if self.arm:
+            self.arm = False
+            intent = self.active_intent(policy_id)
+            if intent is not None:
+                self.advance_intent(
+                    policy_id, expect_policy_generation=str(intent["policy_generation"]),
+                    expect_target_revision=int(intent["target_revision"]),
+                    expect_target_head=str(intent["target_head"]),
+                    new_target_head="drifted-" + str(intent["target_head"]), churn_bound=32)
+        return super().satisfy_intent_with_pass(policy_id, **kw)  # type: ignore[arg-type]
+
+
+def _measure_drift_sandbox(cal: CalibrationStore):  # type: ignore[no-untyped-def]
+    """A make_sandbox that appends a fixture on its FIRST call — a set drift landing DURING measurement (after
+    prepare, while calibrate runs on the frozen sealed set); the post-measure live-head recheck catches it."""
+    state = {"done": False}
+
+    def make() -> _H:
+        if not state["done"]:
+            state["done"] = True
+            _drift(cal, "meas")
+        return _H()
+    return make
+
+
 class WorkerInvariantHarness(unittest.TestCase):
-    """The four invariants + atomicity, checked across adversarial interleavings of a set append landing at
-    each worker step. In every case: at most one pass, satisfied => that pass exists, and a stale/drifted run
-    never leaves a mutated-but-inconsistent intent."""
+    """Interleaving harness: a set-head DRIFT is INJECTED at the worker's interposition points — during
+    measurement, at the live-head recheck, and (as a concurrent relay advance) between renew and the
+    completion CAS — plus the pre-run drift and post-satisfy redelivery. At every step the invariants hold:
+    **no double-satisfy** (≤1 satisfied intent), **no orphan/duplicate pass** (≤1 distinct ref PER LOGICAL
+    TARGET head — historical H1/H2 passes legitimately coexist), **satisfied ⟺ pass** (every satisfied intent's
+    current ref resolves exactly), **no lost-satisfy** (the policy converges once drift stops), and a
+    stale/drifted run never mutates. The interior points with no injected dependency (between renew and the
+    CAS beyond the advance case; after satisfy before queue-complete) are covered by the CAS-authority and
+    ALREADY_DONE / reactivate_satisfied tests rather than claimed here."""
 
     def _assert_invariants(self, cal, s) -> None:  # type: ignore[no-untyped-def]
         rows = s._conn().execute("SELECT status, calibration_result_ref, target_head FROM refresh_intent "
                                  "WHERE policy_id='p1'").fetchall()
-        satisfied = [r for r in rows if r["status"] == "satisfied"]
-        self.assertLessEqual(len(satisfied), 1)                       # no double-satisfy
-        passes = s._conn().execute("SELECT COUNT(*) AS n FROM calibration_pass "
-                                   "WHERE policy_id='p1'").fetchone()["n"]
-        self.assertLessEqual(int(passes), 1)                          # no orphan/duplicate pass
-        for r in satisfied:                                           # satisfied => its pass exists (pin)
-            self.assertIsNotNone(r["calibration_result_ref"])
-            self.assertIsNotNone(s.pass_binding(r["calibration_result_ref"], "p1", r["target_head"]))
+        self.assertLessEqual(sum(1 for r in rows if r["status"] == "satisfied"), 1)  # no double-satisfy
+        for r in rows:                                       # satisfied => its CURRENT ref resolves exactly
+            if r["status"] == "satisfied":
+                self.assertIsNotNone(r["calibration_result_ref"])
+                self.assertIsNotNone(s.pass_binding(r["calibration_result_ref"], "p1", r["target_head"]))
+        # no DUPLICATE/conflicting pass PER LOGICAL TARGET (policy, head): at most one distinct ref per head.
+        for row in s._conn().execute(
+                "SELECT pinned_set_version, COUNT(DISTINCT calibration_result_ref) AS n FROM calibration_pass "
+                "WHERE policy_id='p1' GROUP BY pinned_set_version").fetchall():
+            self.assertLessEqual(int(row["n"]), 1)
 
-    def test_append_then_worker_converges_and_holds_invariants(self) -> None:
-        # append lands BEFORE the worker runs -> worker RETRYs (drift); relay reconciles to the new head; a
-        # second worker SATISFIES. No lost-satisfy (the policy converges), invariants hold throughout.
+    def test_drift_during_measurement_retries_no_mutation(self) -> None:
         cal, s, q = _scenario()
-        cal.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT, approval=_appr("g1", "g2", op="drift"),
-                   fixture_id="b2", set_id="default", label=FixtureLabel.KNOWN_BAD, payload=b"q")
+        out = _run(cal, s, q, _pass_det(), make_sandbox=_measure_drift_sandbox(cal))
+        self.assertIs(out, WorkerOutcome.RETRY)              # live-head recheck caught the mid-measure drift
+        self._assert_invariants(cal, s)
+        self.assertIsNot(q.get(next(iter(_job_ids(q)))).status, JobStatus.DONE)  # released, not completed
+
+    def test_drift_at_live_head_recheck_retries_no_mutation(self) -> None:
+        cal = _DriftOnSetHead(Path(tempfile.mkdtemp(prefix="mv-wk-dlh-")) / "c.db")
+        cal.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT, approval=_appr("g1", "g2", op="b1"),
+                   fixture_id="b1", set_id="default", label=FixtureLabel.KNOWN_BAD, payload=b"y")
+        cal.append(ChangeOp.ADD_KNOWN_GOOD, admission=_ADMIT, approval=_appr("g1", "g2", op="g1"),
+                   fixture_id="g1", set_id="default", label=FixtureLabel.KNOWN_GOOD, payload=b"z")
+        cal, s, q = _scenario(cal=cal)
+        cal.arm = True                                       # drift fires at the worker's live-head set_head
+        self.assertIs(_run(cal, s, q, _pass_det()), WorkerOutcome.RETRY)
+        self._assert_invariants(cal, s)
+
+    def test_concurrent_advance_between_renew_and_cas_is_stale_no_pass(self) -> None:
+        s = _AdvanceBeforeSatisfy(Path(tempfile.mkdtemp(prefix="mv-wk-adv-")) / "p.db")
+        cal, s, q = _scenario(s=s)
+        s.arm = True                                         # advance the intent inside satisfy (post-renew)
+        self.assertIs(_run(cal, s, q, _pass_det()), WorkerOutcome.STALE)  # CAS misses -> stale, no wrong pass
+        self._assert_invariants(cal, s)
+        self.assertEqual(int(s._conn().execute(
+            "SELECT COUNT(*) AS n FROM calibration_pass WHERE policy_id='p1'").fetchone()["n"]), 0)
+
+    def test_pre_run_drift_converges_and_holds_invariants(self) -> None:
+        cal, s, q = _scenario()
+        _drift(cal, "pre")                                   # append lands BEFORE the worker runs
         self.assertIs(_run(cal, s, q, GoldenScriptedDetector([_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3)),
-                      WorkerOutcome.RETRY)          # b1,b2 caught, g1 passed — but drift -> retry first
-        self._assert_invariants(cal, s)             # nothing mutated yet
-        # relay advances the intent to the new head + enqueues a fresh job. A worker LOOP then drains: the old
-        # (now fence-mismatched) job completes STALE, the new head's job SATISFIES. No lost-satisfy — the
-        # policy converges — and the invariants hold at every step.
+                      WorkerOutcome.RETRY)
+        self._assert_invariants(cal, s)
+        # relay reconciles to the new head; a worker LOOP drains the stale job then SATISFIES the new one.
         relay_intents(policy_store=s, calibration_store=cal, queue=q, now=_NOW + 1)
         outcomes = []
         for i in range(4):
             out = _run(cal, s, q, GoldenScriptedDetector([_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3),
-                       now=_NOW + 2 + i)
+                       clock=(lambda v=_NOW + 2 + i: v))
             outcomes.append(out)
             self._assert_invariants(cal, s)
             if out is WorkerOutcome.SATISFIED:
                 break
-        self.assertIn(WorkerOutcome.SATISFIED, outcomes)  # converged at the new head (no lost-satisfy)
+        self.assertIn(WorkerOutcome.SATISFIED, outcomes)     # converged (no lost-satisfy)
         self._assert_invariants(cal, s)
 
     def test_redelivery_after_satisfy_is_idempotent(self) -> None:
         cal, s, q = _scenario()
         self.assertIs(_run(cal, s, q, _pass_det()), WorkerOutcome.SATISFIED)
         self._assert_invariants(cal, s)
-        # re-relay + re-run: the satisfied intent at an unchanged head is NOT re-enqueued (relay skips it),
-        # so no double work; invariants still hold.
-        relay_intents(policy_store=s, calibration_store=cal, queue=q, now=_NOW + 1)
+        relay_intents(policy_store=s, calibration_store=cal, queue=q, now=_NOW + 1)  # satisfied+unchanged: skip
         self._assert_invariants(cal, s)
 
 

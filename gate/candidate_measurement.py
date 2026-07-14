@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from core import ResourceBudget, Sandbox
+from core import ResourceBudget, Sandbox, VerdictType
 from engine.calibration import (
     DEFAULT_CALIBRATION_TRIALS,
     BackendGuard,
@@ -116,6 +116,25 @@ def prepare_candidate(
         trust_witness=trust_policy.policy_digest if trust_policy is not None else None,
         guard_witness=getattr(backend_guard, "policy_digest", None),
     )
+
+
+def classify_measurement(measurement: CandidateMeasurement) -> VerdictType:
+    """The SHARED, authority-free outcome classifier both consumers use (the signed runner AND the async
+    worker), so they cannot disagree on what a measurement MEANS. ERROR (inconclusive — retry / signed-ERROR,
+    NEVER a deterministic detector failure) whenever the run is UNATTESTABLE: an INADEQUATE set, ANY harness
+    error, an inconsistent execution identity, INCONSISTENT policies, or any absent / present-but-invalid
+    (positive-shape) runtime-subject coordinate. Only a fully-attested run is PASS/FAIL — a real
+    miss/false-positive/flake is FAIL; a clean two-sided pass is PASS. Note a harness error can leave the
+    four coordinates measurable (a non-null subject), so ``subject is None`` alone is NOT a sufficient ERROR
+    test — ``harness_errors`` must be checked explicitly."""
+    r = measurement.result
+    coords = (measurement.resolved_profile_digest, measurement.trust_policy_digest,
+              measurement.guard_policy_digest, measurement.execution_identity_digest)
+    coords_valid = all(isinstance(c, str) and c != "" for c in coords)
+    if (r.inadequate or r.harness_errors or not r.identity_consistent
+            or not r.policies_consistent or measurement.subject_identity is None or not coords_valid):
+        return VerdictType.ERROR
+    return VerdictType.PASS if r.passed else VerdictType.FAIL
 
 
 def _valid_coord(c: str | None) -> str | None:

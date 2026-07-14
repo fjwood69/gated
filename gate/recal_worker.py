@@ -30,7 +30,7 @@ import sqlite3
 from enum import Enum
 from typing import Callable
 
-from core import ResourceBudget, Sandbox
+from core import ResourceBudget, Sandbox, VerdictType
 from engine.calibration import DEFAULT_CALIBRATION_TRIALS, BackendGuard, BundleResolver
 from engine.observation_trust import TrustPolicy
 from gate.calibration_identity import calibration_result_ref
@@ -38,6 +38,7 @@ from gate.calibration_store import CalibrationStore
 from gate.candidate_measurement import (
     PreparedCandidate,
     WitnessInconsistencyError,
+    classify_measurement,
     prepare_candidate,
     produce_candidate_measurement,
 )
@@ -86,16 +87,21 @@ def run_one(
     budget: ResourceBudget,
     lease_token: str,
     visibility_timeout: float,
-    now: float,
+    clock: Callable[[], float],
     retry_delay: float = 0.0,
     trials: int = DEFAULT_CALIBRATION_TRIALS,
 ) -> WorkerOutcome:
     """Lease and process at most ONE intent candidate. Returns the disposition. Idempotent + fenced end to
     end: a crash at any point leaves the durable state recoverable (the queue redelivers; the intent CAS
-    dedups), and no path records a pass for the wrong head or moves a policy to REJECTED."""
+    dedups), and no path records a pass for the wrong head or moves a policy to REJECTED.
+
+    ``clock`` is read AT the lease AND re-read AFTER the (potentially long) measurement — renewal, completion
+    and release use the FRESH time, not the lease-start time, so a renewal genuinely detects a lease that
+    expired during calibration (a frozen timestamp would revive an expired lease and defeat the guarantee)."""
     if not (isinstance(lease_token, str) and lease_token):  # positive-shape: a lease token is an identity
         raise ValueError("lease_token must be a non-empty string")
 
+    now = clock()  # lease timestamp — also used by the EARLY (pre-measurement) complete/release paths
     job = queue.lease(lease_token=lease_token, visibility_timeout=visibility_timeout, now=now, kind="intent")
     if job is None:
         return WorkerOutcome.IDLE
@@ -168,6 +174,11 @@ def run_one(
     except WitnessInconsistencyError:
         return _retry()  # a mid-run boot-object mutation — retry operationally
 
+    # REFRESH the clock: calibration may have taken real time, so renewal / completion / release from here on
+    # use the CURRENT time, not the lease-start time — a renewal must genuinely detect a lease that expired
+    # during the run. (The nested _retry / _complete_no_work read this ``now`` by closure, so they pick it up.)
+    now = clock()
+
     # RECHECK the LIVE head before satisfaction: if the set drifted DURING calibration, the sealed head is
     # stale — don't record a pass we already know is superseded; the intent is still active, so RETRY (the
     # relay re-enqueues at the new head). This external read is an OPTIMISATION, not the authority — the
@@ -175,19 +186,23 @@ def run_one(
     if calibration_store.set_head(set_id) != sealed.oracle_head:
         return _retry()
 
-    subject = measurement.subject_identity
-    if subject is None:
-        # ERROR / unattested (inadequate / harness error / mixed or empty coordinate) — RETRY: the intent is
-        # still active; release so the queue retries; repeated ERROR burns attempts -> dead-letter.
+    # CLASSIFY via the SHARED authority-free classifier (identical to the signed runner). A harness ERROR can
+    # leave the four coordinates measurable (a non-null subject), so ``subject is None`` alone would WRONGLY
+    # terminalize it as failed_detector — classify_measurement checks harness_errors/inadequate/inconsistent
+    # explicitly. ERROR -> RETRY (never a deterministic failure); PASS -> satisfy; FAIL -> failed_detector.
+    kind = classify_measurement(measurement)
+    if kind is VerdictType.ERROR:
         return _retry()
 
-    # RENEW before ANY durable mutation. A failed renewal means exclusivity was lost (the lease lapsed and
-    # may have been re-leased) — ABORT with ZERO PolicyStore mutations; a re-leased worker redoes it, and the
-    # intent CAS makes that safe.
+    # RENEW before ANY durable mutation (PASS satisfy OR clean-FAIL failed_detector). A failed renewal means
+    # exclusivity was lost (the lease lapsed and may have been re-leased) — ABORT with ZERO PolicyStore
+    # mutations; a re-leased worker redoes it, and the intent CAS makes that safe.
     if not queue.renew(job.job_id, lease_token=lease_token, visibility_timeout=visibility_timeout, now=now):
         return WorkerOutcome.ABORTED_LEASE_LOST
 
-    if measurement.result.passed:
+    if kind is VerdictType.PASS:
+        subject = measurement.subject_identity
+        assert subject is not None  # classify_measurement PASS guarantees the four coordinates + subject
         ref = calibration_result_ref(
             policy_id, sealed.oracle_head, subject, passed=True,
             n_bad=len(measurement.result.outcomes),
@@ -202,8 +217,8 @@ def run_one(
             return _complete_no_work(WorkerOutcome.STALE)
         return _complete_no_work(WorkerOutcome.SATISFIED)  # SATISFIED or idempotent ALREADY_SATISFIED
 
-    # clean DETERMINISTIC FAIL (an attested miss/false-positive) -> failed_detector (policy stays CALIBRATING;
-    # NEVER worker-REJECTED). The CAS fences the fence: a miss means the intent advanced -> stale.
+    # VerdictType.FAIL — an ATTESTED deterministic miss / false-positive / flake -> failed_detector (policy
+    # stays CALIBRATING; NEVER worker-REJECTED). The CAS fences the fence: a miss means the intent advanced.
     if policy_store.mark_intent_failed_detector(policy_id, policy_generation=pg, target_revision=tr,
                                                 target_head=th):
         return _complete_no_work(WorkerOutcome.FAILED_DETECTOR)

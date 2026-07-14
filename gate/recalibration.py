@@ -44,6 +44,7 @@ from gate.calibration_store import CalibrationStore
 from gate.candidate_measurement import (
     CandidateMeasurement,
     WitnessInconsistencyError,
+    classify_measurement,
     prepare_candidate,
     produce_candidate_measurement,
 )
@@ -65,25 +66,12 @@ def deterministic_job_id(
 
 
 def _outcome_of(measurement: CandidateMeasurement) -> VerdictType:
-    """Map a measurement to its outcome. ERROR (inconclusive) whenever the run is UNATTESTABLE — an
-    INADEQUATE set, any HARNESS ERROR, an inconsistent execution identity, INCONSISTENT POLICIES (a mixed
-    trust/guard policy across fixtures), or ANY absent runtime-subject coordinate (no composite subject).
-    Only a fully-attested run yields PASS/FAIL: a real miss/false-positive/flake is FAIL; a clean two-sided
-    pass is PASS. Classifying from the ``CandidateMeasurement`` (which carries the four coordinates + the
-    composite subject) means the outcome CANNOT be PASS/FAIL while a coordinate is missing — so it always
-    satisfies ``sign_measurement``'s conditional-validity rule (a PASS/FAIL requires all four coordinates +
-    a subject), and a mixed-policy / digestless-guard run becomes signed ERROR evidence, never a crash."""
-    r = measurement.result
-    # independently require FOUR wire-valid (non-empty str) coordinates — the positive-shape check — rather
-    # than trust the subject-derivation alone; a present-but-invalid ("" / malformed) coordinate is NOT a
-    # valid PASS/FAIL basis and ``sign_measurement`` would reject it on the wire.
-    coords = (measurement.resolved_profile_digest, measurement.trust_policy_digest,
-              measurement.guard_policy_digest, measurement.execution_identity_digest)
-    coords_valid = all(isinstance(c, str) and c != "" for c in coords)
-    if (r.inadequate or r.harness_errors or not r.identity_consistent
-            or not r.policies_consistent or measurement.subject_identity is None or not coords_valid):
-        return VerdictType.ERROR
-    return VerdictType.PASS if r.passed else VerdictType.FAIL
+    """The signed runner's outcome = the SHARED authority-free classifier (``classify_measurement``), so the
+    runner and the async worker cannot disagree on what a measurement means. A PASS/FAIL therefore always
+    carries the four coordinates + subject that ``sign_measurement`` requires; anything unattestable
+    (inadequate / harness error / inconsistent / mixed / invalid-coordinate) is ERROR — signed ERROR
+    evidence here, retry on the worker path — never a crash and never a deterministic failure."""
+    return classify_measurement(measurement)
 
 
 def run_recalibration(

@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **gated** (3762 symbols, 8599 relationships, 206 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **gated** (3786 symbols, 8675 relationships, 206 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
@@ -45,17 +45,14 @@ This project is indexed by GitNexus as **gated** (3762 symbols, 8599 relationshi
 
 <!-- The block below is OUTSIDE the gitnexus markers so `gitnexus analyze` / wiki regeneration does NOT overwrite it. -->
 
-## ⚠️ MANDATORY: re-index `/gated` BEFORE every GitNexus call
+## Re-index with GitNexus BEFORE every GitNexus call
 
-`/gated` is ONE of several repos in the shared GitNexus index, and this build (3.5 S3-completion) churns
-it constantly — the index goes stale between almost every edit. A stale/absent `impact` / `detect_changes`
-reading is **VACUOUS** (it measures the graph's ignorance, not the code's safety). So, EVERY time, before
-any `impact` / `detect_changes` / `context` on gated:
+When this repo shares a GitNexus index with other repos, the index goes stale between almost every edit,
+and an intricate build churns it constantly. A stale/absent `impact` / `detect_changes` reading is
+**VACUOUS** (it measures the graph's ignorance, not the code's safety). So, EVERY time, before any
+`impact` / `detect_changes` / `context`, re-index from the repo root (`gitnexus analyze` — or the runner
+in the box above).
 
-```bash
-cd /home/nucadmin/gated && export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; gitnexus analyze
-```
-
-- **Always pass `repo: "gated"`** to the MCP calls — the multi-repo index errors "Multiple repositories indexed" otherwise.
+- In a multi-repo index, **pass the repo name** to the MCP calls (it errors "Multiple repositories indexed" otherwise).
 - **Trust a reading only when its `epistemic` tag is `EXACT`.** Cadence: **edit → re-index → THEN read impact.**
-- Through intricate sections (the concurrency worker/relay), use GitNexus **regularly** — re-index + impact at each build step, not just at seal.
+- Through intricate sections (a concurrency worker/relay), use GitNexus **regularly** — re-index + impact at each build step, not just at seal.
