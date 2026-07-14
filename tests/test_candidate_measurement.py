@@ -68,6 +68,21 @@ class _MutatingGuard:
         return None
 
 
+class _EmptyDigestGuard:
+    """A guard whose ``policy_digest`` is present but EMPTY ("") — a present-but-invalid coordinate. The
+    witness passes ("" == "") and the aggregation binds "" (consistent), so ONLY the positive-shape
+    validity check stops it from reaching the signer as a PASS/FAIL over an empty wire coordinate."""
+
+    policy_id = "empty-guard:v1"
+
+    @property
+    def policy_digest(self) -> str:
+        return ""
+
+    def __call__(self, sandbox: object) -> None:
+        return None
+
+
 class _MixedGuard:
     """A guard whose ``policy_digest`` DIFFERS on every read — so it is inconsistent ACROSS fixtures and the
     aggregation binds None (fail-closed), never reaching the witness comparison."""
@@ -166,6 +181,13 @@ class RunnerNeverCrashesTests(unittest.TestCase):
         from tests._backend_optout import allow_any_backend
         self._recal_error(allow_any_backend)
 
+    def test_signed_error_on_empty_string_digest(self) -> None:
+        # board completion of P1: a PRESENT-but-EMPTY ("") guard digest is present-but-invalid — the witness
+        # passes and aggregation binds "" (not None), so the enumerated None/mixed/digestless checks miss it.
+        # The positive-shape validity check normalises "" -> None -> ERROR, so the signer never sees an empty
+        # wire coordinate. (Regression: previously crashed with MeasurementSchemaError.)
+        self._recal_error(_EmptyDigestGuard())
+
 
 class MixedGuardAggregationTests(unittest.TestCase):
     def test_mixed_guard_fails_closed_without_a_witness_raise(self) -> None:
@@ -175,6 +197,13 @@ class MixedGuardAggregationTests(unittest.TestCase):
         self.assertIsNone(m.guard_policy_digest)
         self.assertFalse(m.result.passed)
         self.assertIsNone(m.subject_identity)
+
+    def test_empty_string_digest_normalises_to_none_at_the_spine(self) -> None:
+        # positive-shape: the aggregation binds "" (consistent, non-None) but the spine normalises a
+        # present-but-empty coordinate to None, so no subject is derived over an invalid wire coordinate.
+        m = _prepare_and_produce(backend_guard=_EmptyDigestGuard())
+        self.assertIsNone(m.guard_policy_digest)   # "" normalised to None
+        self.assertIsNone(m.subject_identity)      # no subject over an invalid coordinate
 
 
 if __name__ == "__main__":

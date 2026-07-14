@@ -118,6 +118,13 @@ def prepare_candidate(
     )
 
 
+def _valid_coord(c: str | None) -> str | None:
+    """A runtime-subject coordinate is PRESENT only if it is a non-empty ``str``. Normalise everything
+    else — ``None``, ``""``, or a non-str — to ``None`` (present-but-invalid is NOT present). This is the
+    positive-shape check: assert the valid shape once, rather than enumerate the degenerate values."""
+    return c if (isinstance(c, str) and c != "") else None
+
+
 def _verify_witnesses(result: CalibrationResult, prepared: PreparedCandidate) -> None:
     """Fail closed if any MEASURED coordinate diverges from its pre-run witness. Only measured (non-None)
     coordinates are checked — a None coordinate means the run did not attest it (inadequate/error/mixed),
@@ -157,13 +164,20 @@ def produce_candidate_measurement(
         make_sandbox, prepared.detector_id, _frozen_resolve, prepared.sealed_set.calibration_set, budget,
         trials=trials, backend_guard=backend_guard, trust_policy=trust_policy,
     )
-    rpd = result.resolved_profile_digest
-    tpd = result.trust_policy_digest
-    gpd = result.guard_policy_digest
-    eid = result.execution_identity.digest() if result.execution_identity is not None else None
+    # witness self-consistency is checked on the RAW measured digests (mutation detection is faithful only
+    # against exactly what the run measured), BEFORE validity normalisation below.
     _verify_witnesses(result, prepared)
-    # a subject exists ONLY when all four coordinates were measured (a clean PASS/FAIL); an unattestable
-    # ERROR carries null coordinates and a null subject.
+    # POSITIVE-SHAPE validity (not enumerated degenerates): a coordinate is PRESENT only if it is a
+    # non-empty str; anything else — None, "", or a non-str — normalises to None. An empty/malformed digest
+    # is present-but-invalid, and ``sign_measurement`` rejects it on the wire; normalising here means a
+    # subject is derived (and a PASS/FAIL is possible) ONLY over four wire-valid coordinates, so an empty
+    # digest becomes an ERROR carrying nulls rather than a crash at signing.
+    rpd = _valid_coord(result.resolved_profile_digest)
+    tpd = _valid_coord(result.trust_policy_digest)
+    gpd = _valid_coord(result.guard_policy_digest)
+    eid = _valid_coord(result.execution_identity.digest() if result.execution_identity is not None else None)
+    # a subject exists ONLY when all four coordinates are present AND valid (a clean PASS/FAIL); an
+    # unattestable ERROR carries null coordinates and a null subject.
     _coords = (rpd, tpd, gpd, eid)
     subject = (
         calibrated_subject_identity(rpd, tpd, gpd, eid) if all(c is not None for c in _coords) else None

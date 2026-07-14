@@ -74,8 +74,14 @@ def _outcome_of(measurement: CandidateMeasurement) -> VerdictType:
     satisfies ``sign_measurement``'s conditional-validity rule (a PASS/FAIL requires all four coordinates +
     a subject), and a mixed-policy / digestless-guard run becomes signed ERROR evidence, never a crash."""
     r = measurement.result
+    # independently require FOUR wire-valid (non-empty str) coordinates — the positive-shape check — rather
+    # than trust the subject-derivation alone; a present-but-invalid ("" / malformed) coordinate is NOT a
+    # valid PASS/FAIL basis and ``sign_measurement`` would reject it on the wire.
+    coords = (measurement.resolved_profile_digest, measurement.trust_policy_digest,
+              measurement.guard_policy_digest, measurement.execution_identity_digest)
+    coords_valid = all(isinstance(c, str) and c != "" for c in coords)
     if (r.inadequate or r.harness_errors or not r.identity_consistent
-            or not r.policies_consistent or measurement.subject_identity is None):
+            or not r.policies_consistent or measurement.subject_identity is None or not coords_valid):
         return VerdictType.ERROR
     return VerdictType.PASS if r.passed else VerdictType.FAIL
 
