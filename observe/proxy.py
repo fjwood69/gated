@@ -48,18 +48,15 @@ def serve(port: int, countfile: str, mode: str = "fail_always") -> None:
 
     write_count(0)
 
-    def handle(conn: socket.socket) -> None:
-        nonlocal count
+    def handle(conn: socket.socket, n: int) -> None:
+        # the connection was ALREADY counted at accept (n is this attempt's number); handle only reads the
+        # bounded peek and responds. A slow/silent client can no longer suppress its own count by stalling here.
         try:
             conn.settimeout(5.0)
             try:
                 conn.recv(_PEEK)  # bounded peek; deliberately NOT parsed
             except OSError:
                 pass
-            with lock:
-                count += 1
-                n = count
-                write_count(count)
             resp = _200 if (mode == "fail_once" and n >= 2) else _503
             try:
                 conn.sendall(resp)
@@ -79,8 +76,16 @@ def serve(port: int, countfile: str, mode: str = "fail_always") -> None:
     srv.listen(_MAX_INFLIGHT)
     while True:
         conn, _ = srv.accept()
+        # COUNT THE CONNECTION AT ACCEPT — before the concurrency gate and before any payload wait. The
+        # telemetry contract counts CONNECTIONS (real egress attempts), not completed HTTP requests, so a
+        # Slowloris client that connects and stalls cannot go uncounted by occupying a handler for the peek
+        # timeout. The count/write is under ``lock`` so concurrent handlers see a consistent value.
+        with lock:
+            count += 1
+            n = count
+            write_count(count)
         sem.acquire()
-        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+        threading.Thread(target=handle, args=(conn, n), daemon=True).start()
 
 
 if __name__ == "__main__":

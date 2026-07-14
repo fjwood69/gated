@@ -47,6 +47,7 @@ from core import (
     ArtifactHashMismatchError,
     ArtifactSpec,
     Command,
+    Existence,
     ExecutionResult,
     Fixtures,
     ImageResolutionError,
@@ -64,6 +65,21 @@ _Outcome = Literal["completed", "timeout", "error"]
 _RUNTIMES = ("podman", "nerdctl", "docker")  # docker last — optional, never preferred
 ARTIFACT_MOUNT = "/artifact"  # verified tree, read-only
 WORK_DIR = "/work"            # writable tmpfs — scratch/audit only, NEVER graded
+
+
+def probe_existence(argv: list[str], name: str, *, timeout: float = 30.0) -> Existence:
+    """Probe whether the runtime resource ``name`` is listed by ``argv`` — the SHARED, fail-CLOSED existence
+    check for OCI + observed teardown/reap. EXISTS/ABSENT are returned ONLY on a query that actually ran
+    (return code 0); ANY inability to tell — an ``OSError``, a timeout / ``SubprocessError``, OR a NON-ZERO
+    return code (an empty stdout from a *failed* ``ps`` is not proof of absence) — is ``UNKNOWN``. Ephemerality
+    is security-critical, so a caller must treat ``UNKNOWN`` after teardown as a leak, never as 'gone'."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return Existence.UNKNOWN
+    if r.returncode != 0:
+        return Existence.UNKNOWN
+    return Existence.EXISTS if name in r.stdout.split() else Existence.ABSENT
 
 
 class OCIRuntimeUnavailable(Exception):
@@ -262,39 +278,32 @@ class OCISandbox(BaseSandbox):
             return
         try:
             self._force_remove(handle.container)
-            if self._container_exists(handle.container):
+            # PROVE destruction: teardown succeeds ONLY on a probed ABSENT. EXISTS is a survivor; UNKNOWN
+            # (the probe could not tell — timeout / error / non-zero) is ALSO a leak, because we cannot
+            # CONFIRM the container is gone (SandboxLeakError's contract). One escalation, then fail closed.
+            if self._container_state(handle.container) is not Existence.ABSENT:
                 self._force_remove(handle.container)  # reaper escalation
-                if self._container_exists(handle.container):
+                state = self._container_state(handle.container)
+                if state is not Existence.ABSENT:
                     raise SandboxLeakError(
-                        f"container {handle.container} survived teardown — "
-                        "ephemerality (a security property) is violated"
+                        f"container {handle.container} could not be CONFIRMED destroyed (probe={state.value}) "
+                        "— ephemerality (a security property) is violated"
                     )
         finally:
             _rmtree_resilient(handle.snapshot)
 
     # -- internals --------------------------------------------------------
     def _force_remove(self, name: str) -> None:
+        # best-effort removal — the AUTHORITY that destruction happened is the tri-state probe below, not this
+        # return code (a non-zero rm still forces a re-probe, which fails closed on EXISTS/UNKNOWN).
         try:
-            subprocess.run(
-                [self._runtime, "rm", "-f", name],
-                capture_output=True,
-                timeout=30,
-            )
+            subprocess.run([self._runtime, "rm", "-f", name], capture_output=True, timeout=30)
         except (OSError, subprocess.SubprocessError):
             pass
 
-    def _container_exists(self, name: str) -> bool:
-        try:
-            out = subprocess.run(
-                [self._runtime, "ps", "-a", "--filter", f"name=^{name}$",
-                 "--format", "{{.Names}}"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False  # can't tell -> don't false-alarm a leak
-        return name in out.stdout.split()
+    def _container_state(self, name: str) -> Existence:
+        return probe_existence(
+            [self._runtime, "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"], name)
 
     def _result(
         self,

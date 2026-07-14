@@ -25,6 +25,7 @@ from core import (
 )
 from sandbox.noop import NoOpSandbox
 from sandbox.oci import OCIHandle, OCISandbox
+from core import Existence as _Existence
 
 IMAGE = "localhost/mori:local"  # local, has python3 (3.13) — the test base image
 _HAVE_OCI = OCISandbox.available(IMAGE)
@@ -37,6 +38,10 @@ def _artifact(script: str) -> ArtifactSpec:
     d = Path(tempfile.mkdtemp(prefix="mvtest-oci-"))
     (d / "main.py").write_text(script, encoding="utf-8")
     return ArtifactSpec(path=d, tree_hash=tree_hash(d))
+
+
+def _exists_(sb, name):  # test helper: True iff the tri-state probe says EXISTS (healthy runtime)
+    return sb._container_state(name) is _Existence.EXISTS
 
 
 @unittest.skipUnless(_HAVE_OCI, f"no OCI runtime can run {IMAGE} hermetically")
@@ -66,7 +71,7 @@ class OCISandboxTests(unittest.TestCase):
             self.assertEqual(r.outcome, "timeout")
             self.assertLess(time.monotonic() - t0, 30.0, "timeout must fire")
             self.assertFalse(
-                self.sb._container_exists(h.container),  # type: ignore[attr-defined]
+                _exists_(self.sb, h.container),  # type: ignore[attr-defined]
                 "timed-out container must be killed, not orphaned",
             )
         finally:
@@ -127,10 +132,10 @@ class OCISandboxTests(unittest.TestCase):
              IMAGE, "sleep", "120"],
             capture_output=True, timeout=60,
         )
-        self.assertTrue(self.sb._container_exists(h.container))  # type: ignore[attr-defined]
+        self.assertTrue(_exists_(self.sb, h.container))  # type: ignore[attr-defined]
         self.sb.teardown(h)  # must rm -f + verify gone (no SandboxLeakError)
         self.assertFalse(
-            self.sb._container_exists(h.container),  # type: ignore[attr-defined]
+            _exists_(self.sb, h.container),  # type: ignore[attr-defined]
             "teardown must destroy a live container",
         )
 
@@ -140,7 +145,7 @@ class OCISandboxTests(unittest.TestCase):
         try:
             self.sb.run(h, _RUN, ResourceBudget(wall_clock_seconds=30.0))
             self.assertFalse(
-                self.sb._container_exists(h.container),  # type: ignore[attr-defined]
+                _exists_(self.sb, h.container),  # type: ignore[attr-defined]
                 "--rm must leave no container after a normal run",
             )
         finally:

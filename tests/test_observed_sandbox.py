@@ -16,6 +16,7 @@ from sandbox.noop import NoOpSandbox
 import subprocess
 
 from sandbox.observed import ObservedHandle, ObservedOCISandbox, reap_orphans
+from core import Existence as _Existence
 
 IMAGE = "localhost/mori:local"
 _HAVE = ObservedOCISandbox.available(IMAGE)
@@ -39,6 +40,14 @@ def _artifact(script: str) -> ArtifactSpec:
     d = Path(tempfile.mkdtemp(prefix="mvtest-obs-"))
     (d / "main.py").write_text(script, encoding="utf-8")
     return ArtifactSpec(path=d, tree_hash=tree_hash(d))
+
+
+def _exists_(sb, name):  # test helper: True iff the tri-state probe says EXISTS (healthy runtime)
+    return sb._container_state(name) is _Existence.EXISTS
+
+
+def _net_exists_(sb, name):
+    return sb._network_state(name) is _Existence.EXISTS
 
 
 @unittest.skipUnless(_HAVE, f"no OCI runtime can run {IMAGE} hermetically")
@@ -90,9 +99,9 @@ class ObservedSandboxTests(unittest.TestCase):
         self.sb.run(h, _RUN, _BUDGET)
         snap = h.snapshot
         self.sb.teardown(h)
-        self.assertFalse(self.sb._container_exists(h.proxy), "proxy must be gone")  # type: ignore[attr-defined]
-        self.assertFalse(self.sb._container_exists(h.container), "sandbox must be gone")  # type: ignore[attr-defined]
-        self.assertFalse(self.sb._network_exists(h.network), "network must be gone")  # type: ignore[attr-defined]
+        self.assertFalse(_exists_(self.sb, h.proxy), "proxy must be gone")  # type: ignore[attr-defined]
+        self.assertFalse(_exists_(self.sb, h.container), "sandbox must be gone")  # type: ignore[attr-defined]
+        self.assertFalse(_net_exists_(self.sb, h.network), "network must be gone")  # type: ignore[attr-defined]
         self.assertFalse(snap.exists(), "snapshot must be gone")
 
     def test_teardown_converges_after_partial_failure(self) -> None:
@@ -102,8 +111,8 @@ class ObservedSandboxTests(unittest.TestCase):
         assert isinstance(h, ObservedHandle)
         subprocess.run([self.sb.runtime, "rm", "-f", h.proxy], capture_output=True, timeout=30)
         self.sb.teardown(h)  # must converge, no SandboxLeakError
-        self.assertFalse(self.sb._network_exists(h.network))  # type: ignore[attr-defined]
-        self.assertFalse(self.sb._container_exists(h.container))  # type: ignore[attr-defined]
+        self.assertFalse(_net_exists_(self.sb, h.network))  # type: ignore[attr-defined]
+        self.assertFalse(_exists_(self.sb, h.container))  # type: ignore[attr-defined]
         self.assertFalse(h.snapshot.exists())
 
     def test_reaper_cleans_orphans(self) -> None:
@@ -113,10 +122,10 @@ class ObservedSandboxTests(unittest.TestCase):
                        capture_output=True, timeout=30)
         subprocess.run([rt, "run", "-d", "--network", net, "--name", ctr, IMAGE, "sleep", "120"],
                        capture_output=True, timeout=60)
-        self.assertTrue(self.sb._container_exists(ctr))  # type: ignore[attr-defined]
+        self.assertTrue(_exists_(self.sb, ctr))  # type: ignore[attr-defined]
         reap_orphans(rt)
-        self.assertFalse(self.sb._container_exists(ctr), "reaper removes orphan container")  # type: ignore[attr-defined]
-        self.assertFalse(self.sb._network_exists(net), "reaper removes orphan network")  # type: ignore[attr-defined]
+        self.assertFalse(_exists_(self.sb, ctr), "reaper removes orphan container")  # type: ignore[attr-defined]
+        self.assertFalse(_net_exists_(self.sb, net), "reaper removes orphan network")  # type: ignore[attr-defined]
 
     def test_foreign_handle_rejected(self) -> None:
         foreign = NoOpSandbox().prepare(_artifact("pass\n"), Fixtures())

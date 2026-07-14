@@ -41,6 +41,7 @@ from core import (
     ArtifactHashMismatchError,
     ArtifactSpec,
     Command,
+    Existence,
     ExecutionResult,
     Fixtures,
     IsolationLevel,
@@ -58,6 +59,7 @@ from sandbox.oci import (
     OCIRuntimeUnavailable,
     _make_snapshot_readable,
     _selinux_enforcing,
+    probe_existence,
     resolve_image_id,
 )
 from sandbox.subprocess import _rmtree_resilient
@@ -113,16 +115,36 @@ def reap_orphans(runtime: str = "podman") -> None:
     """Startup reaper (GLM mandate): force-remove any orphaned gated containers
     and networks by name prefix. RAII covers normal + partial-failure paths, but a
     hard crash of the engine process itself can still orphan resources; run this on
-    engine startup for a guaranteed clean slate (no FD/IP-space exhaustion on CI)."""
-    def _names(args: list[str]) -> list[str]:
+    engine startup for a guaranteed clean slate (no FD/IP-space exhaustion on CI).
+
+    Fail CLOSED: the reaper PROMISES a clean slate, so a listing that cannot run (error / timeout / non-zero)
+    RAISES ``SandboxLeakError`` rather than reap nothing and report success — an unlistable runtime is exactly
+    the state where an orphaned container/network could persist unseen. Each removal is re-probed; a resource
+    not CONFIRMED gone raises."""
+    def _names(args: list[str], what: str) -> list[str]:
         try:
-            return subprocess.run(args, capture_output=True, text=True, timeout=30).stdout.split()
-        except (OSError, subprocess.SubprocessError):
-            return []
-    for c in _names([runtime, "ps", "-a", "--filter", f"name={_PREFIX}", "--format", "{{.Names}}"]):
+            r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SandboxLeakError(
+                f"startup reaper could not list orphan {what} ({exc!r}) — cannot guarantee a clean slate"
+            ) from exc
+        if r.returncode != 0:
+            raise SandboxLeakError(
+                f"startup reaper list of orphan {what} returned {r.returncode} — cannot guarantee a clean slate")
+        return r.stdout.split()
+
+    for c in _names([runtime, "ps", "-a", "--filter", f"name={_PREFIX}", "--format", "{{.Names}}"],
+                    "containers"):
         subprocess.run([runtime, "rm", "-f", c], capture_output=True, timeout=30)
-    for n in _names([runtime, "network", "ls", "--filter", f"name={_PREFIX}", "--format", "{{.Name}}"]):
+        if probe_existence([runtime, "ps", "-a", "--filter", f"name=^{c}$", "--format", "{{.Names}}"],
+                           c) is not Existence.ABSENT:
+            raise SandboxLeakError(f"startup reaper could not CONFIRM orphan container {c} destroyed")
+    for n in _names([runtime, "network", "ls", "--filter", f"name={_PREFIX}", "--format", "{{.Name}}"],
+                    "networks"):
         subprocess.run([runtime, "network", "rm", "-f", n], capture_output=True, timeout=30)
+        if probe_existence([runtime, "network", "ls", "--filter", f"name=^{n}$", "--format", "{{.Name}}"],
+                           n) is not Existence.ABSENT:
+            raise SandboxLeakError(f"startup reaper could not CONFIRM orphan network {n} destroyed")
 
 
 class NetworkIsolationError(Exception):
@@ -329,12 +351,17 @@ class ObservedOCISandbox(BaseSandbox):
             if name:
                 self._force_remove(name)
         self._force_remove_network(network)
-        survivors = [n for n in (sandbox, proxy) if n and self._container_exists(n)]
-        if self._network_exists(network):
+        # a SURVIVOR is any of the three resources we cannot PROVE gone — EXISTS or UNKNOWN (the probe timed
+        # out / errored / returned non-zero). Only a probed ABSENT clears a resource; a fail-open "can't tell
+        # -> gone" would let a container or the sealed network outlive its verdict.
+        survivors = [n for n in (sandbox, proxy)
+                     if n and self._container_state(n) is not Existence.ABSENT]
+        if self._network_state(network) is not Existence.ABSENT:
             survivors.append(network)
         return survivors
 
     def _force_remove(self, name: str) -> None:
+        # best-effort; the destruction AUTHORITY is the tri-state probe (a non-zero rm re-probes, fails closed).
         try:
             subprocess.run([self._runtime, "rm", "-f", name], capture_output=True, timeout=30)
         except (OSError, subprocess.SubprocessError):
@@ -347,23 +374,13 @@ class ObservedOCISandbox(BaseSandbox):
         except (OSError, subprocess.SubprocessError):
             pass
 
-    def _container_exists(self, name: str) -> bool:
-        try:
-            out = subprocess.run(
-                [self._runtime, "ps", "-a", "--filter", f"name=^{name}$",
-                 "--format", "{{.Names}}"], capture_output=True, text=True, timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return name in out.stdout.split()
+    def _container_state(self, name: str) -> Existence:
+        return probe_existence(
+            [self._runtime, "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"], name)
 
-    def _network_exists(self, name: str) -> bool:
-        try:
-            out = subprocess.run(
-                [self._runtime, "network", "ls", "--filter", f"name=^{name}$",
-                 "--format", "{{.Name}}"], capture_output=True, text=True, timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return name in out.stdout.split()
+    def _network_state(self, name: str) -> Existence:
+        return probe_existence(
+            [self._runtime, "network", "ls", "--filter", f"name=^{name}$", "--format", "{{.Name}}"], name)
 
     def _result(self, outcome: _Outcome, exit_code: int | None, egress: int | None,
                 handle: ObservedHandle, raw: int | None = None) -> ExecutionResult:

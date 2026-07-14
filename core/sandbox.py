@@ -44,6 +44,19 @@ class SandboxLeakError(Exception):
     This is the one sanctioned case of teardown raising."""
 
 
+class Existence(Enum):
+    """The tri-state result of a runtime existence probe (a destruction/orphan check). Crucially, a probe
+    that CANNOT tell — the runtime timed out, errored, or returned non-zero — is ``UNKNOWN``, NEVER
+    ``ABSENT``. Teardown may report success ONLY on a PROVEN ``ABSENT``: since ephemerality is
+    security-critical and the threat model is a MALICIOUS artifact, treating "can't tell" as "gone" is a
+    fail-OPEN (a container/network may survive while teardown claims it destroyed it). ``UNKNOWN`` after a
+    teardown is exactly the ``SandboxLeakError`` "cannot CONFIRM destroyed" condition — raise, don't swallow."""
+
+    EXISTS = "exists"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
+
+
 class ImageResolutionError(Exception):
     """A backend could not resolve its mutable image tag to an immutable local digest before run
     (image absent, or GC'd/pruned between resolve and run). 3.5-close #1.1: a FATAL identity error
