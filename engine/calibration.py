@@ -289,10 +289,6 @@ def calibrate(
     bundle = resolve(detector_id)  # trusted registry only — an unregistered id is refused here
     detector = bundle.assertion
     resolved_profile_digest = bundle.profile_digest
-    # B3 (S3): the guard PROVENANCE digest is read off the guard object ACTUALLY APPLIED (never separately
-    # supplied), resolved ONCE before the loop and passed into every run so it rides the authoritative
-    # TrialReport. The test-only opt-out bears no policy_digest -> None (no bound guard identity).
-    guard_policy_digest: str | None = getattr(backend_guard, "policy_digest", None)
 
     outcomes: list[FixtureOutcome] = []
     # v4 P1-c: execute the FROZEN resolved command (bundle.command), not a fresh detector.entrypoint().
@@ -350,10 +346,25 @@ def calibrate(
             and len(set(tp_digests)) == 1
         )
         trust_policy_digest = tp_digests[0] if (trust_consistent and tp_digests) else None
-    # B3 (S3): ``guard_policy_digest`` was read off the guard object ACTUALLY APPLIED before the loop and
-    # bound into every fixture's TrialReport. One guard governs the whole run, so it is inherently
-    # consistent; policy-A-applied-while-digest-B-supplied is impossible by construction.
-    policies_consistent = trust_consistent
+    # B3 (S3) + CP4 Slice B: the guard digest is AGGREGATED from every authoritative TrialReport (measured
+    # DURING the run, off the invoked guard object) — exactly as trust is — NOT a single pre-loop read. This
+    # is what gives the CandidateMeasurement's witness-vs-guard check real teeth: a mid-run guard-object
+    # mutation makes the reports disagree and fail closed here, rather than a pre-loop read that could never
+    # diverge from itself. Mirrors trust: EVERY fixture report present + non-null + all-equal -> bind that
+    # digest, else fail-closed. The test-only opt-out bears no policy_digest -> every report's guard digest
+    # is None -> nothing to bind (consistent, None), exactly like ``trust_policy is None``.
+    gp_digests = [o.trials.guard_policy_digest for o in outcomes if o.trials is not None]
+    if gp_digests and len(gp_digests) == len(outcomes) and all(d is None for d in gp_digests):
+        guard_policy_digest: str | None = None  # opt-out: no bound guard identity
+        guard_consistent = True
+    else:
+        guard_consistent = (
+            len(gp_digests) == len(outcomes)
+            and all(d is not None for d in gp_digests)
+            and len(set(gp_digests)) == 1
+        )
+        guard_policy_digest = gp_digests[0] if (guard_consistent and gp_digests) else None
+    policies_consistent = trust_consistent and guard_consistent
     passed = not (fn or fp or flaky or errs) and identity_consistent and policies_consistent
     return CalibrationResult(
         passed=passed, inadequate=False, fn_failures=fn, fp_failures=fp, flaky=flaky,
