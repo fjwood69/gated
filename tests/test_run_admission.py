@@ -109,6 +109,12 @@ class MeasuredNotPlanTests(unittest.TestCase):
         assert isinstance(res, AdmittedRunResult)
         self.assertEqual(res.measured_subject, expected)
 
+    def test_measured_coordinates_read_solely_from_the_report(self) -> None:
+        # re-dissent Finding-1 lock: all four coordinates come from the authoritative return, NOT a pre-run
+        # bundle or guard object. Set distinct values on the report and assert they are what admission reads.
+        un = _unadmitted(_plan(), _report(rpd="RP", tpd="TP", gpd="GP"))
+        self.assertEqual(un.measured_coordinates(), ("RP", "TP", "GP", _EID))
+
     def test_execution_coordinate_is_the_identity_digest(self) -> None:
         # the fourth coordinate is the digest of the parent-measured execution identity (not a raw field).
         rpd, tpd, gpd, eid = _unadmitted(_plan(), _report()).measured_coordinates()
@@ -128,6 +134,19 @@ class RefusalTests(unittest.TestCase):
         self.assertIsInstance(res, BlockingRefusal)
         assert isinstance(res, BlockingRefusal)
         self.assertIs(res.reason, RunAdmissionRefusal.ICV_UNSUPPORTED)
+
+    def test_icv_exact_int_typing_rejects_bool_str_and_bad_value(self) -> None:
+        # P1-2 (re-dissent): type(icv) is int AND == constant. A bool (True == 1) must NOT admit under a
+        # 'vTrue' domain; a str or an unsupported int is refused too.
+        bad_icvs: tuple[object, ...] = (True, False, "1", IDENTITY_CONTRACT_VERSION + 1, 0)
+        for bad in bad_icvs:
+            with self.subTest(icv=repr(bad)):
+                plan = AuthorizedRunPlan(policy_id="p1", target_subject=_SUBJECT,
+                                         authorized_context=(_SET, _SUBJECT, bad))  # type: ignore[arg-type]
+                res = admit_run_result(_unadmitted(plan, _report()))
+                self.assertIsInstance(res, BlockingRefusal)
+                assert isinstance(res, BlockingRefusal)
+                self.assertIs(res.reason, RunAdmissionRefusal.ICV_UNSUPPORTED)
 
     def test_unauthorized_subject_refused(self) -> None:
         # the plan's dispatch target != the governance-authorized subject -> the run was dispatched against a
@@ -197,12 +216,39 @@ class TypestateTests(unittest.TestCase):
         self.assertEqual(plan.authorized_subject, "subj")
         self.assertEqual(plan.identity_contract_version, IDENTITY_CONTRACT_VERSION)
 
-    def test_admitted_ctor_refuses_incoherent_subject_defence_in_depth(self) -> None:
-        # constructing an AdmittedRunResult whose measured_subject != the plan's target raises, so a
-        # hand-assembled admitted result for the wrong identity fails closed rather than publishing.
+class DirectConstructionTests(unittest.TestCase):
+    """P1-1 (re-dissent): the constructor RE-RUNS the full admission validator, so hand-assembling an
+    AdmittedRunResult cannot bypass admission. Every forge attempt fails closed with RunAdmissionError."""
+
+    def test_report_drift_with_stored_target_raises(self) -> None:
+        # forge: plan target=T, but the REPORT recomputes to X (a different guard) != T, stored subject=T.
+        # The old ctor (measured_subject == plan.target_subject) would have ACCEPTED this; the full recheck
+        # recomputes X from the report, sees the drift, and raises — the bypass is closed structurally.
+        with self.assertRaises(RunAdmissionError):
+            AdmittedRunResult(plan=_plan(target=_SUBJECT), report=_report(gpd="a-DIFFERENT-guard"),
+                              measured_subject=_SUBJECT)
+
+    def test_stored_subject_not_the_report_recomputed_one_raises(self) -> None:
+        # the report recomputes to _SUBJECT (== target), but the stored subject is a lie != recomputed.
         with self.assertRaises(RunAdmissionError):
             AdmittedRunResult(plan=_plan(target=_SUBJECT), report=_report(),
-                              measured_subject="a-different-subject")
+                              measured_subject="a-fabricated-subject")
+
+    def test_bad_icv_direct_construction_raises(self) -> None:
+        plan = AuthorizedRunPlan(policy_id="p1", target_subject=_SUBJECT,
+                                 authorized_context=(_SET, _SUBJECT, IDENTITY_CONTRACT_VERSION + 1))
+        with self.assertRaises(RunAdmissionError):
+            AdmittedRunResult(plan=plan, report=_report(), measured_subject=_SUBJECT)
+
+    def test_incomplete_coordinates_direct_construction_raises(self) -> None:
+        with self.assertRaises(RunAdmissionError):
+            AdmittedRunResult(plan=_plan(target=_SUBJECT), report=_report(execution_identity=None),
+                              measured_subject=_SUBJECT)
+
+    def test_unauthorized_subject_direct_construction_raises(self) -> None:
+        with self.assertRaises(RunAdmissionError):
+            AdmittedRunResult(plan=_plan(target=_SUBJECT, authorized="other-authorized"),
+                              report=_report(), measured_subject=_SUBJECT)
 
 
 if __name__ == "__main__":

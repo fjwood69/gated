@@ -1,5 +1,9 @@
 """gate/admission.py — 3.4: the fixture ADMISSION GATE. The true floor of the calibration oracle.
 
+AUTHORITY BOUNDARY (this module): fixture admission — it controls what enters the CALIBRATION ORACLE (a
+candidate → a fixture). This is DISTINCT from ``gate/run_admission.py`` (3.5 S3-completion), which controls
+what ENFORCEMENT EVIDENCE is publishable (a run result → an admitted verdict). Two different boundaries.
+
 An oracle is only as trustworthy as the discipline of what enters it. If an unvalidated LLM
 proposal or an auto-persisted C3 override can reach the fixture store, the calibration chain becomes
 a formally-correct proof of a false thing. This module is the one, human-gated, dual-controlled path
