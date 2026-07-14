@@ -268,9 +268,17 @@ def run_calibration(
     MEASUREMENT-DERIVED subject — H(resolved_profile_digest, execution_identity) from the SAME calibration
     run, exactly as ``run_recalibration`` — so governance later chooses WHICH persisted pass to ratify but
     cannot define what code it ran."""
-    store.transition(
-        policy_id, PolicyState.CALIBRATING, approval=approval,
-        pinned_set_version=calibration_chain_head,
+    # 3.5 S3-completion CP4: enter CALIBRATING via the atomic enter_calibrating (tier transition + the
+    # re-calibration RECOVERY INTENT in one transaction), so a crash between the transition and the run
+    # cannot strand the policy (the ENABLED-only relay would never re-trigger it). The intent carries the
+    # ROUTING recipe (detector / trust / guard / set / head / ICV); the four-tuple is MEASURED by the run.
+    store.enter_calibrating(
+        policy_id, approval=approval, set_id=set_id, pinned_set_version=calibration_chain_head,
+        detector_id=detector_id, trust_policy_ref=trust_policy.policy_digest,
+        # the guard OBJECT's policy digest (read as the runner reads it — off the applied object); a guard
+        # with no policy_digest yields "" and enter_calibrating fail-closes (an unroutable intent).
+        guard_policy_ref=getattr(backend_guard, "policy_digest", ""),
+        identity_contract_version=IDENTITY_CONTRACT_VERSION,
     )
     # detector by NAME, resolved only through the trusted registry (never a caller-supplied object).
     result = calibrate(make_sandbox, detector_id, resolve, calibration_set, budget,

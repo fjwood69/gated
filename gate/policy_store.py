@@ -137,6 +137,33 @@ CREATE TABLE IF NOT EXISTS calibration_pass (
                                                  -- pass from another identity contract cannot enable.
     passed_at              REAL NOT NULL
 );
+-- 3.5 S3-completion CP4 (liveness): the RE-CALIBRATION INTENT for a CALIBRATING policy. Created ATOMICALLY
+-- with the CALIBRATING tier transition (enter_calibrating, one BEGIN IMMEDIATE), because
+-- enabled_policies_for_set is ENABLED-only so the relay would otherwise never re-trigger a CALIBRATING
+-- policy (it would get safely-but-stuck). The intent carries ROUTING inputs (WHAT to run) — NOT a measured
+-- subject: at CALIBRATING entry no subject has been measured yet, so a subject here would be
+-- declared-not-measured; produce_candidate_pass RESOLVES + MEASURES the four-tuple itself. ``target_head``
+-- is the oracle set_head to seal+calibrate at; ``target_generation`` is the POLICY tier-chain head
+-- (record_hash) this intent targets — it FENCES a stale completion (a completion under an advanced
+-- generation updates 0 rows). ``churn_count`` is CUMULATIVE per policy, bumped only on a DISTINCT
+-- target_head advance (Slice A/C). The intent state machine + the ONE-active-intent partial unique index +
+-- the completion CAS land in Slice A; this slice creates the table + the atomic pending intent.
+CREATE TABLE IF NOT EXISTS refresh_intent (
+    seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_id              TEXT NOT NULL,
+    set_id                 TEXT NOT NULL,   -- routing: which oracle SET to recalibrate against
+    target_head            TEXT NOT NULL,   -- routing: the set_head (oracle head) to seal + calibrate at
+    target_generation      TEXT NOT NULL,   -- the policy tier-chain head (record_hash) this intent targets
+    detector_id            TEXT NOT NULL,   -- routing: which detector to run
+    trust_policy_ref       TEXT NOT NULL,   -- routing: which observation-trust policy governs it
+    guard_policy_ref       TEXT NOT NULL,   -- routing: which backend-guard policy governs it
+    identity_contract_version INTEGER NOT NULL,  -- routing: the ICV the candidate must compose under
+    churn_count            INTEGER NOT NULL DEFAULT 0,  -- cumulative per policy; bumped on distinct target_head advance
+    status                 TEXT NOT NULL    -- pending|dispatched|satisfied|superseded|failed_detector|failed_churn
+        CHECK (status IN ('pending','dispatched','satisfied','superseded','failed_detector','failed_churn')),
+    created_at             REAL NOT NULL,
+    updated_at             REAL NOT NULL
+);
 """
 
 
@@ -201,7 +228,13 @@ class PolicyStore:
             principal cannot meet even 1);
           * a transition INTO ENABLED must carry non-null calibration_result_ref + pinned_set_version
             + detector_identity (addition #3 — no un-anchored enablement).
-        Returns the new seq. There is deliberately NO update/delete method."""
+        Returns the new seq. There is deliberately NO update/delete method.
+
+        3.5 S3-completion CP4: the PREFERRED path into ``CALIBRATING`` is ``enter_calibrating``, which
+        atomically creates the re-calibration recovery intent in the SAME transaction (a CALIBRATING policy
+        without a durable intent would be silently un-reachable by the ENABLED-only relay). Making
+        ``enter_calibrating`` the SOLE path (refusing a bare CALIBRATING transition here) is a focused
+        follow-up — it re-routes every test-setup CALIBRATING call and is deferred out of this slice."""
         with self._lock:
             prior = self._current_state_unlocked(policy_id)
             src = prior if prior is not None else PolicyState.PROPOSED
@@ -273,6 +306,99 @@ class PolicyStore:
                  record_hash),
             )
             return int(cur.lastrowid or 0)
+
+    def enter_calibrating(
+        self,
+        policy_id: str,
+        *,
+        approval: GovernanceApproval,
+        set_id: str,
+        pinned_set_version: str,
+        detector_id: str,
+        trust_policy_ref: str,
+        guard_policy_ref: str,
+        identity_contract_version: int,
+    ) -> int:
+        """3.5 S3-completion CP4 (liveness): the SOLE path into ``CALIBRATING`` — it atomically appends the
+        CALIBRATING tier transition AND creates the pending re-calibration recovery intent in ONE explicit
+        SQLite transaction (``BEGIN IMMEDIATE`` → tier append → derive new policy head → intent insert →
+        ``COMMIT``; rollback BOTH on failure). A CALIBRATING policy is invisible to the ENABLED-only relay,
+        so without a durable intent it would be silently un-reachable (safely-but-stuck); the atomic pair
+        guarantees a CALIBRATING policy ALWAYS has a recovery intent (a crash cannot commit the transition
+        without the intent, or vice versa).
+
+        The intent carries ROUTING inputs (WHICH detector / trust / guard / set / head / ICV to run) — NOT a
+        measured subject: at CALIBRATING entry nothing has been measured yet, so a subject here would be
+        declared-not-measured. ``produce_candidate_pass`` (Slice B) RESOLVES + MEASURES the four-tuple
+        itself. Degenerate-value guarded: every routing string must be non-empty and the ICV must be the
+        exact current int contract. ``target_generation`` is DERIVED from the appended record_hash (the new
+        policy head), never caller-supplied. The intent state machine, the one-active partial unique index,
+        the completion CAS, and the sync-calibration resolution (satisfied / failed_detector) land in Slice
+        A — this slice creates the atomic pending intent only."""
+        for name, val in (("set_id", set_id), ("pinned_set_version", pinned_set_version),
+                          ("detector_id", detector_id), ("trust_policy_ref", trust_policy_ref),
+                          ("guard_policy_ref", guard_policy_ref)):
+            if not isinstance(val, str) or val == "":
+                raise PrivilegedOperationError(
+                    f"enter_calibrating requires a non-empty {name} routing input — an intent with a null "
+                    "routing coordinate is unroutable")
+        if type(identity_contract_version) is not int or identity_contract_version != IDENTITY_CONTRACT_VERSION:
+            raise PrivilegedOperationError(
+                f"enter_calibrating requires identity_contract_version == {IDENTITY_CONTRACT_VERSION} "
+                "(exact int, not bool/str) — a routing ICV under another contract cannot calibrate")
+        with self._lock:
+            prior = self._current_state_unlocked(policy_id)
+            src = prior if prior is not None else PolicyState.PROPOSED
+            if not is_legal_transition(src, PolicyState.CALIBRATING):
+                raise IllegalTransitionError(f"{src.value} -> calibrating is not permitted")
+            required = _required_principals(src, PolicyState.CALIBRATING)
+            if not approval.meets(required):
+                raise PrivilegedOperationError(
+                    f"{src.value} -> calibrating requires {required} distinct governance principal(s) + "
+                    f"purpose/rationale/operation_id; got {sorted(approval.distinct_principals)}")
+            # the CALIBRATING tier record — BYTE-IDENTICAL to transition(CALIBRATING, pinned_set_version=..):
+            # routing (set_id/detector/trust/guard/ICV) lives on the INTENT, and the tier row's
+            # ``detector_identity`` is the MEASURED subject (absent until ENABLED), so it stays None here.
+            principals_json = json.dumps(sorted(approval.distinct_principals))
+            prev_hash = self._head_hash_unlocked()
+            added_at = self._clock()
+            fields = {
+                "policy_id": policy_id,
+                "prior_state": prior.value if prior is not None else None,
+                "new_state": PolicyState.CALIBRATING.value,
+                "calibration_result_ref": None, "set_id": None, "pinned_set_version": pinned_set_version,
+                "detector_identity": None, "identity_contract_version": None,
+                "principals": principals_json, "purpose": approval.purpose,
+                "rationale": approval.rationale, "operation_id": approval.operation_id, "added_at": added_at,
+            }
+            record_hash = chain_hash(prev_hash, _digest_fields(fields))
+            conn = self._conn()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "INSERT INTO tier_transition_chain "
+                    "(policy_id, prior_state, new_state, calibration_result_ref, set_id, pinned_set_version,"
+                    " detector_identity, identity_contract_version, principals, purpose, rationale,"
+                    " operation_id, added_at, prev_hash, record_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (policy_id, fields["prior_state"], PolicyState.CALIBRATING.value, None, None,
+                     pinned_set_version, None, None, principals_json, approval.purpose, approval.rationale,
+                     approval.operation_id, added_at, prev_hash, record_hash),
+                )
+                seq = int(cur.lastrowid or 0)
+                # target_generation = the NEW policy head (the record_hash just appended) — DERIVED, never
+                # passed; target_head = the oracle head to seal + calibrate at.
+                conn.execute(
+                    "INSERT INTO refresh_intent (policy_id, set_id, target_head, target_generation,"
+                    " detector_id, trust_policy_ref, guard_policy_ref, identity_contract_version,"
+                    " churn_count, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,0,'pending',?,?)",
+                    (policy_id, set_id, pinned_set_version, record_hash, detector_id, trust_policy_ref,
+                     guard_policy_ref, identity_contract_version, added_at, added_at),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            return seq
 
     def reattest(
         self,
