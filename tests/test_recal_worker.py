@@ -277,6 +277,25 @@ class _AdvanceBeforeSatisfy(PolicyStore):
         return super().satisfy_intent_with_pass(policy_id, **kw)  # type: ignore[arg-type]
 
 
+class _AppendBeforeSatisfy(PolicyStore):
+    """Once ARMED, appends a fixture to the linked calibration store the next time ``satisfy_intent_with_pass``
+    runs — WITHOUT advancing the intent. Injects the IRREDUCIBLE cross-DB window: the set moves to H2 after
+    the worker's live-head check but the relay has NOT advanced the intent off H1, so the H1 triple-CAS still
+    succeeds (it fences PolicyStore movement, and the intent has not moved). An H1 pass therefore satisfies
+    while the live head is already H2 — safe because reconciliation, not the CAS, supersedes it."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.arm = False
+        self.cal: CalibrationStore | None = None
+
+    def satisfy_intent_with_pass(self, policy_id: str, **kw: object):  # type: ignore[no-untyped-def, override]
+        if self.arm and self.cal is not None:
+            self.arm = False
+            _drift(self.cal, "win")  # append ONLY — the intent is deliberately NOT advanced
+        return super().satisfy_intent_with_pass(policy_id, **kw)  # type: ignore[arg-type]
+
+
 def _measure_drift_sandbox(cal: CalibrationStore):  # type: ignore[no-untyped-def]
     """A make_sandbox that appends a fixture on its FIRST call — a set drift landing DURING measurement (after
     prepare, while calibrate runs on the frozen sealed set); the post-measure live-head recheck catches it."""
@@ -366,6 +385,50 @@ class WorkerInvariantHarness(unittest.TestCase):
         self.assertIs(_run(cal, s, q, _pass_det()), WorkerOutcome.SATISFIED)
         self._assert_invariants(cal, s)
         relay_intents(policy_store=s, calibration_store=cal, queue=q, now=_NOW + 1)  # satisfied+unchanged: skip
+        self._assert_invariants(cal, s)
+
+    def test_append_before_cas_no_relay_satisfies_h1_then_reconciles_to_h2(self) -> None:
+        # THE irreducible cross-DB window (board): a fixture appends AFTER the worker's live-head check but
+        # BEFORE the intent CAS, and the relay has NOT advanced the intent. The triple-CAS fences PolicyStore
+        # movement, and the intent is still H1 -> so an H1 pass SATISFIES while the live head is already H2.
+        # This is SAFE not because the CAS blocked it but because RECONCILIATION supersedes it.
+        s0 = _AppendBeforeSatisfy(Path(tempfile.mkdtemp(prefix="mv-wk-win-")) / "p.db")
+        cal, s, q = _scenario(s=s0)
+        s0.cal = cal
+        h1 = cal.set_head("default")
+        s0.arm = True
+        self.assertIs(_run(cal, s, q, _pass_det()), WorkerOutcome.SATISFIED)  # H1 satisfies in the window
+        h2 = cal.set_head("default")
+        self.assertNotEqual(h1, h2)                                            # the set is now H2
+        intent = s._conn().execute("SELECT status, calibration_result_ref FROM refresh_intent "
+                                   "WHERE policy_id='p1'").fetchone()
+        self.assertEqual(intent["status"], "satisfied")
+        h1_ref = intent["calibration_result_ref"]
+        self.assertIsNotNone(s.pass_binding(h1_ref, "p1", h1))                 # H1 pass persisted (bound to H1)
+        self._assert_invariants(cal, s)
+        # RECONCILIATION repairs the drift: satisfied@H1 vs live-head H2 -> reactivate_satisfied re-arms at H2,
+        # CLEARS the stale H1 ref, and enqueues an H2 job.
+        relay_intents(policy_store=s, calibration_store=cal, queue=q, now=_NOW + 1)
+        rearmed = s.active_intent("p1")
+        assert rearmed is not None
+        self.assertEqual(rearmed["status"], "pending")
+        self.assertEqual(rearmed["target_head"], h2)
+        self.assertIsNone(rearmed["calibration_result_ref"])                   # stale H1 ref cleared
+        # the H2 worker converges (H2 set = b1 + appended dwin + g1 -> catch both bad, pass good).
+        outs = []
+        for i in range(4):
+            o = _run(cal, s, q, GoldenScriptedDetector([_FAIL] * 3 + [_FAIL] * 3 + [_PASS] * 3),
+                     clock=(lambda v=_NOW + 2 + i: v))
+            outs.append(o)
+            self._assert_invariants(cal, s)
+            if o is WorkerOutcome.SATISFIED:
+                break
+        self.assertIn(WorkerOutcome.SATISFIED, outs)                          # converged at H2 (no lost-satisfy)
+        current = s._conn().execute("SELECT calibration_result_ref, target_head FROM refresh_intent "
+                                    "WHERE policy_id='p1' AND status='satisfied'").fetchone()
+        self.assertEqual(current["target_head"], h2)
+        self.assertNotEqual(current["calibration_result_ref"], h1_ref)        # current candidate is H2, not H1
+        self.assertIsNotNone(s.pass_binding(h1_ref, "p1", h1))                # H1 pass PRESERVED as historical
         self._assert_invariants(cal, s)
 
 

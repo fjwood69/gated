@@ -180,9 +180,15 @@ def run_one(
     now = clock()
 
     # RECHECK the LIVE head before satisfaction: if the set drifted DURING calibration, the sealed head is
-    # stale — don't record a pass we already know is superseded; the intent is still active, so RETRY (the
-    # relay re-enqueues at the new head). This external read is an OPTIMISATION, not the authority — the
-    # satisfy triple-CAS on the intent is what actually fences a wrong-head pass.
+    # stale — don't record a pass we already know is superseded; the intent is still active, so RETRY.
+    # SCOPE (board): this external read only SHRINKS the irreducible cross-DB window; it is NOT the authority.
+    # The intent triple-CAS fences POLICYSTORE target movement (an intent advance/supersede/terminalize — a
+    # same-store race); it does NOT fence an UNRELAYED cross-DB oracle advance (the set moved to H2 but the
+    # relay has not yet advanced the intent off H1). In THAT window an H1 pass can still satisfy at H1 — which
+    # is SAFE not because the CAS prevented it but because RECONCILIATION supersedes it: relay_intents sees
+    # satisfied@H1 vs live-head H2 and reactivate_satisfied re-arms the intent at H2 (clearing the stale H1
+    # ref), so the H1 pass becomes historical-not-current. CAS = same-store fence; reconciliation = cross-DB
+    # convergence. Complementary, not the same job.
     if calibration_store.set_head(set_id) != sealed.oracle_head:
         return _retry()
 
@@ -212,8 +218,10 @@ def run_one(
             calibration_result_ref=ref, pinned_set_version=sealed.oracle_head, detector_identity=subject,
             identity_contract_version=icv, set_id=set_id)
         if outcome is IntentSatisfyOutcome.STALE:
-            # a concurrent advance moved the fence between renew and the CAS — the CAS is the authority, no
-            # wrong pass was recorded; complete the (now-stale) job, no work.
+            # a concurrent POLICYSTORE advance moved the intent fence between renew and the CAS — the CAS
+            # fences that same-store movement, so no wrong-fence pass is recorded; complete the now-obsolete
+            # job, no work. (An UNRELAYED cross-DB oracle advance is NOT caught here — it satisfies at the
+            # sealed head and is repaired by reconciliation; see the live-head comment above.)
             return _complete_no_work(WorkerOutcome.STALE)
         return _complete_no_work(WorkerOutcome.SATISFIED)  # SATISFIED or idempotent ALREADY_SATISFIED
 

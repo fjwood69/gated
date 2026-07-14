@@ -216,6 +216,7 @@ __all__ = [
     "WitnessInconsistencyError",
     "PreparedCandidate",
     "CandidateMeasurement",
+    "classify_measurement",
     "prepare_candidate",
     "produce_candidate_measurement",
 ]
