@@ -31,6 +31,7 @@ import json
 import sqlite3
 import threading
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -38,6 +39,18 @@ from core.chain import GENESIS_HASH, chain_hash, content_digest
 from gate.attestation import IDENTITY_CONTRACT_VERSION
 from gate.authority import GovernanceApproval
 from gate.policy_state import PolicyState, is_legal_transition, is_weakening
+
+
+class IntentSatisfyOutcome(Enum):
+    """3.5 CP4 Slice C: the result of ``satisfy_intent_with_pass`` — the UNIFIED atomic completion of a
+    re-calibration intent + its candidate pass. ``SATISFIED`` = the active intent at the given fence was
+    terminalized and the pass recorded. ``ALREADY_SATISFIED`` = the intent at the fence is already satisfied
+    under the SAME ref (an idempotent crash-redelivery). ``STALE`` = no active row at the fence (it advanced
+    or was superseded) — no mutation. A conflicting pass under the ref raises (never a silent outcome)."""
+
+    SATISFIED = "satisfied"
+    ALREADY_SATISFIED = "already_satisfied"
+    STALE = "stale"
 
 
 class PrivilegedOperationError(PermissionError):
@@ -181,6 +194,9 @@ CREATE TABLE IF NOT EXISTS refresh_intent (
     expected_guard_policy_digest TEXT NOT NULL,  -- the backend-guard policy digest the worker verifies boot-injected guard against
     identity_contract_version INTEGER NOT NULL,  -- routing: the ICV the candidate must compose under
     churn_count            INTEGER NOT NULL DEFAULT 0,  -- cumulative per policy; bumped only on a DISTINCT target_head advance
+    calibration_result_ref TEXT,             -- 3.5 CP4 Slice C: the candidate pass ref, stored ATOMICALLY with
+                                             -- the satisfied transition (satisfy_intent_with_pass) so a satisfied
+                                             -- intent durably identifies its pass — closes the orphan-record window
     status                 TEXT NOT NULL    -- pending|dispatched|satisfied|superseded|failed_detector|failed_churn
         CHECK (status IN ('pending','dispatched','satisfied','superseded','failed_detector','failed_churn')),
     created_at             REAL NOT NULL,
@@ -578,6 +594,143 @@ class PolicyStore:
             )
             return "advanced"
 
+    def satisfy_intent_with_pass(
+        self,
+        policy_id: str,
+        *,
+        policy_generation: str,
+        target_revision: int,
+        target_head: str,
+        calibration_result_ref: str,
+        pinned_set_version: str,
+        detector_identity: str,
+        identity_contract_version: int,
+        set_id: str = "default",
+    ) -> IntentSatisfyOutcome:
+        """3.5 CP4 Slice C (board UNIFY): the ATOMIC completion of an intent + its candidate pass, in ONE
+        ``BEGIN IMMEDIATE`` transaction — validate the active intent's full (policy_generation,
+        target_revision, target_head) triple, insert/verify the idempotent ``calibration_pass``, store the
+        ref on the intent, and terminalize the intent to ``satisfied``; all-or-nothing. This is the SINGLE
+        completion path for BOTH the synchronous enable flow and the async worker: ``satisfied`` and
+        ``has ref`` become one durable fact, so a lease-lost/re-leased worker can never orphan a pass and a
+        record-then-mark ordering hole cannot exist.
+
+        Returns ``SATISFIED`` (the active intent at this fence was terminalized), ``ALREADY_SATISFIED`` (the
+        intent at this fence is already satisfied under the SAME ref — an idempotent crash-redelivery), or
+        ``STALE`` (no active row at this fence — it advanced/superseded; no mutation). A CONFLICTING pass
+        under the ref, or a satisfied intent bound to a DIFFERENT ref, raises ``PrivilegedOperationError``
+        with NO mutation (rolled back)."""
+        with self._lock:
+            conn = self._conn()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT status, calibration_result_ref FROM refresh_intent "
+                    "WHERE policy_id=? AND policy_generation=? AND target_revision=? AND target_head=? "
+                    "ORDER BY seq DESC LIMIT 1",
+                    (policy_id, policy_generation, target_revision, target_head),
+                ).fetchone()
+                if row is None:
+                    conn.execute("COMMIT")
+                    return IntentSatisfyOutcome.STALE
+                status = str(row["status"])
+                if status == "satisfied":
+                    if str(row["calibration_result_ref"] or "") == calibration_result_ref:
+                        conn.execute("COMMIT")
+                        return IntentSatisfyOutcome.ALREADY_SATISFIED
+                    raise PrivilegedOperationError(
+                        f"intent for {policy_id} at this fence is already satisfied under a DIFFERENT "
+                        f"calibration_result_ref — refusing to rebind (a satisfied intent binds one pass)")
+                if status not in ("pending", "dispatched"):
+                    conn.execute("COMMIT")  # superseded / failed_* — not satisfiable at this fence
+                    return IntentSatisfyOutcome.STALE
+                # active: record the idempotent pass (a conflicting ref raises -> rolled back below), then
+                # terminalize under the SAME triple CAS. A 0-row UPDATE means the fence moved between the read
+                # and the write (a concurrent advance/supersede) -> STALE, rolled back.
+                self._record_calibration_pass_unlocked(
+                    calibration_result_ref, policy_id=policy_id, pinned_set_version=pinned_set_version,
+                    detector_identity=detector_identity,
+                    identity_contract_version=identity_contract_version, set_id=set_id)
+                cur = conn.execute(
+                    "UPDATE refresh_intent SET status='satisfied', calibration_result_ref=?, updated_at=? "
+                    "WHERE policy_id=? AND status IN ('pending','dispatched') AND policy_generation=? "
+                    "AND target_revision=? AND target_head=?",
+                    (calibration_result_ref, self._clock(), policy_id, policy_generation, target_revision,
+                     target_head),
+                )
+                if int(cur.rowcount or 0) == 0:
+                    conn.execute("ROLLBACK")
+                    return IntentSatisfyOutcome.STALE
+                conn.execute("COMMIT")
+                return IntentSatisfyOutcome.SATISFIED
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def reactivate_failed_detector(
+        self,
+        policy_id: str,
+        *,
+        expect_policy_generation: str,
+        expect_target_revision: int,
+        expect_target_head: str,
+        new_target_head: str,
+        churn_bound: int,
+    ) -> str:
+        """3.5 CP4 Slice C (board): a DISTINCT-head reactivation of a ``failed_detector`` intent. A
+        deterministic detector FAILURE is terminal FOR THAT HEAD — a same-head redispatch would resurrect the
+        same failure (which is why ``redispatch_intent`` was rejected). But a NEW, distinct oracle head is a
+        fresh measurement basis: this is the ONLY way ``failed_detector`` re-activates. Triple-CAS on
+        ``(policy_generation, target_revision, target_head)`` with ``status='failed_detector'``;
+        ``new_target_head`` MUST be distinct (else ``ValueError``). Churn-bounded exactly as ``advance_intent``
+        (exceeding the bound -> ``failed_churn``). On success the row goes back to ``status='pending'`` at the
+        new head with ``target_revision`` + ``churn_count`` incremented. Returns
+        ``'reactivated' | 'no_op' | 'failed_churn'``. ``failed_churn`` is NEVER reactivated here (human-only)."""
+        if new_target_head == expect_target_head:
+            raise ValueError(
+                "reactivate_failed_detector requires a DISTINCT new_target_head — a same-head reactivation "
+                "would resurrect the same deterministic failure")
+        if type(churn_bound) is not int:
+            raise ValueError("churn_bound must be an int")
+        with self._lock:
+            row = self._conn().execute(
+                "SELECT churn_count FROM refresh_intent WHERE policy_id=? AND status='failed_detector' "
+                "AND policy_generation=? AND target_revision=? AND target_head=?",
+                (policy_id, expect_policy_generation, expect_target_revision, expect_target_head),
+            ).fetchone()
+            if row is None:
+                return "no_op"  # the fence no longer matches a failed_detector row
+            now = self._clock()
+            if int(row["churn_count"]) + 1 > churn_bound:
+                self._conn().execute(
+                    "UPDATE refresh_intent SET status='failed_churn', updated_at=? "
+                    "WHERE policy_id=? AND status='failed_detector' AND policy_generation=? "
+                    "AND target_revision=? AND target_head=?",
+                    (now, policy_id, expect_policy_generation, expect_target_revision, expect_target_head),
+                )
+                return "failed_churn"
+            self._conn().execute(
+                "UPDATE refresh_intent SET status='pending', target_head=?, "
+                "target_revision=target_revision+1, churn_count=churn_count+1, updated_at=? "
+                "WHERE policy_id=? AND status='failed_detector' AND policy_generation=? "
+                "AND target_revision=? AND target_head=?",
+                (new_target_head, now, policy_id, expect_policy_generation, expect_target_revision,
+                 expect_target_head),
+            )
+            return "reactivated"
+
+    def intents_to_reconcile(self) -> list[sqlite3.Row]:
+        """3.5 CP4 Slice C: the intents the durable reconciler considers each pass — ``pending``,
+        ``dispatched``, OR ``failed_detector`` (a distinct new head can reactivate the last). Terminal
+        ``satisfied`` / ``superseded`` are done; ``failed_churn`` is EXCLUDED (a human ``clear_failed_churn``
+        is required first). Returns full rows (fences + routing + ``seq``) so the reconciler can compare each
+        against the live ``set_head`` and enqueue a fenced candidate job (or advance/reactivate on drift)."""
+        with self._lock:
+            return self._conn().execute(
+                "SELECT * FROM refresh_intent "
+                "WHERE status IN ('pending','dispatched','failed_detector') ORDER BY seq ASC"
+            ).fetchall()
+
     def _has_failed_churn_unlocked(self, policy_id: str) -> bool:
         return self._conn().execute(
             "SELECT 1 FROM refresh_intent WHERE policy_id=? AND status='failed_churn' LIMIT 1",
@@ -764,27 +917,46 @@ class PolicyStore:
         a CONFLICTING metadata re-write under the same ref is REJECTED (S3 ckpt4-fix2b — not silently
         retained), so a ref cannot be rebound to a different (policy/set/version/detector/ICV)."""
         with self._lock:
-            existing = self._conn().execute(
-                "SELECT policy_id, set_id, pinned_set_version, detector_identity, "
-                "identity_contract_version FROM calibration_pass WHERE calibration_result_ref=? LIMIT 1",
-                (calibration_result_ref,),
-            ).fetchone()
-            if existing is not None:
-                if (str(existing["policy_id"]), str(existing["set_id"]), str(existing["pinned_set_version"]),
-                        str(existing["detector_identity"]), existing["identity_contract_version"]) != (
-                        policy_id, set_id, pinned_set_version, detector_identity,
-                        identity_contract_version):
-                    raise PrivilegedOperationError(
-                        f"a DIFFERENT calibration_pass already exists for ref {calibration_result_ref!r} — "
-                        "refusing to silently retain conflicting metadata (a ref binds one immutable pass)")
-                return  # identical row -> idempotent no-op
-            self._conn().execute(
-                "INSERT INTO calibration_pass "
-                "(calibration_result_ref, policy_id, set_id, pinned_set_version, detector_identity,"
-                " identity_contract_version, passed_at) VALUES (?,?,?,?,?,?,?)",
-                (calibration_result_ref, policy_id, set_id, pinned_set_version, detector_identity,
-                 identity_contract_version, self._clock()),
-            )
+            self._record_calibration_pass_unlocked(
+                calibration_result_ref, policy_id=policy_id, pinned_set_version=pinned_set_version,
+                detector_identity=detector_identity, identity_contract_version=identity_contract_version,
+                set_id=set_id)
+
+    def _record_calibration_pass_unlocked(
+        self,
+        calibration_result_ref: str,
+        *,
+        policy_id: str,
+        pinned_set_version: str,
+        detector_identity: str,
+        identity_contract_version: int,
+        set_id: str,
+    ) -> None:
+        """Insert-or-verify the idempotent ``calibration_pass`` row. The caller HOLDS ``self._lock`` (and may
+        be mid-transaction — ``satisfy_intent_with_pass`` calls this inside its ``BEGIN IMMEDIATE`` so the
+        pass insert and the intent satisfy commit or roll back together). Same idempotency + conflict rule as
+        the public ``record_calibration_pass``."""
+        existing = self._conn().execute(
+            "SELECT policy_id, set_id, pinned_set_version, detector_identity, "
+            "identity_contract_version FROM calibration_pass WHERE calibration_result_ref=? LIMIT 1",
+            (calibration_result_ref,),
+        ).fetchone()
+        if existing is not None:
+            if (str(existing["policy_id"]), str(existing["set_id"]), str(existing["pinned_set_version"]),
+                    str(existing["detector_identity"]), existing["identity_contract_version"]) != (
+                    policy_id, set_id, pinned_set_version, detector_identity,
+                    identity_contract_version):
+                raise PrivilegedOperationError(
+                    f"a DIFFERENT calibration_pass already exists for ref {calibration_result_ref!r} — "
+                    "refusing to silently retain conflicting metadata (a ref binds one immutable pass)")
+            return  # identical row -> idempotent no-op
+        self._conn().execute(
+            "INSERT INTO calibration_pass "
+            "(calibration_result_ref, policy_id, set_id, pinned_set_version, detector_identity,"
+            " identity_contract_version, passed_at) VALUES (?,?,?,?,?,?,?)",
+            (calibration_result_ref, policy_id, set_id, pinned_set_version, detector_identity,
+             identity_contract_version, self._clock()),
+        )
 
     def current_attestation(self, policy_id: str) -> tuple[str, str, str] | None:
         """The ``(set_id, oracle_head, detector_identity)`` the policy's CURRENT calibration was

@@ -28,6 +28,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+from core.chain import content_digest
+
 
 class JobStatus(str, Enum):
     PENDING = "pending"
@@ -36,10 +38,30 @@ class JobStatus(str, Enum):
     DEAD_LETTER = "dead_letter"
 
 
+def intent_candidate_job_id(
+    *, intent_seq: int, policy_generation: str, target_revision: int, target_head: str,
+) -> str:
+    """3.5 CP4 Slice C: the deterministic dedup key for an ``'intent'`` candidate job. Keyed by the intent
+    identity (``intent_seq``) PLUS its full split-generation fence (``policy_generation``, ``target_revision``,
+    ``target_head``) — so a re-relay of the SAME intent-target collapses (idempotent), while an advance
+    (revision++, new head) yields a NEW job and leaves the old one stale. ``kind`` is domain-separated into
+    the digest so an intent job can never collide with an outbox job."""
+    return content_digest({
+        "kind": "intent", "intent_seq": intent_seq, "policy_generation": policy_generation,
+        "target_revision": target_revision, "target_head": target_head,
+    })
+
+
 @dataclass(frozen=True)
 class RecalJob:
     """A re-calibration work item — everything the runner + restore controller need, plus lease/retry
-    bookkeeping. ``tier_generation`` is what the TRIGGER observed; the restore CAS rechecks currency."""
+    bookkeeping. ``tier_generation`` is what the TRIGGER observed; the restore CAS rechecks currency.
+
+    3.5 CP4 Slice C: ``kind`` distinguishes the source relay — ``'outbox'`` (an ENABLED policy, fixture-append
+    trigger) from ``'intent'`` (a CALIBRATING policy's durable refresh_intent). For an ``'intent'`` job the
+    fence fields (``intent_seq``, ``policy_generation``, ``target_revision``, with ``oracle_head`` = the
+    intent's ``target_head``) are the split-generation the worker PREFLIGHTS against the intent's CURRENT
+    fence and the completion CAS commits under; they are None for an ``'outbox'`` job."""
 
     job_id: str
     policy_id: str
@@ -52,6 +74,10 @@ class RecalJob:
     enqueued_at: float
     lease_token: str | None = None
     locked_until: float | None = None
+    kind: str = "outbox"
+    intent_seq: int | None = None
+    policy_generation: str | None = None
+    target_revision: int | None = None
 
 
 _SCHEMA = """
@@ -67,18 +93,29 @@ CREATE TABLE IF NOT EXISTS recal_queue (
     lease_token       TEXT,
     locked_until      REAL,
     enqueued_at       REAL NOT NULL,
-    updated_at        REAL NOT NULL
+    updated_at        REAL NOT NULL,
+    kind              TEXT NOT NULL DEFAULT 'outbox',   -- 3.5 CP4 Slice C: 'outbox' | 'intent'
+    intent_seq        INTEGER,          -- the refresh_intent.seq (intent identity) for an 'intent' job
+    policy_generation TEXT,             -- the intent fence the worker preflights + the completion CAS commits under
+    target_revision   INTEGER           -- the monotonic advance counter fenced by the completion CAS
 );
 """
 
 
 def _row_to_job(row: sqlite3.Row) -> RecalJob:
+    keys = row.keys()
     return RecalJob(
         job_id=row["job_id"], policy_id=row["policy_id"], set_id=row["set_id"],
         oracle_head=row["oracle_head"], detector_identity=row["detector_identity"],
         tier_generation=row["tier_generation"], status=JobStatus(row["status"]),
         attempts=int(row["attempts"]), enqueued_at=float(row["enqueued_at"]),
         lease_token=row["lease_token"], locked_until=row["locked_until"],
+        kind=str(row["kind"]) if "kind" in keys and row["kind"] is not None else "outbox",
+        intent_seq=int(row["intent_seq"]) if "intent_seq" in keys and row["intent_seq"] is not None else None,
+        policy_generation=(row["policy_generation"]
+                           if "policy_generation" in keys and row["policy_generation"] is not None else None),
+        target_revision=(int(row["target_revision"])
+                         if "target_revision" in keys and row["target_revision"] is not None else None),
     )
 
 
@@ -108,18 +145,23 @@ class RecalQueue:
     def enqueue(
         self, *, job_id: str, policy_id: str, set_id: str, oracle_head: str,
         detector_identity: str, tier_generation: str, now: float | None = None,
+        kind: str = "outbox", intent_seq: int | None = None,
+        policy_generation: str | None = None, target_revision: int | None = None,
     ) -> bool:
         """Enqueue a re-calibration (idempotent by ``job_id`` — the same measurement never runs twice;
         a job already present, incl. one dead-lettered, is left as-is). Returns True if a new row was
-        inserted, False if it was a duplicate."""
+        inserted, False if it was a duplicate. For an ``'intent'`` job (CP4 Slice C) the fence fields
+        (``intent_seq``, ``policy_generation``, ``target_revision``; ``oracle_head`` = the intent target_head)
+        travel with the job so the worker preflights + the completion CAS commits under the SAME split-gen."""
         ts = self._clock() if now is None else now
         with self._lock:
             cur = self._conn().execute(
                 "INSERT OR IGNORE INTO recal_queue (job_id, policy_id, set_id, oracle_head,"
-                " detector_identity, tier_generation, status, attempts, enqueued_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " detector_identity, tier_generation, status, attempts, enqueued_at, updated_at,"
+                " kind, intent_seq, policy_generation, target_revision)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, policy_id, set_id, oracle_head, detector_identity, tier_generation,
-                 JobStatus.PENDING.value, 0, ts, ts),
+                 JobStatus.PENDING.value, 0, ts, ts, kind, intent_seq, policy_generation, target_revision),
             )
             return bool(cur.rowcount)
 
@@ -163,6 +205,25 @@ class RecalQueue:
                 "UPDATE recal_queue SET status=?, lease_token=NULL, locked_until=NULL, updated_at=?"
                 " WHERE job_id=? AND lease_token=? AND status=?",
                 (JobStatus.DONE.value, ts, job_id, lease_token, JobStatus.PROCESSING.value),
+            )
+            return bool(cur.rowcount)
+
+    def renew(
+        self, job_id: str, *, lease_token: str, visibility_timeout: float, now: float | None = None,
+    ) -> bool:
+        """3.5 CP4 Slice C: extend a held lease by ``visibility_timeout`` — TOKEN-CAS: succeeds ONLY if
+        ``lease_token`` still holds the lease, the job is PROCESSING, AND the lease has NOT already expired
+        (``locked_until >= now``). A worker whose lease already lapsed (the watchdog could have re-queued or
+        re-leased it to another worker) CANNOT renew — it must abort and perform NO durable mutation. This is
+        the heartbeat that lets a long calibration outlive the initial visibility timeout without another
+        worker stealing the job; a failed renewal is the signal that exclusivity was lost. Returns True iff
+        the lease was extended."""
+        ts = self._clock() if now is None else now
+        with self._lock:
+            cur = self._conn().execute(
+                "UPDATE recal_queue SET locked_until=?, updated_at=? "
+                "WHERE job_id=? AND lease_token=? AND status=? AND locked_until >= ?",
+                (ts + visibility_timeout, ts, job_id, lease_token, JobStatus.PROCESSING.value, ts),
             )
             return bool(cur.rowcount)
 

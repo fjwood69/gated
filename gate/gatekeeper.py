@@ -50,7 +50,7 @@ from gate.candidate_measurement import (
     produce_candidate_measurement,
 )
 from gate.policy_state import Disposition, PolicyState, disposition_for
-from gate.policy_store import ChainIntegrityError, PolicyStore
+from gate.policy_store import ChainIntegrityError, IntentSatisfyOutcome, PolicyStore
 from gate.preflight import ConfigurationError
 from gate.snapshot import CalibrationSnapshot, SnapshotError, attested_record, verify_snapshot
 
@@ -351,13 +351,17 @@ def run_calibration(
             passed=result.passed, n_bad=len(result.outcomes),
             fixture_ids=[o.fixture_id for o in result.outcomes],
         )
-        store.record_calibration_pass(
-            ref, policy_id=policy_id, pinned_set_version=sealed.oracle_head,
+        # UNIFIED completion (CP4 Slice C, board): the pass record AND the intent satisfy are ONE atomic
+        # store transaction (satisfy_intent_with_pass) — the SAME primitive the async worker uses — so no
+        # record-then-mark ordering hole can orphan a pass. No relay advances the intent during a synchronous
+        # run, so STALE (the completion CAS missed) means an unexpected concurrent supersede/advance →
+        # fail-closed. SATISFIED (or the idempotent ALREADY_SATISFIED) is the success path.
+        outcome = store.satisfy_intent_with_pass(
+            policy_id, calibration_result_ref=ref, pinned_set_version=sealed.oracle_head,
             detector_identity=subject, identity_contract_version=IDENTITY_CONTRACT_VERSION, set_id=set_id,
+            **_fence,  # type: ignore[arg-type]
         )
-        # sync resolution: PASS → completion CAS. No relay advances the intent during a synchronous run, so
-        # the CAS MUST succeed; a miss means the intent was superseded/advanced unexpectedly → fail-closed.
-        if not store.mark_intent_satisfied(policy_id, **_fence):  # type: ignore[arg-type]
+        if outcome is IntentSatisfyOutcome.STALE:
             raise ConfigurationError(
                 f"sync completion CAS missed for {policy_id} — the intent was superseded/advanced during a "
                 "synchronous calibration (fail-closed; unexpected concurrency)")

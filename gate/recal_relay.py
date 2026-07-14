@@ -19,7 +19,7 @@ from typing import Callable
 
 from gate.calibration_store import CalibrationStore
 from gate.policy_store import PolicyStore
-from gate.recal_queue import RecalQueue
+from gate.recal_queue import RecalQueue, intent_candidate_job_id
 from gate.recalibration import deterministic_job_id
 
 
@@ -61,4 +61,62 @@ def relay_outbox(
     return enqueued
 
 
-__all__ = ["relay_outbox"]
+def relay_intents(
+    *,
+    policy_store: PolicyStore,
+    calibration_store: CalibrationStore,
+    queue: RecalQueue,
+    now: float,
+    churn_bound: int,
+) -> int:
+    """3.5 CP4 Slice C: the durable RECONCILER that connects a CALIBRATING policy's ``refresh_intent`` to the
+    queue — the intent-side counterpart to ``relay_outbox`` (which is ENABLED-only, so a CALIBRATING policy is
+    invisible to it). For every RECONCILABLE intent (pending / dispatched / failed_detector; ``failed_churn``
+    is excluded — human recovery), compare its ``target_head`` to the CURRENT ``set_head``:
+
+      * head UNCHANGED → enqueue a fenced ``'intent'`` candidate job (idempotent by the intent job-id).
+      * head DRIFTED (distinct) → advance the fence to the current head FIRST — ``advance_intent`` for an
+        active intent, ``reactivate_failed_detector`` for a failed_detector one (a distinct new head is the
+        ONLY way a deterministic detector failure retries) — then enqueue at the NEW head. A raced advance
+        (``no_op``) or an exhausted churn budget (``failed_churn``) enqueues nothing.
+
+    Returns the number of NEW jobs enqueued. Idempotent + fenced: a re-run enqueues nothing for an unchanged
+    intent (job-id dedup), and every head advance is a triple-CAS (no double-increment, no stale overwrite).
+    The worker PREFLIGHTS the job's ``(policy_generation, target_revision, target_head)`` against the intent's
+    CURRENT fence before doing work, so a job enqueued at a head the intent has since advanced past is stale."""
+    enqueued = 0
+    for intent in policy_store.intents_to_reconcile():
+        policy_id = str(intent["policy_id"])
+        set_id = str(intent["set_id"])
+        pg, tr, th = str(intent["policy_generation"]), int(intent["target_revision"]), str(intent["target_head"])
+        current_head = calibration_store.set_head(set_id)
+        if current_head != th:
+            # DISTINCT-head drift: advance the fence to reality FIRST, then enqueue at the new head.
+            if str(intent["status"]) == "failed_detector":
+                result = policy_store.reactivate_failed_detector(
+                    policy_id, expect_policy_generation=pg, expect_target_revision=tr,
+                    expect_target_head=th, new_target_head=current_head, churn_bound=churn_bound)
+                advanced = result == "reactivated"
+            else:
+                result = policy_store.advance_intent(
+                    policy_id, expect_policy_generation=pg, expect_target_revision=tr,
+                    expect_target_head=th, new_target_head=current_head, churn_bound=churn_bound)
+                advanced = result == "advanced"
+            if not advanced:
+                continue  # no_op (a concurrent advance already landed) or failed_churn — nothing to enqueue
+            fresh = policy_store.active_intent(policy_id)
+            if fresh is None:
+                continue  # superseded between the advance and the re-read — fail-closed, skip
+            pg, tr, th = str(fresh["policy_generation"]), int(fresh["target_revision"]), str(fresh["target_head"])
+        job_id = intent_candidate_job_id(
+            intent_seq=int(intent["seq"]), policy_generation=pg, target_revision=tr, target_head=th)
+        if queue.enqueue(
+            job_id=job_id, policy_id=policy_id, set_id=set_id, oracle_head=th,
+            detector_identity=str(intent["detector_id"]), tier_generation=pg, now=now,
+            kind="intent", intent_seq=int(intent["seq"]), policy_generation=pg, target_revision=tr,
+        ):
+            enqueued += 1
+    return enqueued
+
+
+__all__ = ["relay_outbox", "relay_intents"]
