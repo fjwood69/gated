@@ -110,6 +110,16 @@ class ClosedRuntimeContractTests(unittest.TestCase):
         self.assertEqual(sb.runtime, "podman")
         guard(sb)  # the paired reference guard accepts the token-stamped, runtime-pinned sandbox
 
+    def test_guard_policy_digest_is_a_stable_content_address(self) -> None:
+        # the digest the runner reads OFF the guard object is derived from the guard's IDENTITY (policy_id),
+        # NOT a re-hash of mutable runtime state — so two DISTINCT instances of the same guard policy produce
+        # the SAME digest, and admission (which compares digests) never fails spuriously across instances.
+        from gate.backends import _TrustedBackendGuardPolicy
+        g1, g2 = _TrustedBackendGuardPolicy(), _TrustedBackendGuardPolicy()
+        self.assertIsNot(g1, g2)                              # distinct instances...
+        self.assertEqual(g1.policy_digest, g2.policy_digest)  # ...same stable content-address
+        self.assertTrue(g1.policy_digest)
+
 
 class _AlwaysPass:
     fixtures = Fixtures()
