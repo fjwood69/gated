@@ -48,6 +48,11 @@ class Reason(Enum):
     # DRIFTED from the accepted one. Refuse to run it (block) — never enforce an unauthorized/rolled-back
     # detector at the merge boundary.
     DETECTOR_UNRESOLVED = "enforced detector unregistered or drifted from accepted — fail-closed"  # ERROR
+    # run admission (3.5 S3-completion) — the engine run could not be admitted to publication under the
+    # authorized identity: its measured RuntimeSubject drifted from the dispatched target, a measured
+    # coordinate was absent (unattestable run), or the plan's identity contract / authorized subject did not
+    # hold. The SPECIFIC layer is on the gate-side ``RunAdmissionRefusal``; the merge blocks either way.
+    RUN_UNADMITTED = "run not admissible under the authorized identity — fail-closed"  # ERROR
 
 
 @dataclass(frozen=True)

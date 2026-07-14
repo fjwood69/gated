@@ -32,6 +32,8 @@ _REASON_PHRASE = {
     Reason.ARTIFACT_INTEGRITY_MISMATCH: "the mounted tree did NOT match its verified hash",
     Reason.IMAGE_UNRESOLVED: "the sandbox image digest could not be resolved before run",
     Reason.DETECTOR_UNRESOLVED: "the enforced detector is unregistered or drifted from the accepted one",
+    Reason.RUN_UNADMITTED: "the run could not be admitted under the authorized identity — measured "
+                           "subject drift, an absent coordinate, or a stale authorization",
 }
 
 
