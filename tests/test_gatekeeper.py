@@ -95,8 +95,10 @@ def _enable(store: PolicyStore, pid: str, *, detector: str = "det-1", set_id: st
             head: str = "fx-head") -> None:
     ref = f"cal-{pid}"  # unique per policy so current_attestation resolves the right pass
     store.transition(pid, PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op=f"{pid}-1"))
-    store.transition(pid, PolicyState.CALIBRATING, approval=_appr("gov1", op=f"{pid}-2"),
-                     pinned_set_version=head)
+    store.enter_calibrating(pid, approval=_appr("gov1", op=f"{pid}-2"), set_id=set_id,
+                            pinned_set_version=head, detector_id=detector, expected_profile_digest="pd",
+                            expected_trust_policy_digest="tp", expected_guard_policy_digest="gp",
+                            identity_contract_version=1)
     store.record_calibration_pass(ref, policy_id=pid, pinned_set_version=head,
                                   detector_identity=detector, set_id=set_id, identity_contract_version=1)
     store.transition(pid, PolicyState.ENABLED, approval=_appr("gov1", op=f"{pid}-3"),

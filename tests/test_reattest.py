@@ -38,8 +38,10 @@ def _enable(s: PolicyStore, pid: str = "p1", *, det: str = "det-1", head: str = 
             set_id: str = "X", ref: str | None = None) -> str:
     ref = ref or f"cal-{pid}-{head}"
     s.transition(pid, PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op=f"{pid}-{head}-1"))
-    s.transition(pid, PolicyState.CALIBRATING, approval=_appr("g1", op=f"{pid}-{head}-2"),
-                 pinned_set_version=head)
+    s.enter_calibrating(pid, approval=_appr("g1", op=f"{pid}-{head}-2"), set_id=set_id,
+                        pinned_set_version=head, detector_id=det, expected_profile_digest="pd",
+                        expected_trust_policy_digest="tp", expected_guard_policy_digest="gp",
+                        identity_contract_version=1)
     s.record_calibration_pass(ref, policy_id=pid, pinned_set_version=head, detector_identity=det,
                               set_id=set_id, identity_contract_version=1)
     s.transition(pid, PolicyState.ENABLED, approval=_appr("g1", op=f"{pid}-{head}-3"),

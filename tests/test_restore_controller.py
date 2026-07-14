@@ -93,7 +93,9 @@ def _cal_store() -> CalibrationStore:
 def _policy_store_enabled(head: str) -> PolicyStore:
     s = PolicyStore(Path(tempfile.mkdtemp(prefix="mv-rc-pol-")) / "t.db")
     s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="a"))
-    s.transition("p1", PolicyState.CALIBRATING, approval=_appr("g1", op="b"), pinned_set_version=head)
+    s.enter_calibrating("p1", approval=_appr("g1", op="b"), set_id="X", pinned_set_version=head,
+                        detector_id=_DET, expected_profile_digest="pd", expected_trust_policy_digest="tp",
+                        expected_guard_policy_digest="gp", identity_contract_version=1)
     s.record_calibration_pass("cal-0", policy_id="p1", pinned_set_version=head,
                               detector_identity=_DET, set_id="X", identity_contract_version=1)
     s.transition("p1", PolicyState.ENABLED, approval=_appr("g1", op="c"),
@@ -249,8 +251,10 @@ class RestoreControllerTests(unittest.TestCase):
         s = _policy_store_enabled(c.set_head("X"))
         # a SECOND enabled policy -> its enable record is now the global chain head, not p1's.
         s.transition("p2", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="p2a"))
-        s.transition("p2", PolicyState.CALIBRATING, approval=_appr("g1", op="p2b"),
-                     pinned_set_version=c.set_head("X"))
+        s.enter_calibrating("p2", approval=_appr("g1", op="p2b"), set_id="X",
+                            pinned_set_version=c.set_head("X"), detector_id=_DET,
+                            expected_profile_digest="pd", expected_trust_policy_digest="tp",
+                            expected_guard_policy_digest="gp", identity_contract_version=1)
         s.record_calibration_pass("cal-p2", policy_id="p2", pinned_set_version=c.set_head("X"),
                                   detector_identity=_DET, set_id="X", identity_contract_version=1)
         s.transition("p2", PolicyState.ENABLED, approval=_appr("g1", op="p2c"),

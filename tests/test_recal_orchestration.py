@@ -108,7 +108,9 @@ _DET = _canonical_subject()
 def _pol(head: str) -> PolicyStore:
     s = PolicyStore(Path(tempfile.mkdtemp(prefix="mv-orch-pol-")) / "t.db")
     s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="a"))
-    s.transition("p1", PolicyState.CALIBRATING, approval=_appr("g1", op="b"), pinned_set_version=head)
+    s.enter_calibrating("p1", approval=_appr("g1", op="b"), set_id="X", pinned_set_version=head,
+                        detector_id=_DET, expected_profile_digest="pd", expected_trust_policy_digest="tp",
+                        expected_guard_policy_digest="gp", identity_contract_version=1)
     s.record_calibration_pass("cal-0", policy_id="p1", pinned_set_version=head,
                               detector_identity=_DET, set_id="X", identity_contract_version=1)
     s.transition("p1", PolicyState.ENABLED, approval=_appr("g1", op="c"),

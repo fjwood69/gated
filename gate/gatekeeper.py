@@ -40,6 +40,7 @@ from engine.calibration import (
     BundleResolver,
     CalibrationResult,
     DEFAULT_CALIBRATION_TRIALS,
+    ResolvedDetector,
     calibrate,
 )
 from engine.observation_trust import TrustPolicy
@@ -268,20 +269,33 @@ def run_calibration(
     MEASUREMENT-DERIVED subject — H(resolved_profile_digest, execution_identity) from the SAME calibration
     run, exactly as ``run_recalibration`` — so governance later chooses WHICH persisted pass to ratify but
     cannot define what code it ran."""
-    # 3.5 S3-completion CP4: enter CALIBRATING via the atomic enter_calibrating (tier transition + the
-    # re-calibration RECOVERY INTENT in one transaction), so a crash between the transition and the run
-    # cannot strand the policy (the ENABLED-only relay would never re-trigger it). The intent carries the
-    # ROUTING recipe (detector / trust / guard / set / head / ICV); the four-tuple is MEASURED by the run.
+    # 3.5 S3-completion CP4 correction 1: resolve the detector bundle ONCE, and pass THAT frozen bundle
+    # into calibrate() (a resolver returning the captured bundle) — the expected-profile digest and the
+    # calibration run share one frozen resolution, never a resolve-for-precheck-then-resolve-again.
+    bundle = resolve(detector_id)  # trusted registry: unregistered / drifted -> raises
+
+    def _frozen_resolve(_detector_id: str) -> ResolvedDetector:
+        return bundle
+
+    # enter CALIBRATING via the atomic enter_calibrating (tier transition + the re-calibration RECOVERY
+    # INTENT in one transaction), so a crash between the transition and the run cannot strand the policy
+    # (the ENABLED-only relay would never re-trigger it). The intent carries model-(b) ROUTING (detector
+    # registry name + expected profile/trust/guard digests the worker verifies boot objects against); the
+    # four-tuple is MEASURED by the run.
     store.enter_calibrating(
         policy_id, approval=approval, set_id=set_id, pinned_set_version=calibration_chain_head,
-        detector_id=detector_id, trust_policy_ref=trust_policy.policy_digest,
+        detector_id=detector_id, expected_profile_digest=bundle.profile_digest,
+        expected_trust_policy_digest=trust_policy.policy_digest,
         # the guard OBJECT's policy digest (read as the runner reads it — off the applied object); a guard
         # with no policy_digest yields "" and enter_calibrating fail-closes (an unroutable intent).
-        guard_policy_ref=getattr(backend_guard, "policy_digest", ""),
+        expected_guard_policy_digest=getattr(backend_guard, "policy_digest", ""),
         identity_contract_version=IDENTITY_CONTRACT_VERSION,
     )
-    # detector by NAME, resolved only through the trusted registry (never a caller-supplied object).
-    result = calibrate(make_sandbox, detector_id, resolve, calibration_set, budget,
+    # capture the intent's fence coordinates for the sync completion CAS (nothing advances it during the
+    # synchronous run — no relay is scanning; the coordinates are stable).
+    _intent = store.active_intent(policy_id)
+    # detector by NAME, resolved through the trusted registry ONCE (frozen bundle); never re-resolved.
+    result = calibrate(make_sandbox, detector_id, _frozen_resolve, calibration_set, budget,
                        trials=trials, backend_guard=backend_guard, trust_policy=trust_policy)
     breaking = (*result.fn_failures, *result.fp_failures, *result.flaky, *result.harness_errors)
     ref: str | None = None
@@ -297,13 +311,33 @@ def run_calibration(
                 "a PASSED calibration lacked one of the four runtime-subject coordinates "
                 "(resolved-profile / trust-policy / guard-policy / execution identity) — cannot derive the "
                 "measured subject; refusing to persist an un-attributable pass")
+        # correction 2: POST-run verify (defence-in-depth) — the run's MEASURED profile/trust/guard digests
+        # must equal the intent's EXPECTED digests. Near-tautological here (the same frozen objects ran under
+        # resolve-once), load-bearing for the async worker where boot objects could differ from expectations;
+        # fail-closed on any divergence during the run.
+        if _intent is not None and (rpd, tpd, gpd) != (
+            str(_intent["expected_profile_digest"]), str(_intent["expected_trust_policy_digest"]),
+            str(_intent["expected_guard_policy_digest"])):
+            raise ConfigurationError(
+                "post-run verify: the calibration's MEASURED profile/trust/guard digests do not match the "
+                "intent's EXPECTED digests — an applied policy object diverged during the run (fail-closed)")
         subject = calibrated_subject_identity(rpd, tpd, gpd, eid)
         ref = _result_ref(policy_id, calibration_chain_head, subject, result)
         store.record_calibration_pass(
             ref, policy_id=policy_id, pinned_set_version=calibration_chain_head,
             detector_identity=subject, identity_contract_version=IDENTITY_CONTRACT_VERSION, set_id=set_id,
         )
+        # sync resolution: PASS → the intent is SATISFIED (completion CAS under its captured fence
+        # coordinates). The policy STAYS CALIBRATING, awaiting human ratify_enable.
+        if _intent is not None:
+            store.mark_intent_satisfied(
+                policy_id, policy_generation=str(_intent["policy_generation"]),
+                target_revision=int(_intent["target_revision"]), target_head=str(_intent["target_head"]))
     else:
+        # sync resolution: deterministic FAIL → the intent is failed_detector (terminal, non-blocking) FIRST,
+        # then the policy is REJECTED (exits CALIBRATING; its atomic supersede finds the intent already
+        # terminal → no-op, preserving the failed_detector record).
+        store.mark_intent_failed_detector(policy_id)
         store.transition(
             policy_id, PolicyState.REJECTED, approval=approval,
             pinned_set_version=calibration_chain_head,

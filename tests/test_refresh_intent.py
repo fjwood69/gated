@@ -1,19 +1,19 @@
-"""tests/test_refresh_intent.py — 3.5 S3-completion CP4 Slice 1: the atomic CALIBRATING recovery intent.
-Run: python3 -m unittest discover -s tests
+"""tests/test_refresh_intent.py — 3.5 S3-completion CP4 combined Slice 1+A: the CALIBRATING recovery intent
+lifecycle. Run: python3 -m unittest discover -s tests
 
-``enter_calibrating`` is the path into CALIBRATING that atomically (one BEGIN IMMEDIATE) appends the tier
-transition AND creates the pending re-calibration recovery intent, so a CALIBRATING policy — invisible to
-the ENABLED-only relay — is never silently stranded. Properties pinned:
-  * the intent carries ROUTING inputs (detector / trust / guard / set / head / ICV), NOT a measured subject
-    (nothing is measured at CALIBRATING entry — a subject here would be declared-not-measured);
-  * ``target_generation`` is DERIVED from the appended record_hash (== the new policy head), not caller-supplied;
-  * the CALIBRATING tier row is byte-identical to a bare transition (routing is on the INTENT, and the tier
-    row's ``detector_identity`` — the MEASURED subject — stays NULL until ENABLED);
-  * degenerate routing inputs (empty string / bool-or-str / wrong ICV) are refused;
-  * an illegal entry writes NOTHING (neither tier row nor intent).
-
-The intent state machine / CRUD accessor / partial unique index / completion CAS are Slice A; this reads
-the table directly.
+``enter_calibrating`` is the SOLE path into CALIBRATING; it atomically (one BEGIN IMMEDIATE) appends the
+tier transition AND creates the pending re-calibration recovery intent, so a CALIBRATING policy — invisible
+to the ENABLED-only relay — is never silently stranded. Properties pinned:
+  * the intent carries model-(b) ROUTING (detector registry name + expected profile/trust/guard digests),
+    NOT a measured subject; ``policy_generation`` is DERIVED from the appended record_hash; the tier row is
+    byte-identical (routing on the intent, the tier row's measured-subject column stays NULL until ENABLED);
+  * SPLIT GENERATIONS: an advance is an in-place CAS on (policy_generation, target_revision, target_head) —
+    a stale/delayed advance no-ops (no double-increment, no stale overwrite); completion fences on the same
+    triple; churn increments only on a distinct advance;
+  * a transition OUT of CALIBRATING atomically supersedes the active intent IN THE SAME transaction;
+  * ``ActiveCalibrationIntentExists`` refuses a second active intent; ``failed_detector`` is non-blocking,
+    ``failed_churn`` blocks new autos until human recovery clears it;
+  * crash boundary (i): an intent-insert failure rolls BOTH the tier row and the intent back.
 """
 from __future__ import annotations
 
@@ -24,11 +24,16 @@ from pathlib import Path
 from gate.attestation import IDENTITY_CONTRACT_VERSION
 from gate.authority import GovernanceApproval
 from gate.policy_state import PolicyState
-from gate.policy_store import IllegalTransitionError, PolicyStore, PrivilegedOperationError
+from gate.policy_store import (
+    ActiveCalibrationIntentExists,
+    IllegalTransitionError,
+    PolicyStore,
+    PrivilegedOperationError,
+)
 
 _ROUTING = dict(set_id="setA", pinned_set_version="oracle-head-1", detector_id="retry",
-                trust_policy_ref="tp-digest", guard_policy_ref="gp-digest",
-                identity_contract_version=IDENTITY_CONTRACT_VERSION)
+                expected_profile_digest="pd", expected_trust_policy_digest="tp",
+                expected_guard_policy_digest="gp", identity_contract_version=IDENTITY_CONTRACT_VERSION)
 
 
 def _appr(*principals: str, op: str) -> GovernanceApproval:
@@ -43,45 +48,45 @@ def _pending(s: PolicyStore, pid: str = "p1") -> None:
     s.transition(pid, PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op=f"{pid}-1"))
 
 
-def _intent(s: PolicyStore, pid: str = "p1"):  # type: ignore[no-untyped-def]
-    return s._conn().execute("SELECT * FROM refresh_intent WHERE policy_id=?", (pid,)).fetchall()
+def _enter(s: PolicyStore, pid: str = "p1", op: str = "p1-2", **over: object) -> int:
+    return s.enter_calibrating(pid, approval=_appr("g1", op=op), **{**_ROUTING, **over})  # type: ignore[arg-type]
+
+
+def _rows(s: PolicyStore, pid: str = "p1"):  # type: ignore[no-untyped-def]
+    return s._conn().execute("SELECT * FROM refresh_intent WHERE policy_id=? ORDER BY seq", (pid,)).fetchall()
 
 
 class EnterCalibratingTests(unittest.TestCase):
     def test_atomically_creates_calibrating_and_a_pending_routing_intent(self) -> None:
         s = _store()
         _pending(s)
-        s.enter_calibrating("p1", approval=_appr("g1", op="p1-2"), **_ROUTING)  # type: ignore[arg-type]
+        _enter(s)
         self.assertIs(s.current_state("p1"), PolicyState.CALIBRATING)
-        rows = _intent(s)
+        rows = _rows(s)
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual(row["status"], "pending")
         self.assertEqual(row["set_id"], "setA")
-        self.assertEqual(row["target_head"], "oracle-head-1")      # routing: the oracle head to calibrate at
+        self.assertEqual(row["target_head"], "oracle-head-1")
+        self.assertEqual(row["target_revision"], 0)
         self.assertEqual(row["detector_id"], "retry")
-        self.assertEqual(row["trust_policy_ref"], "tp-digest")
-        self.assertEqual(row["guard_policy_ref"], "gp-digest")
-        self.assertEqual(row["identity_contract_version"], IDENTITY_CONTRACT_VERSION)
-        self.assertEqual(row["churn_count"], 0)                    # cumulative counter starts at 0
-        # no measured subject on the intent — its columns are routing only.
+        self.assertEqual(row["expected_profile_digest"], "pd")
+        self.assertEqual(row["expected_trust_policy_digest"], "tp")
+        self.assertEqual(row["expected_guard_policy_digest"], "gp")
+        self.assertEqual(row["churn_count"], 0)
+        # no measured subject on the intent — routing only.
         self.assertNotIn("detector_identity", row.keys())
-        self.assertNotIn("subject", row.keys())
 
-    def test_target_generation_is_the_derived_new_policy_head(self) -> None:
-        # target_generation is DERIVED from the appended record_hash (== policy_head), not caller-supplied.
+    def test_policy_generation_is_the_derived_policy_head(self) -> None:
         s = _store()
         _pending(s)
-        s.enter_calibrating("p1", approval=_appr("g1", op="p1-2"), **_ROUTING)  # type: ignore[arg-type]
-        self.assertEqual(_intent(s)[0]["target_generation"], s.policy_head("p1"))
+        _enter(s)
+        self.assertEqual(_rows(s)[0]["policy_generation"], s.policy_head("p1"))
 
     def test_tier_row_is_byte_identical_routing_not_on_the_chain(self) -> None:
-        # the CALIBRATING tier row carries ONLY pinned_set_version; set_id / detector_identity / ICV stay
-        # NULL (the tier row's detector_identity is the MEASURED subject, absent until ENABLED). Routing
-        # lives on the intent, so the tier chain is unchanged from a bare CALIBRATING transition.
         s = _store()
         _pending(s)
-        s.enter_calibrating("p1", approval=_appr("g1", op="p1-2"), **_ROUTING)  # type: ignore[arg-type]
+        _enter(s)
         trow = s._conn().execute(
             "SELECT * FROM tier_transition_chain WHERE policy_id='p1' AND new_state='calibrating'"
         ).fetchone()
@@ -89,17 +94,17 @@ class EnterCalibratingTests(unittest.TestCase):
         self.assertIsNone(trow["set_id"])
         self.assertIsNone(trow["detector_identity"])
         self.assertIsNone(trow["identity_contract_version"])
-        self.assertTrue(s.verify_chain())  # the appended row is well-formed + chained
+        self.assertTrue(s.verify_chain())
 
     def test_degenerate_routing_inputs_refused(self) -> None:
         for bad in ({"set_id": ""}, {"pinned_set_version": ""}, {"detector_id": ""},
-                    {"trust_policy_ref": ""}, {"guard_policy_ref": ""}):
+                    {"expected_profile_digest": ""}, {"expected_trust_policy_digest": ""},
+                    {"expected_guard_policy_digest": ""}):
             with self.subTest(bad=next(iter(bad))):
                 s = _store()
                 _pending(s)
                 with self.assertRaises(PrivilegedOperationError):
-                    s.enter_calibrating("p1", approval=_appr("g1", op="p1-2"),
-                                        **{**_ROUTING, **bad})  # type: ignore[arg-type]
+                    _enter(s, **bad)
 
     def test_degenerate_icv_refused(self) -> None:
         for bad_icv in (True, False, "1", IDENTITY_CONTRACT_VERSION + 1, 0):
@@ -107,17 +112,168 @@ class EnterCalibratingTests(unittest.TestCase):
                 s = _store()
                 _pending(s)
                 with self.assertRaises(PrivilegedOperationError):
-                    s.enter_calibrating("p1", approval=_appr("g1", op="p1-2"),
-                                        **{**_ROUTING, "identity_contract_version": bad_icv})  # type: ignore[arg-type]
+                    _enter(s, identity_contract_version=bad_icv)
 
     def test_illegal_entry_writes_nothing(self) -> None:
-        # a fresh policy is PROPOSED; PROPOSED -> CALIBRATING is not legal. The pre-check rejects BEFORE the
-        # transaction, so neither a tier row nor an intent is written.
         s = _store()
         with self.assertRaises(IllegalTransitionError):
-            s.enter_calibrating("p1", approval=_appr("g1", op="p1-x"), **_ROUTING)  # type: ignore[arg-type]
-        self.assertEqual(_intent(s), [])
+            _enter(s)  # PROPOSED -> CALIBRATING is illegal
+        self.assertEqual(_rows(s), [])
         self.assertIsNone(s.current_state("p1"))
+
+    def test_bare_calibrating_transition_is_refused(self) -> None:
+        # the sole-path guard: a bare transition into CALIBRATING is refused (use enter_calibrating).
+        s = _store()
+        _pending(s)
+        with self.assertRaises(IllegalTransitionError):
+            s.transition("p1", PolicyState.CALIBRATING, approval=_appr("g1", op="x"),
+                         pinned_set_version="v")
+
+    def test_dangling_active_intent_refused_explicitly(self) -> None:
+        # a policy legal to enter (PENDING_CALIBRATION) that already has a DANGLING active intent is refused
+        # with an explicit ActiveCalibrationIntentExists, not a raw DB-unique violation. Inject the dangling
+        # intent directly (the normal atomic path never leaves one, but a crash/future path could).
+        s = _store()
+        _pending(s)
+        s._conn().execute(
+            "INSERT INTO refresh_intent (policy_id, set_id, target_head, policy_generation, target_revision,"
+            " detector_id, expected_profile_digest, expected_trust_policy_digest, expected_guard_policy_digest,"
+            " identity_contract_version, churn_count, status, created_at, updated_at) "
+            "VALUES ('p1','setA','h','gen',0,'d','pd','tp','gp',1,0,'pending',0,0)")
+        with self.assertRaises(ActiveCalibrationIntentExists):
+            _enter(s)
+
+    def test_atomic_rollback_on_intent_insert_failure(self) -> None:
+        # crash boundary (i): an aborting trigger makes the intent INSERT fail AFTER the tier row is
+        # inserted, inside the BEGIN IMMEDIATE — proving BOTH roll back (no half-written CALIBRATING).
+        s = _store()
+        _pending(s)
+        s._conn().execute("CREATE TEMP TRIGGER _boom BEFORE INSERT ON refresh_intent "
+                          "BEGIN SELECT RAISE(ABORT, 'boom'); END")
+        try:
+            with self.assertRaises(Exception):
+                _enter(s)
+        finally:
+            s._conn().execute("DROP TRIGGER _boom")
+        self.assertEqual(_rows(s), [])
+        n = s._conn().execute(
+            "SELECT COUNT(*) AS n FROM tier_transition_chain WHERE policy_id='p1' AND new_state='calibrating'"
+        ).fetchone()["n"]
+        self.assertEqual(n, 0)
+        self.assertIs(s.current_state("p1"), PolicyState.PENDING_CALIBRATION)
+
+
+class SupersedeTests(unittest.TestCase):
+    def test_supersede_active_intent_terminalizes(self) -> None:
+        s = _store()
+        _pending(s)
+        _enter(s)
+        self.assertEqual(s.supersede_active_intent("p1"), 1)
+        self.assertEqual(_rows(s)[0]["status"], "superseded")
+        self.assertIsNone(s.active_intent("p1"))
+
+    def test_transition_out_of_calibrating_atomically_supersedes(self) -> None:
+        s = _store()
+        _pending(s)
+        _enter(s)
+        # CALIBRATING -> REJECTED exits CALIBRATING; the active intent is superseded in the SAME transaction.
+        s.transition("p1", PolicyState.REJECTED, approval=_appr("g1", op="rej"))
+        self.assertIs(s.current_state("p1"), PolicyState.REJECTED)
+        self.assertEqual(_rows(s)[0]["status"], "superseded")
+        self.assertIsNone(s.active_intent("p1"))
+
+    def test_full_recovery_reentry(self) -> None:
+        # the human recovery path: CALIBRATING -> REJECTED (atomic supersede) -> PENDING_CALIBRATION -> a
+        # fresh enter_calibrating succeeds (the prior intent is terminal, so no active intent blocks it).
+        s = _store()
+        _pending(s)
+        _enter(s)
+        s.transition("p1", PolicyState.REJECTED, approval=_appr("g1", op="rej"))
+        s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="re-pend"))
+        _enter(s, op="p1-again")
+        self.assertIs(s.current_state("p1"), PolicyState.CALIBRATING)
+        self.assertEqual(s.active_intent("p1")["status"], "pending")
+
+
+class CompletionCasTests(unittest.TestCase):
+    def test_satisfied_under_matching_triple(self) -> None:
+        s = _store()
+        _pending(s)
+        _enter(s)
+        i = s.active_intent("p1")
+        ok = s.mark_intent_satisfied("p1", policy_generation=i["policy_generation"],
+                                     target_revision=i["target_revision"], target_head=i["target_head"])
+        self.assertTrue(ok)
+        self.assertEqual(_rows(s)[0]["status"], "satisfied")
+
+    def test_stale_completion_no_ops(self) -> None:
+        s = _store()
+        _pending(s)
+        _enter(s)
+        i = s.active_intent("p1")
+        # a completion under a STALE revision (the intent was advanced meanwhile) matches 0 rows.
+        ok = s.mark_intent_satisfied("p1", policy_generation=i["policy_generation"],
+                                     target_revision=i["target_revision"] + 1, target_head=i["target_head"])
+        self.assertFalse(ok)
+        self.assertEqual(_rows(s)[0]["status"], "pending")  # untouched
+
+
+class ChurnAdvanceTests(unittest.TestCase):
+    def test_distinct_successive_heads_each_increment(self) -> None:
+        s = _store()
+        _pending(s)
+        _enter(s)
+        i = s.active_intent("p1")
+        gen = i["policy_generation"]
+        self.assertTrue(s.advance_intent("p1", expect_policy_generation=gen, expect_target_revision=0,
+                                         expect_target_head="oracle-head-1", new_target_head="H2"))
+        r1 = s.active_intent("p1")
+        self.assertEqual((r1["target_head"], r1["target_revision"], r1["churn_count"]), ("H2", 1, 1))
+        # a genuinely-distinct successive head increments again.
+        self.assertTrue(s.advance_intent("p1", expect_policy_generation=gen, expect_target_revision=1,
+                                         expect_target_head="H2", new_target_head="H3"))
+        r2 = s.active_intent("p1")
+        self.assertEqual((r2["target_head"], r2["target_revision"], r2["churn_count"]), ("H3", 2, 2))
+
+    def test_stale_delayed_advance_no_ops(self) -> None:
+        # the split-generation fence: a lagging advance (still expecting revision 0 / the old head) after the
+        # row already reached revision 2 matches 0 rows -> no double-increment, no stale overwrite.
+        s = _store()
+        _pending(s)
+        _enter(s)
+        gen = s.active_intent("p1")["policy_generation"]
+        s.advance_intent("p1", expect_policy_generation=gen, expect_target_revision=0,
+                         expect_target_head="oracle-head-1", new_target_head="H2")
+        s.advance_intent("p1", expect_policy_generation=gen, expect_target_revision=1,
+                         expect_target_head="H2", new_target_head="H3")
+        stale = s.advance_intent("p1", expect_policy_generation=gen, expect_target_revision=0,
+                                 expect_target_head="oracle-head-1", new_target_head="H2-again")
+        self.assertFalse(stale)
+        r = s.active_intent("p1")
+        self.assertEqual((r["target_head"], r["target_revision"], r["churn_count"]), ("H3", 2, 2))
+
+
+class FailedStateTests(unittest.TestCase):
+    def test_failed_detector_is_non_blocking(self) -> None:
+        s = _store()
+        _pending(s)
+        _enter(s)
+        self.assertTrue(s.mark_intent_failed_detector("p1"))
+        self.assertEqual(_rows(s)[0]["status"], "failed_detector")
+        self.assertIsNone(s.active_intent("p1"))
+        self.assertFalse(s.has_failed_churn("p1"))  # failed_detector does NOT block new autos
+
+    def test_failed_churn_blocks_until_cleared(self) -> None:
+        s = _store()
+        _pending(s)
+        _enter(s)
+        self.assertTrue(s.mark_intent_failed_churn("p1"))
+        self.assertEqual(_rows(s)[0]["status"], "failed_churn")
+        self.assertTrue(s.has_failed_churn("p1"))   # the explicit guard: blocks new autos
+        # human recovery clears the block.
+        self.assertEqual(s.clear_failed_churn("p1"), 1)
+        self.assertFalse(s.has_failed_churn("p1"))
+        self.assertEqual(_rows(s)[0]["status"], "superseded")
 
 
 if __name__ == "__main__":

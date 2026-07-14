@@ -49,6 +49,12 @@ class IllegalTransitionError(ValueError):
     """A (src -> dst) tier transition that the state machine does not permit."""
 
 
+class ActiveCalibrationIntentExists(RuntimeError):
+    """3.5 S3-completion CP4: enter_calibrating was called for a policy that already has an active
+    (pending|dispatched) re-calibration intent. Re-entry must first terminalize the prior intent
+    (supersede_active_intent) — an explicit refusal, not a raw DB-unique-constraint violation."""
+
+
 class ChainIntegrityError(RuntimeError):
     """The tier-transition chain failed verification — a record was edited/removed/reordered, or a
     per-policy prior-state continuity / legal-edge invariant was violated."""
@@ -140,30 +146,42 @@ CREATE TABLE IF NOT EXISTS calibration_pass (
 -- 3.5 S3-completion CP4 (liveness): the RE-CALIBRATION INTENT for a CALIBRATING policy. Created ATOMICALLY
 -- with the CALIBRATING tier transition (enter_calibrating, one BEGIN IMMEDIATE), because
 -- enabled_policies_for_set is ENABLED-only so the relay would otherwise never re-trigger a CALIBRATING
--- policy (it would get safely-but-stuck). The intent carries ROUTING inputs (WHAT to run) — NOT a measured
--- subject: at CALIBRATING entry no subject has been measured yet, so a subject here would be
--- declared-not-measured; produce_candidate_pass RESOLVES + MEASURES the four-tuple itself. ``target_head``
--- is the oracle set_head to seal+calibrate at; ``target_generation`` is the POLICY tier-chain head
--- (record_hash) this intent targets — it FENCES a stale completion (a completion under an advanced
--- generation updates 0 rows). ``churn_count`` is CUMULATIVE per policy, bumped only on a DISTINCT
--- target_head advance (Slice A/C). The intent state machine + the ONE-active-intent partial unique index +
--- the completion CAS land in Slice A; this slice creates the table + the atomic pending intent.
+-- policy (it would get safely-but-stuck). The intent carries model-(b) ROUTING inputs (WHAT to run) — NOT a
+-- measured subject: at CALIBRATING entry no subject has been measured yet, so a subject here would be
+-- declared-not-measured. detector_id is a resolvable REGISTRY NAME; the expected_*_digest columns are the
+-- policy digests the worker VERIFIES its boot-injected trust/guard/profile objects against (reject before
+-- calibrating on mismatch). produce_candidate_pass MEASURES the four-tuple itself; the intent is a durable
+-- target + expected-policy constraint consumed by the trusted composition root, NOT self-routable.
+--
+-- SPLIT GENERATIONS (board D1 ruling): a stale-overwrite hazard exists if a single coordinate serves both
+-- routing (changes on advance) and fencing. So: ``policy_generation`` = the POLICY tier-chain head captured
+-- at CALIBRATING (fences a policy transition); ``target_revision`` = a MONOTONIC advance counter (fences a
+-- stale oracle-head advance); ``target_head`` = the oracle head to seal+calibrate at (routing). A distinct
+-- oracle-head advance is ONE in-place CAS UPDATE on the (policy_generation, target_revision, target_head)
+-- triple, incrementing target_revision + churn_count; completion fences on the same triple. Generation is
+-- FENCING only, never evidence identity (the candidate pass ref is content-bound via _result_ref).
 CREATE TABLE IF NOT EXISTS refresh_intent (
     seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
     policy_id              TEXT NOT NULL,
     set_id                 TEXT NOT NULL,   -- routing: which oracle SET to recalibrate against
     target_head            TEXT NOT NULL,   -- routing: the set_head (oracle head) to seal + calibrate at
-    target_generation      TEXT NOT NULL,   -- the policy tier-chain head (record_hash) this intent targets
-    detector_id            TEXT NOT NULL,   -- routing: which detector to run
-    trust_policy_ref       TEXT NOT NULL,   -- routing: which observation-trust policy governs it
-    guard_policy_ref       TEXT NOT NULL,   -- routing: which backend-guard policy governs it
+    policy_generation      TEXT NOT NULL,   -- the POLICY tier-chain head captured at CALIBRATING (fences a policy transition)
+    target_revision        INTEGER NOT NULL DEFAULT 0,  -- MONOTONIC advance counter (fences a stale oracle-head advance)
+    detector_id            TEXT NOT NULL,   -- routing: resolvable detector REGISTRY NAME
+    expected_profile_digest TEXT NOT NULL,  -- the detector profile digest the worker verifies its resolved bundle against
+    expected_trust_policy_digest TEXT NOT NULL,  -- the observation-trust policy digest the worker verifies boot-injected trust against
+    expected_guard_policy_digest TEXT NOT NULL,  -- the backend-guard policy digest the worker verifies boot-injected guard against
     identity_contract_version INTEGER NOT NULL,  -- routing: the ICV the candidate must compose under
-    churn_count            INTEGER NOT NULL DEFAULT 0,  -- cumulative per policy; bumped on distinct target_head advance
+    churn_count            INTEGER NOT NULL DEFAULT 0,  -- cumulative per policy; bumped only on a DISTINCT target_head advance
     status                 TEXT NOT NULL    -- pending|dispatched|satisfied|superseded|failed_detector|failed_churn
         CHECK (status IN ('pending','dispatched','satisfied','superseded','failed_detector','failed_churn')),
     created_at             REAL NOT NULL,
     updated_at             REAL NOT NULL
 );
+-- ONE active intent per policy (board): a fresh pending/dispatched intent cannot coexist with another.
+-- Terminal rows (satisfied/superseded/failed_*) are EXCLUDED, so re-entry is allowed once terminalized.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_refresh_intent_active
+    ON refresh_intent (policy_id) WHERE status IN ('pending','dispatched');
 """
 
 
@@ -230,11 +248,16 @@ class PolicyStore:
             + detector_identity (addition #3 — no un-anchored enablement).
         Returns the new seq. There is deliberately NO update/delete method.
 
-        3.5 S3-completion CP4: the PREFERRED path into ``CALIBRATING`` is ``enter_calibrating``, which
-        atomically creates the re-calibration recovery intent in the SAME transaction (a CALIBRATING policy
-        without a durable intent would be silently un-reachable by the ENABLED-only relay). Making
-        ``enter_calibrating`` the SOLE path (refusing a bare CALIBRATING transition here) is a focused
-        follow-up — it re-routes every test-setup CALIBRATING call and is deferred out of this slice."""
+        3.5 S3-completion CP4: ``enter_calibrating`` is the SOLE path into ``CALIBRATING`` — a bare
+        CALIBRATING transition is REFUSED here, because it would create a policy with no durable
+        re-calibration intent (silently un-reachable by the ENABLED-only relay = safe-but-stuck). And a
+        transition OUT of CALIBRATING (e.g. → REJECTED) atomically SUPERSEDES the active intent IN THE SAME
+        transaction as the tier append (a separate supersede call would reopen a crash gap: transition
+        committed, intent still active → stranded, blocking re-entry)."""
+        if new_state is PolicyState.CALIBRATING:
+            raise IllegalTransitionError(
+                "use enter_calibrating() for a CALIBRATING transition — it atomically creates the "
+                "re-calibration recovery intent (CP4 liveness); a bare transition would strand the policy")
         with self._lock:
             prior = self._current_state_unlocked(policy_id)
             src = prior if prior is not None else PolicyState.PROPOSED
@@ -295,17 +318,32 @@ class PolicyStore:
                 "added_at": self._clock(),
             }
             record_hash = chain_hash(prev_hash, _digest_fields(fields))
-            cur = self._conn().execute(
-                "INSERT INTO tier_transition_chain "
-                "(policy_id, prior_state, new_state, calibration_result_ref, set_id, pinned_set_version,"
-                " detector_identity, identity_contract_version, principals, purpose, rationale,"
-                " operation_id, added_at, prev_hash, record_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (policy_id, fields["prior_state"], new_state.value, calibration_result_ref,
-                 set_id, pinned_set_version, detector_identity, identity_contract_version, principals_json,
-                 approval.purpose, approval.rationale, approval.operation_id, fields["added_at"], prev_hash,
-                 record_hash),
-            )
-            return int(cur.lastrowid or 0)
+            # a transition OUT of CALIBRATING must terminalize the active re-cal intent ATOMICALLY with the
+            # tier append (else a crash between them strands a non-terminal intent that blocks re-entry).
+            exiting_calibrating = src is PolicyState.CALIBRATING
+            conn = self._conn()
+            if exiting_calibrating:
+                conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "INSERT INTO tier_transition_chain "
+                    "(policy_id, prior_state, new_state, calibration_result_ref, set_id, pinned_set_version,"
+                    " detector_identity, identity_contract_version, principals, purpose, rationale,"
+                    " operation_id, added_at, prev_hash, record_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (policy_id, fields["prior_state"], new_state.value, calibration_result_ref,
+                     set_id, pinned_set_version, detector_identity, identity_contract_version, principals_json,
+                     approval.purpose, approval.rationale, approval.operation_id, fields["added_at"],
+                     prev_hash, record_hash),
+                )
+                seq = int(cur.lastrowid or 0)
+                if exiting_calibrating:
+                    self._supersede_active_intent_unlocked(policy_id)
+                    conn.execute("COMMIT")
+            except Exception:
+                if exiting_calibrating:
+                    conn.execute("ROLLBACK")
+                raise
+            return seq
 
     def enter_calibrating(
         self,
@@ -315,8 +353,9 @@ class PolicyStore:
         set_id: str,
         pinned_set_version: str,
         detector_id: str,
-        trust_policy_ref: str,
-        guard_policy_ref: str,
+        expected_profile_digest: str,
+        expected_trust_policy_digest: str,
+        expected_guard_policy_digest: str,
         identity_contract_version: int,
     ) -> int:
         """3.5 S3-completion CP4 (liveness): the SOLE path into ``CALIBRATING`` — it atomically appends the
@@ -327,17 +366,19 @@ class PolicyStore:
         guarantees a CALIBRATING policy ALWAYS has a recovery intent (a crash cannot commit the transition
         without the intent, or vice versa).
 
-        The intent carries ROUTING inputs (WHICH detector / trust / guard / set / head / ICV to run) — NOT a
-        measured subject: at CALIBRATING entry nothing has been measured yet, so a subject here would be
-        declared-not-measured. ``produce_candidate_pass`` (Slice B) RESOLVES + MEASURES the four-tuple
-        itself. Degenerate-value guarded: every routing string must be non-empty and the ICV must be the
-        exact current int contract. ``target_generation`` is DERIVED from the appended record_hash (the new
-        policy head), never caller-supplied. The intent state machine, the one-active partial unique index,
-        the completion CAS, and the sync-calibration resolution (satisfied / failed_detector) land in Slice
-        A — this slice creates the atomic pending intent only."""
+        The intent carries model-(b) ROUTING inputs — NOT a measured subject: ``detector_id`` is a resolvable
+        registry name; the ``expected_*_digest`` are the policy digests the worker VERIFIES its boot-injected
+        profile/trust/guard objects against (reject before calibrating on mismatch). ``policy_generation`` is
+        DERIVED from the appended record_hash (the new policy head), never caller-supplied; ``target_revision``
+        starts at 0. A live active (pending/dispatched) intent for this policy is refused with
+        ``ActiveCalibrationIntentExists`` (an explicit check, not a raw DB-unique violation) — re-entry must
+        first terminalize the prior intent via ``supersede_active_intent``. Degenerate-value guarded: every
+        routing string non-empty, ICV the exact current int contract."""
         for name, val in (("set_id", set_id), ("pinned_set_version", pinned_set_version),
-                          ("detector_id", detector_id), ("trust_policy_ref", trust_policy_ref),
-                          ("guard_policy_ref", guard_policy_ref)):
+                          ("detector_id", detector_id),
+                          ("expected_profile_digest", expected_profile_digest),
+                          ("expected_trust_policy_digest", expected_trust_policy_digest),
+                          ("expected_guard_policy_digest", expected_guard_policy_digest)):
             if not isinstance(val, str) or val == "":
                 raise PrivilegedOperationError(
                     f"enter_calibrating requires a non-empty {name} routing input — an intent with a null "
@@ -356,9 +397,13 @@ class PolicyStore:
                 raise PrivilegedOperationError(
                     f"{src.value} -> calibrating requires {required} distinct governance principal(s) + "
                     f"purpose/rationale/operation_id; got {sorted(approval.distinct_principals)}")
+            if self._active_intent_unlocked(policy_id) is not None:
+                raise ActiveCalibrationIntentExists(
+                    f"{policy_id} already has an active (pending/dispatched) re-calibration intent — "
+                    "terminalize it (supersede_active_intent) before re-entering CALIBRATING")
             # the CALIBRATING tier record — BYTE-IDENTICAL to transition(CALIBRATING, pinned_set_version=..):
-            # routing (set_id/detector/trust/guard/ICV) lives on the INTENT, and the tier row's
-            # ``detector_identity`` is the MEASURED subject (absent until ENABLED), so it stays None here.
+            # routing lives on the INTENT, and the tier row's ``detector_identity`` is the MEASURED subject
+            # (absent until ENABLED), so it stays None here.
             principals_json = json.dumps(sorted(approval.distinct_principals))
             prev_hash = self._head_hash_unlocked()
             added_at = self._clock()
@@ -385,20 +430,141 @@ class PolicyStore:
                      approval.operation_id, added_at, prev_hash, record_hash),
                 )
                 seq = int(cur.lastrowid or 0)
-                # target_generation = the NEW policy head (the record_hash just appended) — DERIVED, never
-                # passed; target_head = the oracle head to seal + calibrate at.
+                # policy_generation = the NEW policy head (the record_hash just appended) — DERIVED, never
+                # passed; target_head = the oracle head to seal + calibrate at; target_revision starts at 0.
                 conn.execute(
-                    "INSERT INTO refresh_intent (policy_id, set_id, target_head, target_generation,"
-                    " detector_id, trust_policy_ref, guard_policy_ref, identity_contract_version,"
-                    " churn_count, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,0,'pending',?,?)",
-                    (policy_id, set_id, pinned_set_version, record_hash, detector_id, trust_policy_ref,
-                     guard_policy_ref, identity_contract_version, added_at, added_at),
+                    "INSERT INTO refresh_intent (policy_id, set_id, target_head, policy_generation,"
+                    " target_revision, detector_id, expected_profile_digest, expected_trust_policy_digest,"
+                    " expected_guard_policy_digest, identity_contract_version, churn_count, status,"
+                    " created_at, updated_at) VALUES (?,?,?,?,0,?,?,?,?,?,0,'pending',?,?)",
+                    (policy_id, set_id, pinned_set_version, record_hash, detector_id, expected_profile_digest,
+                     expected_trust_policy_digest, expected_guard_policy_digest, identity_contract_version,
+                     added_at, added_at),
                 )
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
             return seq
+
+    def _active_intent_unlocked(self, policy_id: str) -> sqlite3.Row | None:
+        """The single active (pending|dispatched) refresh_intent row for ``policy_id``, or None. Terminal
+        rows (satisfied/superseded/failed_detector/failed_churn) are EXCLUDED, so re-entry is allowed once
+        the prior intent is terminalized. The partial unique index guarantees at most one."""
+        row: sqlite3.Row | None = self._conn().execute(
+            "SELECT * FROM refresh_intent WHERE policy_id=? AND status IN ('pending','dispatched') "
+            "ORDER BY seq DESC LIMIT 1", (policy_id,)
+        ).fetchone()
+        return row
+
+    def active_intent(self, policy_id: str) -> sqlite3.Row | None:
+        """The current active (pending|dispatched) re-calibration intent row for ``policy_id``, or None."""
+        with self._lock:
+            return self._active_intent_unlocked(policy_id)
+
+    def _supersede_active_intent_unlocked(self, policy_id: str) -> int:
+        """Terminalize the active intent (if any) to ``superseded``. Returns the number of rows affected
+        (0 or 1). Used for LIFECYCLE EXIT / human recovery, NOT ordinary head advancement (which updates the
+        row in place). Callers already hold ``self._lock`` (and may be mid-transaction)."""
+        cur = self._conn().execute(
+            "UPDATE refresh_intent SET status='superseded', updated_at=? "
+            "WHERE policy_id=? AND status IN ('pending','dispatched')",
+            (self._clock(), policy_id),
+        )
+        return int(cur.rowcount or 0)
+
+    def supersede_active_intent(self, policy_id: str) -> int:
+        """Terminalize the active re-calibration intent for ``policy_id`` to ``superseded`` (lifecycle exit /
+        human recovery). Returns rows affected. A standalone call for the human-recovery path; transitions
+        OUT of CALIBRATING supersede ATOMICALLY inside the transition transaction (see ``transition``)."""
+        with self._lock:
+            return self._supersede_active_intent_unlocked(policy_id)
+
+    def mark_intent_satisfied(
+        self, policy_id: str, *, policy_generation: str, target_revision: int, target_head: str,
+    ) -> bool:
+        """Completion CAS: terminalize the active intent to ``satisfied`` ONLY if it still matches the
+        ``(policy_generation, target_revision, target_head)`` the caller measured under. If the triple
+        advanced (a churn advance bumped the revision, or a policy transition moved the generation) the
+        UPDATE matches 0 rows and no-ops → the caller classifies it superseded, never a failure. Returns
+        True iff the intent was satisfied."""
+        with self._lock:
+            cur = self._conn().execute(
+                "UPDATE refresh_intent SET status='satisfied', updated_at=? "
+                "WHERE policy_id=? AND status IN ('pending','dispatched') AND policy_generation=? "
+                "AND target_revision=? AND target_head=?",
+                (self._clock(), policy_id, policy_generation, target_revision, target_head),
+            )
+            return bool(cur.rowcount)
+
+    def mark_intent_failed_detector(self, policy_id: str) -> bool:
+        """Terminalize the active intent to ``failed_detector`` — a DETERMINISTIC calibration failure (the
+        detector could not produce a clean pass). Distinct from ``failed_churn``: it does NOT block a new
+        auto-intent (a set change can legitimately re-trigger). Returns True iff a row was terminalized."""
+        with self._lock:
+            cur = self._conn().execute(
+                "UPDATE refresh_intent SET status='failed_detector', updated_at=? "
+                "WHERE policy_id=? AND status IN ('pending','dispatched')",
+                (self._clock(), policy_id),
+            )
+            return bool(cur.rowcount)
+
+    def advance_intent(
+        self, policy_id: str, *, expect_policy_generation: str, expect_target_revision: int,
+        expect_target_head: str, new_target_head: str,
+    ) -> bool:
+        """Churn-A DISTINCT oracle-head advance: an IN-PLACE CAS UPDATE on the
+        ``(policy_generation, target_revision, target_head)`` triple → set ``target_head`` = the new head,
+        increment ``target_revision`` AND ``churn_count``. A stale/delayed advance (the row is already at a
+        newer revision, e.g. a lagging H2 after H3 landed) matches 0 rows and no-ops — no double-increment,
+        no stale overwrite (the split-generation fence, board D1). This UPDATES the existing active row; it
+        is NOT a supersede-and-replace. Churn increments ONLY on a genuine distinct advance. Returns True
+        iff the advance fired."""
+        with self._lock:
+            cur = self._conn().execute(
+                "UPDATE refresh_intent SET target_head=?, target_revision=target_revision+1, "
+                "churn_count=churn_count+1, updated_at=? "
+                "WHERE policy_id=? AND status IN ('pending','dispatched') AND policy_generation=? "
+                "AND target_revision=? AND target_head=?",
+                (new_target_head, self._clock(), policy_id, expect_policy_generation, expect_target_revision,
+                 expect_target_head),
+            )
+            return bool(cur.rowcount)
+
+    def mark_intent_failed_churn(self, policy_id: str) -> bool:
+        """Terminalize the active intent to ``failed_churn`` — the cumulative churn budget was exhausted
+        (the policy never converged to a current head). The policy STAYS CALIBRATING (SKIP_NEUTRAL,
+        never-enforcing) + an alert is raised out-of-band; this is NOT unattestable. ``failed_churn`` is a
+        BLOCKING terminal (see ``has_failed_churn``): recovery is human CALIBRATING→REJECTED→PENDING, which
+        must clear it. Returns True iff a row was terminalized."""
+        with self._lock:
+            cur = self._conn().execute(
+                "UPDATE refresh_intent SET status='failed_churn', updated_at=? "
+                "WHERE policy_id=? AND status IN ('pending','dispatched')",
+                (self._clock(), policy_id),
+            )
+            return bool(cur.rowcount)
+
+    def has_failed_churn(self, policy_id: str) -> bool:
+        """The EXPLICIT failed-churn guard (the partial-unique index does NOT cover terminal rows): a policy
+        with a ``failed_churn`` intent must NOT receive a fresh auto-intent until a human clears it. The
+        relay checks this before creating a new CALIBRATING intent."""
+        return self._conn().execute(
+            "SELECT 1 FROM refresh_intent WHERE policy_id=? AND status='failed_churn' LIMIT 1",
+            (policy_id,),
+        ).fetchone() is not None
+
+    def clear_failed_churn(self, policy_id: str) -> int:
+        """Human recovery: clear the ``failed_churn`` block (terminalize those rows to ``superseded``) so the
+        policy can re-enter automatic calibration. Called on the recovery path AFTER the human moves the
+        policy CALIBRATING→REJECTED→PENDING_CALIBRATION. Returns rows cleared."""
+        with self._lock:
+            cur = self._conn().execute(
+                "UPDATE refresh_intent SET status='superseded', updated_at=? "
+                "WHERE policy_id=? AND status='failed_churn'",
+                (self._clock(), policy_id),
+            )
+            return int(cur.rowcount or 0)
 
     def reattest(
         self,
@@ -790,6 +956,7 @@ __all__ = [
     "PolicyStore",
     "PrivilegedOperationError",
     "IllegalTransitionError",
+    "ActiveCalibrationIntentExists",
     "ChainIntegrityError",
     "ReAttestConflict",
 ]

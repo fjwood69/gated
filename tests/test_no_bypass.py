@@ -97,7 +97,9 @@ class RuntimeGateTests(unittest.TestCase):
             return GovernanceApproval(p, purpose="p", rationale="r", operation_id=op)
 
         s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=appr("g1", op="1"))
-        s.transition("p1", PolicyState.CALIBRATING, approval=appr("g1", op="2"), pinned_set_version="v")
+        s.enter_calibrating("p1", approval=appr("g1", op="2"), set_id="X", pinned_set_version="v",
+                            detector_id="d", expected_profile_digest="pd", expected_trust_policy_digest="tp",
+                            expected_guard_policy_digest="gp", identity_contract_version=1)
         s.record_calibration_pass("cal", policy_id="p1", pinned_set_version="v",
                                   detector_identity="d", set_id="X", identity_contract_version=1)
         s.transition("p1", PolicyState.ENABLED, approval=appr("g1", op="3"),

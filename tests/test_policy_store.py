@@ -35,8 +35,10 @@ def _enable(store: PolicyStore, pid: str, *, detector: str = "det-1") -> None:
     """Walk a policy PROPOSED->PENDING->CALIBRATING->ENABLED with valid single-principal approvals.
     Records a matching calibration_pass so the (gap-1) ENABLED binding is satisfied."""
     store.transition(pid, PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op=f"{pid}-1"))
-    store.transition(pid, PolicyState.CALIBRATING, approval=_appr("gov1", op=f"{pid}-2"),
-                     pinned_set_version="fx-head")
+    store.enter_calibrating(pid, approval=_appr("gov1", op=f"{pid}-2"), set_id="default",
+                            pinned_set_version="fx-head", detector_id=detector, expected_profile_digest="pd",
+                            expected_trust_policy_digest="tp", expected_guard_policy_digest="gp",
+                            identity_contract_version=1)
     store.record_calibration_pass("cal-1", policy_id=pid, pinned_set_version="fx-head",
                                   detector_identity=detector, identity_contract_version=1)
     store.transition(pid, PolicyState.ENABLED, approval=_appr("gov1", op=f"{pid}-3"),
@@ -60,7 +62,9 @@ class EnablePathTests(unittest.TestCase):
     def test_enabled_requires_anchors(self) -> None:
         s = _store()
         s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op="1"))
-        s.transition("p1", PolicyState.CALIBRATING, approval=_appr("gov1", op="2"))
+        s.enter_calibrating("p1", approval=_appr("gov1", op="2"), set_id="default", pinned_set_version="v",
+                            detector_id="d", expected_profile_digest="pd", expected_trust_policy_digest="tp",
+                            expected_guard_policy_digest="gp", identity_contract_version=1)
         with self.assertRaises(PrivilegedOperationError):  # missing all three anchors
             s.transition("p1", PolicyState.ENABLED, approval=_appr("gov1", op="3"))
         with self.assertRaises(PrivilegedOperationError):  # missing detector_identity
@@ -78,7 +82,10 @@ class EnablePathTests(unittest.TestCase):
         # refused — enablement binds mechanically to a recorded pass, not an opaque string.
         s = _store()
         s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op="1"))
-        s.transition("p1", PolicyState.CALIBRATING, approval=_appr("gov1", op="2"))
+        s.enter_calibrating("p1", approval=_appr("gov1", op="2"), set_id="default",
+                            pinned_set_version="fx-head", detector_id="det-1", expected_profile_digest="pd",
+                            expected_trust_policy_digest="tp", expected_guard_policy_digest="gp",
+                            identity_contract_version=1)
         with self.assertRaises(PrivilegedOperationError):
             s.transition("p1", PolicyState.ENABLED, approval=_appr("gov1", op="3"),
                          calibration_result_ref="fabricated", pinned_set_version="fx-head",
