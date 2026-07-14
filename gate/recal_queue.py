@@ -258,6 +258,27 @@ class RecalQueue:
             )
             return bool(cur.rowcount)
 
+    def release(
+        self, job_id: str, *, lease_token: str, now: float | None = None, delay: float = 0.0,
+    ) -> bool:
+        """3.5 CP4 Slice C: token-CAS VOLUNTARY early lease-expiry with backoff — return a held job to the
+        queue for a PROMPT retry rather than passively holding the lease to timeout. Used by the worker on a
+        RETRYABLE condition (boot-digest mismatch, unattested ERROR, or a set-head drift where the job is not
+        yet obsolete): the job stays PROCESSING with a CLEARED token and ``locked_until = now + delay``, so
+        the standard lease path re-leases it after the backoff (or the watchdog DEAD-LETTERS it at
+        ``max_attempts`` — the calibration-failure budget). ``attempts`` already counted this lease, so a
+        release costs one attempt. Only the lease holder can release (token-CAS + PROCESSING); returns True
+        iff released. Crucially this NEVER completes the job — completing (DONE) a job whose intent is still
+        active would let the deterministic job-id dedup STRAND the policy if the set head returns."""
+        ts = self._clock() if now is None else now
+        with self._lock:
+            cur = self._conn().execute(
+                "UPDATE recal_queue SET lease_token=NULL, locked_until=?, updated_at=? "
+                "WHERE job_id=? AND lease_token=? AND status=?",
+                (ts + delay, ts, job_id, lease_token, JobStatus.PROCESSING.value),
+            )
+            return bool(cur.rowcount)
+
     def watchdog(self, *, max_attempts: int, now: float | None = None) -> list[RecalJob]:
         """Re-queue expired leases; DEAD-LETTER any that have burned ``max_attempts``. Returns the jobs
         newly moved to DEAD_LETTER (the caller raises a critical alert + hard block for each). A

@@ -522,6 +522,16 @@ class PolicyStore:
         with self._lock:
             return self._active_intent_unlocked(policy_id)
 
+    def intent_by_seq(self, seq: int) -> sqlite3.Row | None:
+        """3.5 CP4 Slice C: the refresh_intent row by its ``seq`` (the intent IDENTITY the queue job carries),
+        in ANY status. The worker preflights a leased job against THIS — ``active_intent`` alone is
+        insufficient because it excludes ``satisfied`` (the already-satisfied job must complete WITHOUT
+        re-measuring) and the other terminal states (which the worker resolves as stale, no-work)."""
+        with self._lock:
+            row: sqlite3.Row | None = self._conn().execute(
+                "SELECT * FROM refresh_intent WHERE seq=?", (seq,)).fetchone()
+            return row
+
     def _supersede_active_intent_unlocked(self, policy_id: str) -> int:
         """Terminalize the active intent (if any) to ``superseded``. Returns the number of rows affected
         (0 or 1). Used for LIFECYCLE EXIT / human recovery, NOT ordinary head advancement (which updates the
