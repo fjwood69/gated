@@ -21,7 +21,8 @@ from core import Reason, Verdict, VerdictType
 from engine.runner import EngineRunResult, ExecutionIdentity, TrialReport
 from gate.attestation import IDENTITY_CONTRACT_VERSION, calibrated_subject_identity
 from gate.run_admission import (
-    _LIVE_GRANT,
+    _LiveAdmissionProof,
+    _mint_live_admission_proof,
     AdmittedRunResult,
     AuthorizedRunPlan,
     BlockingRefusal,
@@ -87,6 +88,11 @@ def _admit(plan: AuthorizedRunPlan, report: TrialReport,
            gov: _FakeGovernance) -> AdmittedRunResult | BlockingRefusal:
     return admit_run_result(UnadmittedRunResult(plan=plan, result=EngineRunResult(trial_report=report)),
                             governance=gov)
+
+
+def _proof(*, policy_id: str = "p1", set_id: str = _SET, head: str = _HEAD,
+           subject: str = _SUBJECT) -> _LiveAdmissionProof:
+    return _mint_live_admission_proof(policy_id=policy_id, set_id=set_id, oracle_head=head, subject=subject)
 
 
 class HappyPathTests(unittest.TestCase):
@@ -211,6 +217,13 @@ class LiveCurrencyRefusalTests(unittest.TestCase):
         assert isinstance(res, BlockingRefusal)
         self.assertIs(res.reason, RunAdmissionRefusal.AUTHORIZED_SET_MOVED)
 
+    def test_moved_set_with_unavailable_oracle_is_set_moved_not_oracle(self) -> None:
+        # forensic ordering (dissent): set-continuity is checked BEFORE the oracle query, so a moved set
+        # PLUS an unavailable oracle is the actionable AUTHORIZED_SET_MOVED, not ORACLE_UNAVAILABLE.
+        res = _admit(_plan(set_id=_SET), _report(), _FakeGovernance(set_id="set-2", live_head=None))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.AUTHORIZED_SET_MOVED)
+
 
 class EveryRefusalBlocksTests(unittest.TestCase):
     def test_every_refusal_carries_a_blocking_error_verdict(self) -> None:
@@ -231,32 +244,44 @@ class EveryRefusalBlocksTests(unittest.TestCase):
 
 
 class ProofGatedConstructionTests(unittest.TestCase):
-    """The AdmittedRunResult constructor is proof-gated (live-admission grant) AND re-runs the pure
-    structural validator — a direct construction can bypass NEITHER the live checks NOR the report recompute."""
+    """Construction is gated by a RESULT-BOUND proof (not a reusable grant): the metadata is DERIVED from
+    the proof (no caller-supplied fields to forge), the proof cannot be constructed outside the module, and
+    the constructor verifies proof↔run coherence + re-runs the pure structural validator. A direct
+    construction can bypass NEITHER the live checks NOR the report recompute NOR reuse a foreign proof."""
 
-    def test_construction_without_the_grant_raises(self) -> None:
+    def test_proof_cannot_be_constructed_without_the_mint_sentinel(self) -> None:
+        # a caller cannot fabricate a proof — the constructor refuses any key but the module-private mint.
         with self.assertRaises(RunAdmissionError):
-            AdmittedRunResult(plan=_plan(), report=_report(), measured_subject=_SUBJECT,
-                              admitted_set_id=_SET, bound_oracle_head=_HEAD)  # no grant
+            _LiveAdmissionProof(policy_id="p1", set_id=_SET, oracle_head=_HEAD, subject=_SUBJECT)
 
-    def test_report_drift_with_grant_still_raises(self) -> None:
-        # even WITH the grant, a report that recomputes to a different subject fails the structural re-run.
+    def test_admitted_metadata_is_derived_from_the_proof(self) -> None:
+        # the scoped metadata comes off the proof, not caller-supplied fields.
+        adm = AdmittedRunResult(plan=_plan(), report=_report(), _proof=_proof())
+        self.assertEqual(adm.admitted_set_id, _SET)
+        self.assertEqual(adm.bound_oracle_head, _HEAD)
+        self.assertEqual(adm.measured_subject, _SUBJECT)
+
+    def test_report_drift_with_valid_proof_still_raises(self) -> None:
+        # a genuine proof but a report recomputing to a different subject fails the structural re-run.
         with self.assertRaises(RunAdmissionError):
             AdmittedRunResult(plan=_plan(target=_SUBJECT), report=_report(gpd="guard-2"),
-                              measured_subject=_SUBJECT, admitted_set_id=_SET, bound_oracle_head=_HEAD,
-                              grant=_LIVE_GRANT)
+                              _proof=_proof(subject=_SUBJECT))
 
-    def test_stored_subject_not_report_recomputed_raises(self) -> None:
+    def test_proof_subject_not_report_recomputed_raises(self) -> None:
+        # a proof minted for _SUBJECT2 cannot admit a run that measured _SUBJECT (proof/run mismatch).
         with self.assertRaises(RunAdmissionError):
-            AdmittedRunResult(plan=_plan(target=_SUBJECT), report=_report(), measured_subject="a-lie",
-                              admitted_set_id=_SET, bound_oracle_head=_HEAD, grant=_LIVE_GRANT)
+            AdmittedRunResult(plan=_plan(target=_SUBJECT), report=_report(), _proof=_proof(subject=_SUBJECT2))
 
-    def test_bad_icv_with_grant_raises(self) -> None:
+    def test_proof_from_a_different_policy_raises(self) -> None:
+        with self.assertRaises(RunAdmissionError):
+            AdmittedRunResult(plan=_plan(target=_SUBJECT), report=_report(),
+                              _proof=_proof(policy_id="another-policy"))
+
+    def test_bad_icv_with_valid_proof_raises(self) -> None:
         plan = AuthorizedRunPlan(policy_id="p1", target_subject=_SUBJECT,
                                  authorized_context=(_SET, _SUBJECT, IDENTITY_CONTRACT_VERSION + 1))
         with self.assertRaises(RunAdmissionError):
-            AdmittedRunResult(plan=plan, report=_report(), measured_subject=_SUBJECT,
-                              admitted_set_id=_SET, bound_oracle_head=_HEAD, grant=_LIVE_GRANT)
+            AdmittedRunResult(plan=plan, report=_report(), _proof=_proof())
 
 
 class TypestateTests(unittest.TestCase):
@@ -264,7 +289,7 @@ class TypestateTests(unittest.TestCase):
         adm = _admit(_plan(), _report(), _FakeGovernance())
         assert isinstance(adm, AdmittedRunResult)
         with self.assertRaises(dataclasses.FrozenInstanceError):
-            adm.measured_subject = "x"  # type: ignore[misc]
+            adm.report = _report()  # a real field (measured_subject etc. are derived properties)  # type: ignore[misc]
         ref = _admit(_plan(), _report(), _FakeGovernance(attestation_none=True))
         assert isinstance(ref, BlockingRefusal)
         with self.assertRaises(dataclasses.FrozenInstanceError):

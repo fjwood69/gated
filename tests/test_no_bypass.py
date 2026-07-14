@@ -32,8 +32,10 @@ _GATE = Path(__file__).resolve().parent.parent / "gate"
 
 
 def _constructions(symbol: str) -> dict[str, int]:
-    """Map each gate module -> how many times it MINTS ``symbol`` (``Symbol()``), excluding the symbol's
-    own class/def line. A mint is the capability being produced."""
+    """Map each gate module -> how many times it CALLS ``symbol`` (``Symbol(``), excluding the symbol's own
+    class/def line. A call is the capability/proof being produced — counting ``Symbol(`` (not ``Symbol()``)
+    so a mint taking ARGUMENTS is counted too (a zero-arg-only match would miss a result-bound mint like
+    ``_mint_live_admission_proof(policy_id=…)`` — the exact use-vs-construction blind spot)."""
     out: dict[str, int] = {}
     for p in _GATE.glob("*.py"):
         n = 0
@@ -41,7 +43,7 @@ def _constructions(symbol: str) -> dict[str, int]:
             stripped = line.strip()
             if stripped.startswith(f"class {symbol}") or stripped.startswith(f"def {symbol}"):
                 continue
-            n += stripped.count(f"{symbol}()")
+            n += stripped.count(f"{symbol}(")
         if n:
             out[p.name] = n
     return out
@@ -58,13 +60,14 @@ class StructuralNoBypassTests(unittest.TestCase):
         # the load-bearing controls are reattest's mandatory chain-checked expectations.
         self.assertEqual(_constructions("_mint_reattest_grant"), {"restore_controller.py": 1})
 
-    def test_live_admission_grant_constructed_only_by_run_admission(self) -> None:
-        # 3.5 S3-completion CP1: the ONLY construction of the live-admission grant in the gate tree is the
-        # single module-level singleton in gate/run_admission.py — so no other gate module can mint one to
-        # forge an AdmittedRunResult that skipped the live governance-currency checks. Same honest scope as
-        # the two above: structural absence of a second minter, NOT unforgeability (the load-bearing control
-        # is that admit_run_result actually ran the live reads before minting).
-        self.assertEqual(_constructions("_LiveAdmissionGrant"), {"run_admission.py": 1})
+    def test_live_admission_proof_minted_only_by_run_admission(self) -> None:
+        # 3.5 S3-completion CP1: the ONLY caller of the RESULT-BOUND live-admission proof mint in the gate
+        # tree is gate/run_admission.py (admit_run_result, after its live checks). This asserts mint USE (a
+        # reusable singleton counted CONSTRUCTION and missed the reuse bypass) — so no other gate module can
+        # mint a proof to forge an AdmittedRunResult that skipped the live governance-currency checks. Same
+        # honest scope: structural absence of a second minter, NOT unforgeability (the load-bearing control
+        # is that admit_run_result ran the live reads before minting).
+        self.assertEqual(_constructions("_mint_live_admission_proof"), {"run_admission.py": 1})
 
 
 class RuntimeGateTests(unittest.TestCase):

@@ -48,15 +48,19 @@ TYPESTATE. ``AuthorizedRunPlan`` (minted before the run) + ``EngineRunResult`` p
 outcome (fail-closed ``Verdict(ERROR, RUN_UNADMITTED)`` → action_required), so a refusal never silently
 drops a run to neutral. The typestate is API cohesion (sequencing + pairing), NOT a load-bearing authority.
 
-VALIDATION SPLIT + PROOF-GATED CONSTRUCTION. ``_validate_structural`` is PURE (ICV typing, mint coherence,
+VALIDATION SPLIT + RESULT-BOUND PROOF. ``_validate_structural`` is PURE (ICV typing, mint coherence,
 coordinate completeness, measured-recompute == target) — re-runnable, so ``AdmittedRunResult``'s constructor
 re-runs it (closing the report-recomputed-subject forge). The LIVE currency checks require I/O and are
-``admit_run_result``'s alone (a frozen constructor cannot redo I/O). To stop a DIRECT construction bypassing
-the live checks, ``AdmittedRunResult`` requires a ``_LiveAdmissionGrant`` minted ONLY by
-``admit_run_result`` — an in-process call-path convention (the structural no-bypass test asserts
-``admit_run_result`` is the sole minter), not an unforgeable boundary. Gate-side: imports the engine's
-authoritative return + the attestation identity function + core; ``core`` and the engine runner never
-import this.
+``admit_run_result``'s alone (a frozen constructor cannot redo I/O). To stop a DIRECT construction from
+fabricating an admission, ``AdmittedRunResult`` derives its metadata from a RESULT-BOUND
+``_LiveAdmissionProof`` — a FRESH instance minted (via ``_mint_live_admission_proof``, called only by
+``admit_run_result`` after the live checks) carrying the live-read ``(policy_id, set_id, oracle_head,
+subject)``. It is NOT a reusable singleton and there are NO caller-supplied metadata fields: the constructor
+verifies the proof coheres with the run (same policy; subject == the report-recomputed subject), so a proof
+minted for one run cannot admit another and metadata cannot be forged. An in-process call-path convention
+(the structural no-bypass test asserts ``_mint_live_admission_proof`` is called only from
+``admit_run_result``), not an unforgeable boundary. Gate-side: imports the engine's authoritative return +
+the attestation identity function + core; ``core`` and the engine runner never import this.
 """
 from __future__ import annotations
 
@@ -253,16 +257,43 @@ def _validate_structural(plan: AuthorizedRunPlan, report: TrialReport) -> Blocki
     return measured_subject
 
 
-class _LiveAdmissionGrant:
-    """Proof that ``admit_run_result`` ran the LIVE governance-currency checks. Its sole instance
-    ``_LIVE_GRANT`` is module-private; ``AdmittedRunResult`` refuses construction without it, so a DIRECT
-    construction cannot bypass the live checks. An in-process call-path convention (the structural
-    no-bypass test asserts ``admit_run_result`` is the only minter), NOT an unforgeable authority."""
-
-    __slots__ = ()
+_PROOF_MINT = object()  # module-private mint sentinel — the proof constructor refuses any other key
 
 
-_LIVE_GRANT = _LiveAdmissionGrant()
+@dataclass(frozen=True)
+class _LiveAdmissionProof:
+    """RESULT-BOUND proof that ``admit_run_result`` ran the LIVE governance-currency checks FOR THIS RUN.
+    NOT a reusable singleton: a FRESH instance is minted (by ``_mint_live_admission_proof``) only AFTER the
+    live checks pass, carrying the exact live-read RESULT — ``(policy_id, set_id, oracle_head, subject)``.
+    ``AdmittedRunResult`` DERIVES its public metadata from this proof (never from caller-supplied fields) and
+    verifies the proof coheres with the run (same policy; subject == the report-recomputed subject), so a
+    proof minted for one run cannot admit a different one, and a caller cannot fabricate admission metadata.
+
+    Its constructor refuses any key but the module-private ``_PROOF_MINT`` sentinel, so a caller outside this
+    module cannot construct one. In-process call-path convention (the structural no-bypass test asserts
+    ``_mint_live_admission_proof`` is CALLED only from ``admit_run_result``), NOT an unforgeable boundary —
+    the load-bearing control is that ``admit_run_result`` actually ran the live reads before minting."""
+
+    policy_id: str
+    set_id: str
+    oracle_head: str
+    subject: str
+    mint: InitVar[object] = None
+
+    def __post_init__(self, mint: object) -> None:
+        if mint is not _PROOF_MINT:
+            raise RunAdmissionError(
+                "_LiveAdmissionProof cannot be constructed outside gate.run_admission "
+                "(mint it via admit_run_result's live checks)")
+
+
+def _mint_live_admission_proof(
+    *, policy_id: str, set_id: str, oracle_head: str, subject: str,
+) -> _LiveAdmissionProof:
+    """The SOLE mint of a live-admission proof — called ONLY by ``admit_run_result`` (structural no-bypass
+    test), only AFTER every live governance-currency check has passed, binding the live-read result."""
+    return _LiveAdmissionProof(
+        policy_id=policy_id, set_id=set_id, oracle_head=oracle_head, subject=subject, mint=_PROOF_MINT)
 
 
 @dataclass(frozen=True)
@@ -274,40 +305,53 @@ class AdmittedRunResult:
     BlockingRefusal`` and nothing else.
 
     ``verdict`` is a DERIVED property returning ``report.aggregate`` (no stored copy to diverge). The
-    admission METADATA (``admitted_set_id`` + ``bound_oracle_head`` + ``measured_subject``, which IS the
-    admitted subject) records the SCOPED live governance the run was admitted against, for CP2 to publish so
-    a consumer can detect a stale read.
+    admission METADATA (``admitted_set_id`` + ``bound_oracle_head`` + ``measured_subject``, the admitted
+    subject) are DERIVED PROPERTIES of the result-bound ``_LiveAdmissionProof`` — never caller-supplied
+    fields — so a caller cannot fabricate the SCOPED live governance the run was admitted against.
 
-    Construction is PROOF-GATED: it requires the ``_LiveAdmissionGrant`` minted only by
-    ``admit_run_result``, so a direct construction cannot bypass the live checks. The constructor also
-    re-runs the PURE ``_validate_structural`` and requires ``measured_subject`` to equal the
-    report-recomputed subject — a trusted-code construction check (the live governance authority is
-    ``admit_run_result`` alone, since a frozen constructor cannot redo I/O)."""
+    Construction is PROOF-GATED by a RESULT-BOUND proof: the ``_proof`` must be a ``_LiveAdmissionProof``
+    (which only ``_mint_live_admission_proof`` — called only by ``admit_run_result`` after the live checks —
+    can construct), and the constructor verifies proof↔run COHERENCE: the pure ``_validate_structural`` still
+    re-runs (closing the report-recompute forge), the proof's ``policy_id`` must equal the plan's, and the
+    proof's ``subject`` must equal the report-recomputed subject. So a proof minted for one run cannot admit
+    a different one, and there are no caller-supplied metadata fields to forge. The live governance authority
+    is ``admit_run_result`` alone (a frozen constructor cannot redo I/O); this is a trusted-code call-path
+    convention, not an unforgeable boundary."""
 
     plan: AuthorizedRunPlan
     report: TrialReport
-    measured_subject: str
-    admitted_set_id: str
-    bound_oracle_head: str
-    grant: InitVar[_LiveAdmissionGrant | None] = None
+    _proof: _LiveAdmissionProof
 
-    def __post_init__(self, grant: _LiveAdmissionGrant | None) -> None:
-        if grant is not _LIVE_GRANT:
-            raise RunAdmissionError(
-                "AdmittedRunResult must be minted by admit_run_result (missing the live-admission grant) — "
-                "a direct construction cannot bypass the live governance-currency checks")
-        # defence in depth: re-run the PURE structural validator + require the stored subject to be the
-        # honestly report-recomputed one (the live checks are admit_run_result's authority; the grant proves
-        # they ran, a frozen constructor cannot redo the I/O).
+    def __post_init__(self) -> None:
+        # re-run the PURE structural validator (closes the report-recompute forge) ...
         outcome = _validate_structural(self.plan, self.report)
         if isinstance(outcome, BlockingRefusal):
             raise RunAdmissionError(
                 f"AdmittedRunResult failed structural re-validation ({outcome.reason.value}): "
                 f"{outcome.detail} — construct it via admit_run_result")
-        if self.measured_subject != outcome:
+        # ... then bind the RESULT proof to THIS run: same policy, and the admitted subject IS the
+        # report-recomputed subject. A stale/foreign proof (minted for another run) cannot admit this one.
+        if self._proof.policy_id != self.plan.policy_id:
             raise RunAdmissionError(
-                "AdmittedRunResult.measured_subject != the subject recomputed from the report — the stored "
-                "subject is not the honestly-measured one (construct it via admit_run_result)")
+                f"live-admission proof policy_id {self._proof.policy_id!r} != plan.policy_id "
+                f"{self.plan.policy_id!r} — the proof was minted for a different policy")
+        if self._proof.subject != outcome:
+            raise RunAdmissionError(
+                "live-admission proof subject != the subject recomputed from the report — the proof was "
+                "minted for a different run (construct it via admit_run_result)")
+
+    @property
+    def measured_subject(self) -> str:
+        # the admitted subject IS the proof's subject (== report-recomputed == dispatched target).
+        return self._proof.subject
+
+    @property
+    def admitted_set_id(self) -> str:
+        return self._proof.set_id
+
+    @property
+    def bound_oracle_head(self) -> str:
+        return self._proof.oracle_head
 
     @property
     def verdict(self) -> Verdict:
@@ -341,7 +385,7 @@ def admit_run_result(
     structural = _validate_structural(plan, unadmitted.report)
     if isinstance(structural, BlockingRefusal):
         return structural
-    measured_subject = structural  # == plan.target_subject (proven by the structural pass)
+    # ``structural`` is now the recomputed MEASURED subject (== plan.target_subject, proven).
 
     # --- LIVE governance currency: admission's OWN reads, fail-closed on None/exception ---
     try:
@@ -356,6 +400,15 @@ def admit_run_result(
             f"{plan.policy_id!r} has no current ENABLED attestation — not admissible (fail-closed)")
     live_set_id, bound_head, live_subject = attestation
 
+    # set continuity FIRST — BEFORE the oracle query — so a moved set + an unavailable oracle is classified
+    # as AUTHORIZED_SET_MOVED, not ORACLE_UNAVAILABLE (forensic ordering). The plan's authorized set must be
+    # the policy's live attestation set (a different-set governance rebind must not admit an old plan).
+    if plan.authorized_set != live_set_id:
+        return BlockingRefusal(
+            RunAdmissionRefusal.AUTHORIZED_SET_MOVED,
+            f"plan authorized set {plan.authorized_set!r} != the live attestation set {live_set_id!r} — a "
+            "different-set governance rebind cannot admit an old plan")
+
     try:
         live_head = governance.oracle_head_for(live_set_id)
     except Exception as exc:
@@ -366,14 +419,6 @@ def admit_run_result(
         return BlockingRefusal(
             RunAdmissionRefusal.ORACLE_UNAVAILABLE,
             f"cannot resolve the live set_head for {live_set_id!r} — fail-closed")
-
-    # set continuity: the plan's authorized set must be the policy's live attestation set (a different-set
-    # governance rebind must not silently upgrade an old plan).
-    if plan.authorized_set != live_set_id:
-        return BlockingRefusal(
-            RunAdmissionRefusal.AUTHORIZED_SET_MOVED,
-            f"plan authorized set {plan.authorized_set!r} != the live attestation set {live_set_id!r} — a "
-            "different-set governance rebind cannot admit an old plan")
     # set-head currency: the bound calibration head must still be the live set head (else the set drifted
     # since calibration while the policy stayed ENABLED — the D1 hole).
     if bound_head != live_head:
@@ -389,9 +434,11 @@ def admit_run_result(
             f"dispatched target {plan.target_subject[:12]}.. != the live-authorized subject "
             f"{live_subject[:12]}.. — governance moved the authorized subject since the plan was minted")
 
-    return AdmittedRunResult(
-        plan=plan, report=unadmitted.report, measured_subject=measured_subject,
-        admitted_set_id=live_set_id, bound_oracle_head=live_head, grant=_LIVE_GRANT)
+    # every live check passed — mint a FRESH result-bound proof carrying the live-read values, and derive
+    # the admitted metadata from it (no caller-supplied metadata to forge).
+    proof = _mint_live_admission_proof(
+        policy_id=plan.policy_id, set_id=live_set_id, oracle_head=live_head, subject=live_subject)
+    return AdmittedRunResult(plan=plan, report=unadmitted.report, _proof=proof)
 
 
 __all__ = [
