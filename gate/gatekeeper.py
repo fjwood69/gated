@@ -33,19 +33,22 @@ from dataclasses import dataclass
 from typing import Callable
 
 from core import ResourceBudget, Sandbox
-from core.calibration import CalibrationSet
-from core.chain import content_digest
 from engine.calibration import (
     BackendGuard,
     BundleResolver,
     CalibrationResult,
     DEFAULT_CALIBRATION_TRIALS,
-    ResolvedDetector,
-    calibrate,
 )
 from engine.observation_trust import TrustPolicy
-from gate.attestation import IDENTITY_CONTRACT_VERSION, calibrated_subject_identity
+from gate.attestation import IDENTITY_CONTRACT_VERSION
 from gate.authority import GovernanceApproval
+from gate.calibration_identity import calibration_result_ref
+from gate.calibration_store import CalibrationStore
+from gate.candidate_measurement import (
+    WitnessInconsistencyError,
+    prepare_candidate,
+    produce_candidate_measurement,
+)
 from gate.policy_state import Disposition, PolicyState, disposition_for
 from gate.policy_store import ChainIntegrityError, PolicyStore
 from gate.preflight import ConfigurationError
@@ -229,29 +232,15 @@ class CalibrationOutcome:
     calibration_result_ref: str | None
 
 
-def _result_ref(
-    policy_id: str, pinned_set_version: str, detector_identity: str, result: CalibrationResult
-) -> str:
-    """A deterministic, content-derived handle for a PASS — ties the ref to the exact calibration
-    context (policy, fixture-set version, detector identity, the pass shape). Reproducible (NFR6)
-    and not guessable without the actual result."""
-    return content_digest({
-        "policy_id": policy_id, "pinned_set_version": pinned_set_version,
-        "detector_identity": detector_identity, "passed": result.passed,
-        "n_bad": len(result.outcomes), "fixtures": sorted(o.fixture_id for o in result.outcomes),
-    })
-
-
 def run_calibration(
     policy_id: str,
     *,
     store: PolicyStore,
+    calibration_store: CalibrationStore,
     make_sandbox: Callable[[], Sandbox],
     detector_id: str,
     resolve: BundleResolver,
-    calibration_set: CalibrationSet,
     budget: ResourceBudget,
-    calibration_chain_head: str,
     approval: GovernanceApproval,
     set_id: str = "default",
     trials: int = DEFAULT_CALIBRATION_TRIALS,
@@ -259,7 +248,7 @@ def run_calibration(
     trust_policy: TrustPolicy,
 ) -> CalibrationOutcome:
     """Run the 3.2 BATCH calibrator (shadow-first — full fixture distribution, zero live-PR cost)
-    against the out-of-band CalibrationSet, and record the state move. Records PENDING->CALIBRATING;
+    against the SNAPSHOT-SEALED calibration set, and record the state move. Records PENDING->CALIBRATING;
     on FAIL records CALIBRATING->REJECTED with the breaking fixtures in the (tamper-evident) reason;
     on PASS PERSISTS a calibration_pass attestation (the thing ENABLED binds to, gap-1) and LEAVES
     the policy at CALIBRATING (awaiting human ratify). It NEVER enables — enabling is
@@ -268,23 +257,31 @@ def run_calibration(
     v4 P1-a (fold): the enable path no longer trusts a CALLER identity. The calibration_pass binds the
     MEASUREMENT-DERIVED subject — H(resolved_profile_digest, execution_identity) from the SAME calibration
     run, exactly as ``run_recalibration`` — so governance later chooses WHICH persisted pass to ratify but
-    cannot define what code it ran."""
-    # 3.5 S3-completion CP4 correction 1: resolve the detector bundle ONCE, and pass THAT frozen bundle
-    # into calibrate() (a resolver returning the captured bundle) — the expected-profile digest and the
-    # calibration run share one frozen resolution, never a resolve-for-precheck-then-resolve-again.
-    bundle = resolve(detector_id)  # trusted registry: unregistered / drifted -> raises
+    cannot define what code it ran.
 
-    def _frozen_resolve(_detector_id: str) -> ResolvedDetector:
-        return bundle
-
+    3.5 S3-completion CP4 Slice B: the set head is now MEASURED, not declared. run_calibration SEALS the
+    set from the ``CalibrationStore`` (one consistent read → ``oracle_head`` + fixtures) and binds
+    EVERYTHING — the CALIBRATING intent, the persisted pass, the result ref — to ``sealed.oracle_head``,
+    so no caller can record a pass under a head that never co-existed with the fixtures scored. Measurement
+    flows through the shared ``candidate_measurement`` spine (prepare → produce), so this path and the
+    signed re-calibration runner measure IDENTICALLY and cannot diverge."""
+    # SINGLE SEAL: one consistent read yields the fixtures + the MEASURED oracle head. resolve-BEFORE-intent
+    # (prepare_candidate resolves the bundle ONCE and captures the policy witnesses) so enter_calibrating's
+    # expected-profile digest and the calibration run share one resolution — never resolve-twice. A drifted /
+    # unregistered detector raises here (before CALIBRATING is entered) — fail-closed, nothing recorded.
+    sealed = calibration_store.seal_set(set_id)
+    prepared = prepare_candidate(
+        sealed, resolve=resolve, detector_id=detector_id,
+        trust_policy=trust_policy, backend_guard=backend_guard,
+    )
     # enter CALIBRATING via the atomic enter_calibrating (tier transition + the re-calibration RECOVERY
     # INTENT in one transaction), so a crash between the transition and the run cannot strand the policy
     # (the ENABLED-only relay would never re-trigger it). The intent carries model-(b) ROUTING (detector
-    # registry name + expected profile/trust/guard digests the worker verifies boot objects against); the
-    # four-tuple is MEASURED by the run.
+    # registry name + expected profile/trust/guard digests the worker verifies boot objects against) bound
+    # to the MEASURED head; the four-tuple is MEASURED by the run.
     store.enter_calibrating(
-        policy_id, approval=approval, set_id=set_id, pinned_set_version=calibration_chain_head,
-        detector_id=detector_id, expected_profile_digest=bundle.profile_digest,
+        policy_id, approval=approval, set_id=set_id, pinned_set_version=sealed.oracle_head,
+        detector_id=detector_id, expected_profile_digest=prepared.profile_witness,
         expected_trust_policy_digest=trust_policy.policy_digest,
         # the guard OBJECT's policy digest (read as the runner reads it — off the applied object); a guard
         # with no policy_digest yields "" and enter_calibrating fail-closes (an unroutable intent).
@@ -299,19 +296,30 @@ def run_calibration(
         raise ConfigurationError(
             f"run_calibration: no active re-calibration intent for {policy_id} after enter_calibrating — "
             "fail-closed (a lost intent must not silently skip verification/completion)")
-    # detector by NAME, resolved through the trusted registry ONCE (frozen bundle); never re-resolved.
-    result = calibrate(make_sandbox, detector_id, _frozen_resolve, calibration_set, budget,
-                       trials=trials, backend_guard=backend_guard, trust_policy=trust_policy)
+    # the shared spine calibrates against the sealed fixtures with the frozen bundle and runs the WITNESS
+    # self-consistency check (measured vs the digests captured BEFORE the run). A mid-run mutation of the
+    # applied trust/guard object — which the prepare-then-enter read ordering would otherwise let the
+    # intent's expected digest absorb — is caught HERE; surface it as this path's fail-closed ConfigurationError.
+    try:
+        measurement = produce_candidate_measurement(
+            prepared, make_sandbox=make_sandbox, budget=budget,
+            backend_guard=backend_guard, trust_policy=trust_policy, trials=trials,
+        )
+    except WitnessInconsistencyError as exc:
+        raise ConfigurationError(
+            f"post-run verify (witness): a measured policy coordinate diverged from the pre-run witness — "
+            f"the applied object mutated during calibration ({exc}); refusing to record a wrong-policy run"
+        ) from exc
+    result = measurement.result
     breaking = (*result.fn_failures, *result.fp_failures, *result.flaky, *result.harness_errors)
-    rpd = result.resolved_profile_digest
-    tpd = result.trust_policy_digest
-    gpd = result.guard_policy_digest
-    # correction 2 (defence-in-depth) — POST-run verify WHENEVER all three digests were measured (PASS or
-    # FAIL alike; a FAIL with incomplete measured coords has nothing to verify): the run's MEASURED
-    # profile/trust/guard digests MUST equal the intent's EXPECTED digests, else a WRONG-POLICY run is being
-    # recorded (a FAIL of some other policy must NOT be recorded as this one's rejection). Near-tautological
-    # here (same frozen objects under resolve-once), load-bearing for the async worker where boot objects
-    # could differ; fail-closed on any divergence.
+    rpd = measurement.resolved_profile_digest
+    tpd = measurement.trust_policy_digest
+    gpd = measurement.guard_policy_digest
+    # cross-process defence-in-depth — the run's MEASURED profile/trust/guard digests MUST equal the DURABLE
+    # intent's EXPECTED digests (whenever all three were measured, PASS or FAIL alike). Orthogonal to the
+    # witness check above (which compares against the in-process prepare-time capture): this compares against
+    # what the intent was ROUTED for, the check the async worker (Slice C) relies on when its boot objects are
+    # not the ones prepare captured. Fail-closed on any divergence — a wrong-policy run is never recorded.
     if rpd is not None and tpd is not None and gpd is not None and (rpd, tpd, gpd) != (
         str(_intent["expected_profile_digest"]), str(_intent["expected_trust_policy_digest"]),
         str(_intent["expected_guard_policy_digest"])):
@@ -322,18 +330,22 @@ def run_calibration(
     _fence = dict(policy_generation=str(_intent["policy_generation"]),
                   target_revision=int(_intent["target_revision"]), target_head=str(_intent["target_head"]))
     if result.passed:
-        eid = result.execution_identity.digest() if result.execution_identity is not None else None
-        if rpd is None or tpd is None or gpd is None or eid is None:
+        subject = measurement.subject_identity
+        if subject is None:
             # a clean pass implies all four RuntimeSubject coordinates (profile/trust/guard/execution) —
             # fail-closed rather than persist an un-attributable pass.
             raise ConfigurationError(
                 "a PASSED calibration lacked one of the four runtime-subject coordinates "
                 "(resolved-profile / trust-policy / guard-policy / execution identity) — cannot derive the "
                 "measured subject; refusing to persist an un-attributable pass")
-        subject = calibrated_subject_identity(rpd, tpd, gpd, eid)
-        ref = _result_ref(policy_id, calibration_chain_head, subject, result)
+        # the pass binds the MEASURED head (sealed.oracle_head), never a caller-declared version.
+        ref = calibration_result_ref(
+            policy_id, sealed.oracle_head, subject,
+            passed=result.passed, n_bad=len(result.outcomes),
+            fixture_ids=[o.fixture_id for o in result.outcomes],
+        )
         store.record_calibration_pass(
-            ref, policy_id=policy_id, pinned_set_version=calibration_chain_head,
+            ref, policy_id=policy_id, pinned_set_version=sealed.oracle_head,
             detector_identity=subject, identity_contract_version=IDENTITY_CONTRACT_VERSION, set_id=set_id,
         )
         # sync resolution: PASS → completion CAS. No relay advances the intent during a synchronous run, so
@@ -349,7 +361,7 @@ def run_calibration(
         # (Slice C), where the policy stays CALIBRATING.
         store.transition(
             policy_id, PolicyState.REJECTED, approval=approval,
-            pinned_set_version=calibration_chain_head,
+            pinned_set_version=sealed.oracle_head,
         )
     return CalibrationOutcome(
         policy_id=policy_id, passed=result.passed, report=result.report(),

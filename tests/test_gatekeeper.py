@@ -27,7 +27,7 @@ from core import (
     Verdict,
     VerdictType,
 )
-from core.calibration import CalibrationSet, Fixture, FixtureLabel
+from core.calibration import Fixture, FixtureLabel
 from core.identity import DetectorManifest, identity_for
 from engine.calibration import ResolvedDetector
 from gate.authority import GovernanceApproval
@@ -90,6 +90,22 @@ def _appr(*principals: str, op: str) -> GovernanceApproval:
 def _store() -> PolicyStore:
     d = Path(tempfile.mkdtemp(prefix="mv-gk-"))
     return PolicyStore(d / "tier.db")
+
+
+def _cal_store(*, known_bad: tuple[Fixture, ...], known_good: tuple[Fixture, ...],
+               set_id: str = "default") -> CalibrationStore:
+    """3.5 S3-completion CP4 Slice B: run_calibration now SEALS its set from a CalibrationStore (the head
+    is MEASURED, not a caller string). Populate a store with these fixtures — known-bad appended first so
+    the sealed set's ``(*known_bad, *known_good)`` iteration matches the scripted-detector verdict order."""
+    cal = CalibrationStore(Path(tempfile.mkdtemp(prefix="mv-gk-cs-")) / "cal.db")
+    for op, label, fixtures in ((ChangeOp.ADD_KNOWN_BAD, FixtureLabel.KNOWN_BAD, known_bad),
+                                (ChangeOp.ADD_KNOWN_GOOD, FixtureLabel.KNOWN_GOOD, known_good)):
+        for fx in fixtures:
+            cal.append(op, admission=_ADMIT_CAP,
+                       approval=GovernanceApproval(principals=("g1", "g2"), purpose="admit", rationale="r",
+                                                   operation_id=f"cs-{set_id}-{fx.fixture_id}"),
+                       fixture_id=fx.fixture_id, set_id=set_id, label=label, payload=fx.payload)
+    return cal
 
 
 def _enable(store: PolicyStore, pid: str, *, detector: str = "det-1", set_id: str = "default",
@@ -204,12 +220,12 @@ class Done2_LegibleRefuseTests(unittest.TestCase):
         b1 = Fixture("b1", FixtureLabel.KNOWN_BAD, b"x")
         b2 = Fixture("b2", FixtureLabel.KNOWN_BAD, b"y")
         g1 = Fixture("g1", FixtureLabel.KNOWN_GOOD, b"z")
-        cset = CalibrationSet(known_good=(g1,), known_bad=(b1, b2))
+        cal = _cal_store(known_bad=(b1, b2), known_good=(g1,))
         # detector catches b1 [FAIL]*3, MISSES b2 [PASS]*3, passes g1 [PASS]*3.
         det = _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3 + [_PASS] * 3)
         outcome = run_calibration(
-            "p1", store=s, make_sandbox=_hermetic_factory(), detector_id="d", resolve=_bundle(det),
-            calibration_set=cset, budget=_BUDGET, calibration_chain_head="fx-head",
+            "p1", store=s, calibration_store=cal, make_sandbox=_hermetic_factory(), detector_id="d",
+            resolve=_bundle(det), budget=_BUDGET,
             approval=_appr("gov1", op="p1-cal"), trials=3, backend_guard=test_guard_policy, trust_policy=_REF_TP
         )
         self.assertFalse(outcome.passed)
@@ -225,14 +241,13 @@ class Done3_PerPolicyIsolationTests(unittest.TestCase):
         _enable(s, "pB")  # pB independently ENABLED
         # pA calibration fails -> REJECTED.
         s.transition("pA", PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op="pA-1"))
-        cset = CalibrationSet(
-            known_good=(Fixture("g", FixtureLabel.KNOWN_GOOD, b"z"),),
+        cal = _cal_store(
             known_bad=(Fixture("bad", FixtureLabel.KNOWN_BAD, b"y"),),
+            known_good=(Fixture("g", FixtureLabel.KNOWN_GOOD, b"z"),),
         )
         det = _ScriptedDetector([_PASS] * 3 + [_PASS] * 3)  # MISSES the known-bad
-        run_calibration("pA", store=s, make_sandbox=_hermetic_factory(), detector_id="d",
-                        resolve=_bundle(det), calibration_set=cset, budget=_BUDGET,
-                        calibration_chain_head="fx",
+        run_calibration("pA", store=s, calibration_store=cal, make_sandbox=_hermetic_factory(), detector_id="d",
+                        resolve=_bundle(det), budget=_BUDGET,
                         approval=_appr("gov1", op="pA-cal"), trials=3, backend_guard=test_guard_policy, trust_policy=_REF_TP)
         self.assertIs(s.current_state("pA"), PolicyState.REJECTED)
         self.assertIs(_resolve(s, "pA").disposition, Disposition.SKIP_NEUTRAL)
@@ -267,16 +282,17 @@ class Cp4PostVerifyTests(unittest.TestCase):
     def _run_with_mutating_trust(self, detector: object) -> None:
         s = _store()
         s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op="p1-1"))
-        cset = CalibrationSet(known_good=(Fixture("g", FixtureLabel.KNOWN_GOOD, b"z"),),
-                              known_bad=(Fixture("b", FixtureLabel.KNOWN_BAD, b"y"),))
+        cal = _cal_store(known_bad=(Fixture("b", FixtureLabel.KNOWN_BAD, b"y"),),
+                         known_good=(Fixture("g", FixtureLabel.KNOWN_GOOD, b"z"),))
         with self.assertRaises(ConfigurationError):
-            run_calibration("p1", store=s, make_sandbox=_hermetic_factory(), detector_id="d",
-                            resolve=_bundle(detector), calibration_set=cset, budget=_BUDGET,
-                            calibration_chain_head="fx", approval=_appr("gov1", op="p1-cal"), trials=3,
+            run_calibration("p1", store=s, calibration_store=cal, make_sandbox=_hermetic_factory(),
+                            detector_id="d", resolve=_bundle(detector), budget=_BUDGET,
+                            approval=_appr("gov1", op="p1-cal"), trials=3,
                             backend_guard=test_guard_policy,
                             trust_policy=_MutatingTrust(_REF_TP))  # type: ignore[arg-type]
-        # neither a pass nor a rejection is recorded — the wrong-policy run is refused.
-        self.assertIsNone(s.subject_for_pass("any", "p1", "fx"))
+        # neither a pass nor a rejection is recorded — the wrong-policy run is refused (the shared spine's
+        # WITNESS check fires inside produce, surfaced here as run_calibration's fail-closed ConfigurationError).
+        self.assertIsNone(s.subject_for_pass("any", "p1", cal.set_head("default")))
         self.assertIs(s.current_state("p1"), PolicyState.CALIBRATING)
 
     def test_verify_fires_on_a_would_pass_run(self) -> None:
@@ -292,21 +308,22 @@ class EnablePathTests(unittest.TestCase):
     def test_shadow_first_then_human_ratify_enables(self) -> None:
         s = _store()
         s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op="p1-1"))
-        cset = CalibrationSet(
-            known_good=(Fixture("g1", FixtureLabel.KNOWN_GOOD, b"z"),),
+        cal = _cal_store(
             known_bad=(Fixture("b1", FixtureLabel.KNOWN_BAD, b"y"),),
+            known_good=(Fixture("g1", FixtureLabel.KNOWN_GOOD, b"z"),),
         )
         det = _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3)  # catches b1, passes g1
-        outcome = run_calibration("p1", store=s, make_sandbox=_hermetic_factory(), detector_id="d",
-                                  resolve=_bundle(det), calibration_set=cset, budget=_BUDGET,
-                                  calibration_chain_head="fx",
+        outcome = run_calibration("p1", store=s, calibration_store=cal, make_sandbox=_hermetic_factory(),
+                                  detector_id="d", resolve=_bundle(det), budget=_BUDGET,
                                   approval=_appr("gov1", op="p1-cal"), trials=3, backend_guard=test_guard_policy, trust_policy=_REF_TP)
         self.assertTrue(outcome.passed)
         self.assertIsNotNone(outcome.calibration_result_ref)  # PASS -> a ref to bind ENABLED to
         self.assertIs(s.current_state("p1"), PolicyState.CALIBRATING)  # NOT auto-enabled
-        # human ratify with the ref the PASS produced (mechanically bound — gap-1).
+        # human ratify with the ref the PASS produced (mechanically bound — gap-1). The pass is bound to the
+        # MEASURED sealed head (byte-identical to set_head), so ratify pins that head, not a caller string.
         ratify_enable("p1", store=s, approval=_appr("gov1", op="p1-ratify"),
-                      calibration_result_ref=outcome.calibration_result_ref, pinned_set_version="fx")
+                      calibration_result_ref=outcome.calibration_result_ref,
+                      pinned_set_version=cal.set_head("default"))
         self.assertIs(s.current_state("p1"), PolicyState.ENABLED)
 
 

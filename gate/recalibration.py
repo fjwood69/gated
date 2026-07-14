@@ -38,15 +38,15 @@ from engine.calibration import (
     BackendGuard,
     BundleResolver,
     CalibrationResult,
-    calibrate,
 )
 from engine.observation_trust import TrustPolicy
-from gate.attestation import (
-    MeasurementAttestation,
-    calibrated_subject_identity,
-    sign_measurement,
-)
+from gate.attestation import MeasurementAttestation, sign_measurement
 from gate.calibration_store import CalibrationStore
+from gate.candidate_measurement import (
+    WitnessInconsistencyError,
+    prepare_candidate,
+    produce_candidate_measurement,
+)
 from gate.detector_registry import DetectorResolutionError
 from gate.signing import Signer
 
@@ -114,17 +114,12 @@ def run_recalibration(
         subject_identity=requested_subject_identity,
     )
     issued_at_ms = int(round(now * 1000))
-    try:
-        # ATOMIC resolution: calibrate resolves ONCE and carries the exact resolved-profile digest into
-        # the CalibrationResult, so the signed subject binds the detector that ACTUALLY ran.
-        result = calibrate(
-            make_sandbox, detector_id, resolve, sealed.calibration_set, budget,
-            trials=trials, backend_guard=backend_guard, trust_policy=trust_policy,
-        )
-    except DetectorResolutionError as exc:
-        # drift / unregistered -> a signed ERROR AUDIT attestation with null components: categorically
-        # non-restorable (is_clean_pass False), never a measurement that could restore a tier.
-        unsigned = MeasurementAttestation(
+
+    def _signed_error(marker: str) -> MeasurementAttestation:
+        # a signed ERROR AUDIT attestation with null components: categorically non-restorable
+        # (is_clean_pass False), never a measurement that could restore a tier. The runner ALWAYS emits
+        # signed evidence — a fail-closed measurement condition becomes ERROR evidence, never a crash.
+        return sign_measurement(MeasurementAttestation(
             outcome=VerdictType.ERROR, policy_id=policy_id, subject_identity=None,
             requested_subject_identity=requested_subject_identity,
             resolved_profile_digest=None, trust_policy_digest=None, guard_policy_digest=None,
@@ -132,21 +127,39 @@ def run_recalibration(
             oracle_head=sealed.oracle_head, coverage_digest=sealed.coverage_digest,
             tier_generation=tier_generation, issuer=issuer, run_id=job_id, nonce=nonce,
             issued_at_ms=issued_at_ms, fixture_coverage=sealed.fixture_ids, short_circuit=False,
-            harness_errors=(f"detector-unresolved:{exc.__class__.__name__}",),
-        )
-        return sign_measurement(unsigned, signer=signer)
+            harness_errors=(marker,),
+        ), signer=signer)
 
-    # S3: the four RuntimeSubject coordinates, all measured/derived by the SAME calibration operation.
-    rpd = result.resolved_profile_digest
-    tpd = result.trust_policy_digest       # the APPLIED observation-trust policy (measured provenance)
-    gpd = result.guard_policy_digest       # the APPLIED backend-guard policy (measured provenance)
-    eid = result.execution_identity.digest() if result.execution_identity is not None else None
-    # conditional validity: a subject exists ONLY when ALL FOUR coordinates are present (a clean PASS/FAIL);
-    # an unattestable ERROR (any coordinate missing) carries null coordinates and a null subject.
-    _coords = (rpd, tpd, gpd, eid)
-    subject = (
-        calibrated_subject_identity(rpd, tpd, gpd, eid) if all(c is not None for c in _coords) else None
-    )
+    try:
+        # Shared measurement spine (CP4 Slice B): prepare (resolve ONCE, capture witnesses) then produce
+        # (calibrate on the frozen bundle + witness self-consistency). ATOMIC resolution is preserved — the
+        # resolved-profile digest binds the detector that ACTUALLY ran.
+        prepared = prepare_candidate(
+            sealed, resolve=resolve, detector_id=detector_id,
+            trust_policy=trust_policy, backend_guard=backend_guard,
+        )
+        measurement = produce_candidate_measurement(
+            prepared, make_sandbox=make_sandbox, budget=budget,
+            backend_guard=backend_guard, trust_policy=trust_policy, trials=trials,
+        )
+        result = measurement.result
+    except DetectorResolutionError as exc:
+        # drift / unregistered detector -> signed ERROR audit evidence.
+        return _signed_error(f"detector-unresolved:{exc.__class__.__name__}")
+    except WitnessInconsistencyError:
+        # an applied trust/guard object mutated between prepare and the run (a consistent-but-shifted
+        # policy identity) -> fail-closed as signed ERROR evidence, not an uncaught crash. The runner must
+        # never sign a PASS/FAIL under a policy identity that was not the one prepared.
+        return _signed_error("policy-witness-inconsistent")
+
+    # S3: the four RuntimeSubject coordinates + composite subject, all measured/derived by the SAME
+    # calibration operation and carried on the frozen CandidateMeasurement (conditional validity — the
+    # subject is None unless all four coordinates were measured; an unattestable ERROR carries nulls).
+    rpd = measurement.resolved_profile_digest
+    tpd = measurement.trust_policy_digest   # the APPLIED observation-trust policy (measured provenance)
+    gpd = measurement.guard_policy_digest   # the APPLIED backend-guard policy (measured provenance)
+    eid = measurement.execution_identity_digest
+    subject = measurement.subject_identity
     unsigned = MeasurementAttestation(
         outcome=_outcome_of(result), policy_id=policy_id, subject_identity=subject,
         requested_subject_identity=requested_subject_identity,
