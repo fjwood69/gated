@@ -26,6 +26,7 @@ from gate.authority import GovernanceApproval
 from gate.policy_state import PolicyState
 from gate.policy_store import (
     ActiveCalibrationIntentExists,
+    FailedChurnNotCleared,
     IllegalTransitionError,
     PolicyStore,
     PrivilegedOperationError,
@@ -164,14 +165,6 @@ class EnterCalibratingTests(unittest.TestCase):
 
 
 class SupersedeTests(unittest.TestCase):
-    def test_supersede_active_intent_terminalizes(self) -> None:
-        s = _store()
-        _pending(s)
-        _enter(s)
-        self.assertEqual(s.supersede_active_intent("p1"), 1)
-        self.assertEqual(_rows(s)[0]["status"], "superseded")
-        self.assertIsNone(s.active_intent("p1"))
-
     def test_transition_out_of_calibrating_atomically_supersedes(self) -> None:
         s = _store()
         _pending(s)
@@ -219,61 +212,100 @@ class CompletionCasTests(unittest.TestCase):
 
 
 class ChurnAdvanceTests(unittest.TestCase):
+    def _adv(self, s: PolicyStore, rev: int, head: str, new: str, bound: int = 100) -> str:
+        gen = s.active_intent("p1")["policy_generation"]
+        return s.advance_intent("p1", expect_policy_generation=gen, expect_target_revision=rev,
+                                expect_target_head=head, new_target_head=new, churn_bound=bound)
+
     def test_distinct_successive_heads_each_increment(self) -> None:
         s = _store()
         _pending(s)
         _enter(s)
-        i = s.active_intent("p1")
-        gen = i["policy_generation"]
-        self.assertTrue(s.advance_intent("p1", expect_policy_generation=gen, expect_target_revision=0,
-                                         expect_target_head="oracle-head-1", new_target_head="H2"))
+        self.assertEqual(self._adv(s, 0, "oracle-head-1", "H2"), "advanced")
         r1 = s.active_intent("p1")
         self.assertEqual((r1["target_head"], r1["target_revision"], r1["churn_count"]), ("H2", 1, 1))
         # a genuinely-distinct successive head increments again.
-        self.assertTrue(s.advance_intent("p1", expect_policy_generation=gen, expect_target_revision=1,
-                                         expect_target_head="H2", new_target_head="H3"))
+        self.assertEqual(self._adv(s, 1, "H2", "H3"), "advanced")
         r2 = s.active_intent("p1")
         self.assertEqual((r2["target_head"], r2["target_revision"], r2["churn_count"]), ("H3", 2, 2))
 
     def test_stale_delayed_advance_no_ops(self) -> None:
         # the split-generation fence: a lagging advance (still expecting revision 0 / the old head) after the
-        # row already reached revision 2 matches 0 rows -> no double-increment, no stale overwrite.
+        # row already reached revision 2 matches 0 rows -> "no_op" (no double-increment, no stale overwrite).
         s = _store()
         _pending(s)
         _enter(s)
-        gen = s.active_intent("p1")["policy_generation"]
-        s.advance_intent("p1", expect_policy_generation=gen, expect_target_revision=0,
-                         expect_target_head="oracle-head-1", new_target_head="H2")
-        s.advance_intent("p1", expect_policy_generation=gen, expect_target_revision=1,
-                         expect_target_head="H2", new_target_head="H3")
-        stale = s.advance_intent("p1", expect_policy_generation=gen, expect_target_revision=0,
-                                 expect_target_head="oracle-head-1", new_target_head="H2-again")
-        self.assertFalse(stale)
+        self._adv(s, 0, "oracle-head-1", "H2")
+        self._adv(s, 1, "H2", "H3")
+        self.assertEqual(self._adv(s, 0, "oracle-head-1", "H2-again"), "no_op")
         r = s.active_intent("p1")
         self.assertEqual((r["target_head"], r["target_revision"], r["churn_count"]), ("H3", 2, 2))
 
+    def test_same_head_advance_rejected(self) -> None:
+        # a same-head advance does not churn — rejected (the coalescing invariant: only DISTINCT heads churn).
+        s = _store()
+        _pending(s)
+        _enter(s)
+        with self.assertRaises(ValueError):
+            self._adv(s, 0, "oracle-head-1", "oracle-head-1")
+
+    def test_churn_bound_exceeded_transitions_failed_churn(self) -> None:
+        # with a bound of 1, the SECOND distinct advance would push churn to 2 > 1 -> atomically failed_churn.
+        s = _store()
+        _pending(s)
+        _enter(s)
+        self.assertEqual(self._adv(s, 0, "oracle-head-1", "H2", bound=1), "advanced")  # churn 0 -> 1
+        self.assertEqual(self._adv(s, 1, "H2", "H3", bound=1), "failed_churn")           # 1+1 > 1
+        self.assertEqual(_rows(s)[0]["status"], "failed_churn")
+        self.assertTrue(s.has_failed_churn("p1"))
+
 
 class FailedStateTests(unittest.TestCase):
+    def _fence(self, s: PolicyStore) -> dict[str, object]:
+        i = s.active_intent("p1")
+        return dict(policy_generation=i["policy_generation"], target_revision=i["target_revision"],
+                    target_head=i["target_head"])
+
+    def test_failure_primitives_are_triple_cas_fenced(self) -> None:
+        # a stale worker (wrong revision) cannot terminalize a newer target.
+        s = _store()
+        _pending(s)
+        _enter(s)
+        f = self._fence(s)
+        stale = dict(f, target_revision=int(f["target_revision"]) + 1)  # type: ignore[call-overload]
+        self.assertFalse(s.mark_intent_failed_detector("p1", **stale))  # type: ignore[arg-type]
+        self.assertFalse(s.mark_intent_failed_churn("p1", **stale))  # type: ignore[arg-type]
+        self.assertEqual(_rows(s)[0]["status"], "pending")  # untouched by the stale terminalisation
+
     def test_failed_detector_is_non_blocking(self) -> None:
         s = _store()
         _pending(s)
         _enter(s)
-        self.assertTrue(s.mark_intent_failed_detector("p1"))
+        self.assertTrue(s.mark_intent_failed_detector("p1", **self._fence(s)))  # type: ignore[arg-type]
         self.assertEqual(_rows(s)[0]["status"], "failed_detector")
         self.assertIsNone(s.active_intent("p1"))
         self.assertFalse(s.has_failed_churn("p1"))  # failed_detector does NOT block new autos
 
-    def test_failed_churn_blocks_until_cleared(self) -> None:
+    def test_failed_churn_blocks_enter_until_governance_clear(self) -> None:
         s = _store()
         _pending(s)
         _enter(s)
-        self.assertTrue(s.mark_intent_failed_churn("p1"))
-        self.assertEqual(_rows(s)[0]["status"], "failed_churn")
-        self.assertTrue(s.has_failed_churn("p1"))   # the explicit guard: blocks new autos
-        # human recovery clears the block.
-        self.assertEqual(s.clear_failed_churn("p1"), 1)
+        self.assertTrue(s.mark_intent_failed_churn("p1", **self._fence(s)))  # type: ignore[arg-type]
+        self.assertTrue(s.has_failed_churn("p1"))
+        # recovery states: exit CALIBRATING then back to PENDING — but the failed_churn block persists.
+        s.transition("p1", PolicyState.REJECTED, approval=_appr("g1", op="rej"))
+        s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="re-pend"))
+        with self.assertRaises(FailedChurnNotCleared):
+            _enter(s, op="p1-blocked")
+        # clearing is GOVERNANCE-gated (requires an approval) — a bare call is refused.
+        with self.assertRaises(PrivilegedOperationError):
+            s.clear_failed_churn("p1", approval=GovernanceApproval((), purpose="", rationale="",
+                                                                   operation_id=""))
+        self.assertEqual(s.clear_failed_churn("p1", approval=_appr("g1", op="clear")), 1)
         self.assertFalse(s.has_failed_churn("p1"))
-        self.assertEqual(_rows(s)[0]["status"], "superseded")
+        # now re-entry succeeds.
+        _enter(s, op="p1-recovered")
+        self.assertEqual(s.active_intent("p1")["status"], "pending")
 
 
 if __name__ == "__main__":

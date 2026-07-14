@@ -51,8 +51,16 @@ class IllegalTransitionError(ValueError):
 
 class ActiveCalibrationIntentExists(RuntimeError):
     """3.5 S3-completion CP4: enter_calibrating was called for a policy that already has an active
-    (pending|dispatched) re-calibration intent. Re-entry must first terminalize the prior intent
-    (supersede_active_intent) — an explicit refusal, not a raw DB-unique-constraint violation."""
+    (pending|dispatched) re-calibration intent — an explicit refusal, not a raw DB-unique-constraint
+    violation. Re-entry follows the lifecycle: exit CALIBRATING (which supersedes the intent atomically),
+    then re-enter."""
+
+
+class FailedChurnNotCleared(RuntimeError):
+    """3.5 S3-completion CP4: enter_calibrating was called for a policy with an un-cleared ``failed_churn``
+    intent. ``failed_churn`` is a BLOCKING terminal (the policy never converged) — a human must
+    ``clear_failed_churn`` (governance-gated) before the policy can re-enter automatic calibration. The
+    partial-unique index does NOT cover terminal rows, so this guard is enforced explicitly."""
 
 
 class ChainIntegrityError(RuntimeError):
@@ -400,7 +408,11 @@ class PolicyStore:
             if self._active_intent_unlocked(policy_id) is not None:
                 raise ActiveCalibrationIntentExists(
                     f"{policy_id} already has an active (pending/dispatched) re-calibration intent — "
-                    "terminalize it (supersede_active_intent) before re-entering CALIBRATING")
+                    "exit CALIBRATING (which supersedes it) before re-entering")
+            if self._has_failed_churn_unlocked(policy_id):
+                raise FailedChurnNotCleared(
+                    f"{policy_id} has an un-cleared failed_churn intent — a human must clear_failed_churn "
+                    "(governance-gated) before the policy can re-enter automatic calibration")
             # the CALIBRATING tier record — BYTE-IDENTICAL to transition(CALIBRATING, pinned_set_version=..):
             # routing lives on the INTENT, and the tier row's ``detector_identity`` is the MEASURED subject
             # (absent until ENABLED), so it stays None here.
@@ -473,12 +485,9 @@ class PolicyStore:
         )
         return int(cur.rowcount or 0)
 
-    def supersede_active_intent(self, policy_id: str) -> int:
-        """Terminalize the active re-calibration intent for ``policy_id`` to ``superseded`` (lifecycle exit /
-        human recovery). Returns rows affected. A standalone call for the human-recovery path; transitions
-        OUT of CALIBRATING supersede ATOMICALLY inside the transition transaction (see ``transition``)."""
-        with self._lock:
-            return self._supersede_active_intent_unlocked(policy_id)
+    # NO standalone public supersede: a bare supersede could leave a policy CALIBRATING with NO active
+    # intent (safe-but-stuck). Lifecycle exit supersedes ONLY inside the transition transaction
+    # (``_supersede_active_intent_unlocked``, called by ``transition`` when leaving CALIBRATING).
 
     def mark_intent_satisfied(
         self, policy_id: str, *, policy_generation: str, target_revision: int, target_head: str,
@@ -488,76 +497,107 @@ class PolicyStore:
         advanced (a churn advance bumped the revision, or a policy transition moved the generation) the
         UPDATE matches 0 rows and no-ops → the caller classifies it superseded, never a failure. Returns
         True iff the intent was satisfied."""
+        return self._cas_terminalize(policy_id, "satisfied", policy_generation, target_revision, target_head)
+
+    def mark_intent_failed_detector(
+        self, policy_id: str, *, policy_generation: str, target_revision: int, target_head: str,
+    ) -> bool:
+        """Terminalize the active intent to ``failed_detector`` under the SAME triple CAS as satisfaction —
+        a stale worker cannot terminalize a NEWER target. A DETERMINISTIC calibration failure on the WORKER
+        path (Slice C); the policy STAYS CALIBRATING, and ``failed_detector`` does NOT block a new auto-intent
+        (a set change can legitimately re-trigger). Returns True iff this exact target was terminalized."""
+        return self._cas_terminalize(
+            policy_id, "failed_detector", policy_generation, target_revision, target_head)
+
+    def mark_intent_failed_churn(
+        self, policy_id: str, *, policy_generation: str, target_revision: int, target_head: str,
+    ) -> bool:
+        """Terminalize the active intent to ``failed_churn`` under the SAME triple CAS — the cumulative churn
+        budget was exhausted (the policy never converged). The policy STAYS CALIBRATING (SKIP_NEUTRAL) + an
+        out-of-band alert; NOT unattestable. ``failed_churn`` BLOCKS a new auto-intent (see
+        ``has_failed_churn``) until a human ``clear_failed_churn``. (``advance_intent`` also transitions to
+        ``failed_churn`` atomically when the bound is exceeded; this is the standalone primitive.)"""
+        return self._cas_terminalize(
+            policy_id, "failed_churn", policy_generation, target_revision, target_head)
+
+    def _cas_terminalize(
+        self, policy_id: str, status: str, policy_generation: str, target_revision: int, target_head: str,
+    ) -> bool:
         with self._lock:
             cur = self._conn().execute(
-                "UPDATE refresh_intent SET status='satisfied', updated_at=? "
+                "UPDATE refresh_intent SET status=?, updated_at=? "
                 "WHERE policy_id=? AND status IN ('pending','dispatched') AND policy_generation=? "
                 "AND target_revision=? AND target_head=?",
-                (self._clock(), policy_id, policy_generation, target_revision, target_head),
-            )
-            return bool(cur.rowcount)
-
-    def mark_intent_failed_detector(self, policy_id: str) -> bool:
-        """Terminalize the active intent to ``failed_detector`` — a DETERMINISTIC calibration failure (the
-        detector could not produce a clean pass). Distinct from ``failed_churn``: it does NOT block a new
-        auto-intent (a set change can legitimately re-trigger). Returns True iff a row was terminalized."""
-        with self._lock:
-            cur = self._conn().execute(
-                "UPDATE refresh_intent SET status='failed_detector', updated_at=? "
-                "WHERE policy_id=? AND status IN ('pending','dispatched')",
-                (self._clock(), policy_id),
+                (status, self._clock(), policy_id, policy_generation, target_revision, target_head),
             )
             return bool(cur.rowcount)
 
     def advance_intent(
         self, policy_id: str, *, expect_policy_generation: str, expect_target_revision: int,
-        expect_target_head: str, new_target_head: str,
-    ) -> bool:
-        """Churn-A DISTINCT oracle-head advance: an IN-PLACE CAS UPDATE on the
-        ``(policy_generation, target_revision, target_head)`` triple → set ``target_head`` = the new head,
-        increment ``target_revision`` AND ``churn_count``. A stale/delayed advance (the row is already at a
-        newer revision, e.g. a lagging H2 after H3 landed) matches 0 rows and no-ops — no double-increment,
-        no stale overwrite (the split-generation fence, board D1). This UPDATES the existing active row; it
-        is NOT a supersede-and-replace. Churn increments ONLY on a genuine distinct advance. Returns True
-        iff the advance fired."""
+        expect_target_head: str, new_target_head: str, churn_bound: int,
+    ) -> str:
+        """Churn-A DISTINCT oracle-head advance: an IN-PLACE CAS on the
+        ``(policy_generation, target_revision, target_head)`` triple. ``new_target_head`` MUST be distinct
+        from ``expect_target_head`` (a same-head advance does not churn — rejected with ``ValueError``). If
+        the fence no longer matches (a stale/delayed advance after the row moved on) → ``"no_op"`` (no
+        double-increment, no stale overwrite). Otherwise: if incrementing would exceed ``churn_bound`` the
+        intent ATOMICALLY transitions to ``failed_churn`` (the policy never converged) → ``"failed_churn"``;
+        else ``target_head`` is set, ``target_revision`` + ``churn_count`` increment → ``"advanced"``. The
+        read + conditional write are serialised under the single store lock."""
+        if new_target_head == expect_target_head:
+            raise ValueError(
+                "advance_intent requires a DISTINCT new_target_head — a same-head advance does not churn")
+        if type(churn_bound) is not int:
+            raise ValueError("churn_bound must be an int")
         with self._lock:
-            cur = self._conn().execute(
+            row = self._conn().execute(
+                "SELECT churn_count FROM refresh_intent WHERE policy_id=? AND status IN "
+                "('pending','dispatched') AND policy_generation=? AND target_revision=? AND target_head=?",
+                (policy_id, expect_policy_generation, expect_target_revision, expect_target_head),
+            ).fetchone()
+            if row is None:
+                return "no_op"  # the fence no longer matches — a newer advance already landed
+            now = self._clock()
+            if int(row["churn_count"]) + 1 > churn_bound:
+                self._conn().execute(
+                    "UPDATE refresh_intent SET status='failed_churn', updated_at=? "
+                    "WHERE policy_id=? AND status IN ('pending','dispatched') AND policy_generation=? "
+                    "AND target_revision=? AND target_head=?",
+                    (now, policy_id, expect_policy_generation, expect_target_revision, expect_target_head),
+                )
+                return "failed_churn"
+            self._conn().execute(
                 "UPDATE refresh_intent SET target_head=?, target_revision=target_revision+1, "
                 "churn_count=churn_count+1, updated_at=? "
                 "WHERE policy_id=? AND status IN ('pending','dispatched') AND policy_generation=? "
                 "AND target_revision=? AND target_head=?",
-                (new_target_head, self._clock(), policy_id, expect_policy_generation, expect_target_revision,
+                (new_target_head, now, policy_id, expect_policy_generation, expect_target_revision,
                  expect_target_head),
             )
-            return bool(cur.rowcount)
+            return "advanced"
 
-    def mark_intent_failed_churn(self, policy_id: str) -> bool:
-        """Terminalize the active intent to ``failed_churn`` — the cumulative churn budget was exhausted
-        (the policy never converged to a current head). The policy STAYS CALIBRATING (SKIP_NEUTRAL,
-        never-enforcing) + an alert is raised out-of-band; this is NOT unattestable. ``failed_churn`` is a
-        BLOCKING terminal (see ``has_failed_churn``): recovery is human CALIBRATING→REJECTED→PENDING, which
-        must clear it. Returns True iff a row was terminalized."""
-        with self._lock:
-            cur = self._conn().execute(
-                "UPDATE refresh_intent SET status='failed_churn', updated_at=? "
-                "WHERE policy_id=? AND status IN ('pending','dispatched')",
-                (self._clock(), policy_id),
-            )
-            return bool(cur.rowcount)
-
-    def has_failed_churn(self, policy_id: str) -> bool:
-        """The EXPLICIT failed-churn guard (the partial-unique index does NOT cover terminal rows): a policy
-        with a ``failed_churn`` intent must NOT receive a fresh auto-intent until a human clears it. The
-        relay checks this before creating a new CALIBRATING intent."""
+    def _has_failed_churn_unlocked(self, policy_id: str) -> bool:
         return self._conn().execute(
             "SELECT 1 FROM refresh_intent WHERE policy_id=? AND status='failed_churn' LIMIT 1",
             (policy_id,),
         ).fetchone() is not None
 
-    def clear_failed_churn(self, policy_id: str) -> int:
-        """Human recovery: clear the ``failed_churn`` block (terminalize those rows to ``superseded``) so the
-        policy can re-enter automatic calibration. Called on the recovery path AFTER the human moves the
-        policy CALIBRATING→REJECTED→PENDING_CALIBRATION. Returns rows cleared."""
+    def has_failed_churn(self, policy_id: str) -> bool:
+        """The EXPLICIT failed-churn guard (the partial-unique index does NOT cover terminal rows): a policy
+        with a ``failed_churn`` intent must NOT receive a fresh auto-intent until a human clears it. The
+        relay checks this before creating a new CALIBRATING intent; ``enter_calibrating`` enforces it too."""
+        with self._lock:
+            return self._has_failed_churn_unlocked(policy_id)
+
+    def clear_failed_churn(self, policy_id: str, *, approval: GovernanceApproval) -> int:
+        """Human recovery (GOVERNANCE-gated): clear the ``failed_churn`` block (terminalize those rows to
+        ``superseded``) so the policy can re-enter automatic calibration. Requires a ``GovernanceApproval``
+        (≥1 distinct principal + purpose/rationale/operation_id) — clearing a never-converged block is a
+        deliberate human act, not an unrestricted public update. Returns rows cleared."""
+        if not approval.meets(1):
+            raise PrivilegedOperationError(
+                "clear_failed_churn requires a GovernanceApproval (≥1 distinct principal + "
+                "purpose/rationale/operation_id) — it is a deliberate human recovery, not a bare update")
         with self._lock:
             cur = self._conn().execute(
                 "UPDATE refresh_intent SET status='superseded', updated_at=? "
@@ -957,6 +997,7 @@ __all__ = [
     "PrivilegedOperationError",
     "IllegalTransitionError",
     "ActiveCalibrationIntentExists",
+    "FailedChurnNotCleared",
     "ChainIntegrityError",
     "ReAttestConflict",
 ]

@@ -34,6 +34,7 @@ from gate.authority import GovernanceApproval
 from gate.calibration_store import AdmissionCapability, CalibrationStore, ChangeOp
 from gate.detector_registry import profile_of
 from gate.gatekeeper import ratify_enable, resolve_disposition, run_calibration
+from gate.preflight import ConfigurationError
 from gate.policy_state import Disposition, PolicyState
 from gate.policy_store import PolicyStore
 from gate.snapshot import AttestationRecord, issue_snapshot
@@ -238,6 +239,37 @@ class Done3_PerPolicyIsolationTests(unittest.TestCase):
         # pB untouched by pA's failure.
         self.assertIs(s.current_state("pB"), PolicyState.ENABLED)
         self.assertIs(_resolve(s, "pB").disposition, Disposition.RUN_ENFORCING)
+
+
+class Cp4PostVerifyTests(unittest.TestCase):
+    def test_post_run_verify_fires_on_a_mutating_applied_object(self) -> None:
+        # 3.5 CP4 D3 (prove-it-bites): a trust-policy object whose digest MUTATES between enter_calibrating
+        # (which captures the intent's EXPECTED digest) and the run (which MEASURES it) makes the post-run
+        # verify FIRE — proving it is NOT a tautology under frozen objects. Fail-closed (ConfigurationError).
+        class _MutatingTrust:
+            def __init__(self, base: object) -> None:
+                self._base = base
+                self._n = 0
+
+            @property
+            def policy_digest(self) -> str:
+                self._n += 1
+                return "tp-v1" if self._n == 1 else "tp-v2"  # enter reads first (v1); the run measures v2
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._base, name)  # delegate evaluate() etc. to the real trust policy
+
+        s = _store()
+        s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("gov1", op="p1-1"))
+        cset = CalibrationSet(known_good=(Fixture("g", FixtureLabel.KNOWN_GOOD, b"z"),),
+                              known_bad=(Fixture("b", FixtureLabel.KNOWN_BAD, b"y"),))
+        det = _ScriptedDetector([_FAIL] * 3 + [_PASS] * 3)  # would PASS, but the verify fires first
+        with self.assertRaises(ConfigurationError):
+            run_calibration("p1", store=s, make_sandbox=_hermetic_factory(), detector_id="d",
+                            resolve=_bundle(det), calibration_set=cset, budget=_BUDGET,
+                            calibration_chain_head="fx", approval=_appr("gov1", op="p1-cal"), trials=3,
+                            backend_guard=test_guard_policy,
+                            trust_policy=_MutatingTrust(_REF_TP))  # type: ignore[arg-type]
 
 
 class EnablePathTests(unittest.TestCase):

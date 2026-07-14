@@ -291,18 +291,36 @@ def run_calibration(
         expected_guard_policy_digest=getattr(backend_guard, "policy_digest", ""),
         identity_contract_version=IDENTITY_CONTRACT_VERSION,
     )
-    # capture the intent's fence coordinates for the sync completion CAS (nothing advances it during the
-    # synchronous run — no relay is scanning; the coordinates are stable).
+    # REQUIRE the active intent (fail-closed on None): a lost intent must not silently skip provenance
+    # verification or completion. Its fence coordinates are captured for the sync completion CAS (nothing
+    # advances it during the synchronous run — no relay is scanning — so the coordinates are stable).
     _intent = store.active_intent(policy_id)
+    if _intent is None:
+        raise ConfigurationError(
+            f"run_calibration: no active re-calibration intent for {policy_id} after enter_calibrating — "
+            "fail-closed (a lost intent must not silently skip verification/completion)")
     # detector by NAME, resolved through the trusted registry ONCE (frozen bundle); never re-resolved.
     result = calibrate(make_sandbox, detector_id, _frozen_resolve, calibration_set, budget,
                        trials=trials, backend_guard=backend_guard, trust_policy=trust_policy)
     breaking = (*result.fn_failures, *result.fp_failures, *result.flaky, *result.harness_errors)
+    rpd = result.resolved_profile_digest
+    tpd = result.trust_policy_digest
+    gpd = result.guard_policy_digest
+    # correction 2 (defence-in-depth) — POST-run verify on EVERY conclusive result (PASS AND FAIL): whenever
+    # the run measured its profile/trust/guard digests, they MUST equal the intent's EXPECTED digests, else a
+    # WRONG-POLICY run is being recorded (a FAIL of some other policy must NOT be recorded as this one's
+    # rejection). Near-tautological here (same frozen objects under resolve-once), load-bearing for the async
+    # worker where boot objects could differ; fail-closed on any divergence.
+    if rpd is not None and tpd is not None and gpd is not None and (rpd, tpd, gpd) != (
+        str(_intent["expected_profile_digest"]), str(_intent["expected_trust_policy_digest"]),
+        str(_intent["expected_guard_policy_digest"])):
+        raise ConfigurationError(
+            "post-run verify: the run's MEASURED profile/trust/guard digests do not match the intent's "
+            "EXPECTED digests — a wrong-policy run (fail-closed)")
     ref: str | None = None
+    _fence = dict(policy_generation=str(_intent["policy_generation"]),
+                  target_revision=int(_intent["target_revision"]), target_head=str(_intent["target_head"]))
     if result.passed:
-        rpd = result.resolved_profile_digest
-        tpd = result.trust_policy_digest
-        gpd = result.guard_policy_digest
         eid = result.execution_identity.digest() if result.execution_identity is not None else None
         if rpd is None or tpd is None or gpd is None or eid is None:
             # a clean pass implies all four RuntimeSubject coordinates (profile/trust/guard/execution) —
@@ -311,33 +329,23 @@ def run_calibration(
                 "a PASSED calibration lacked one of the four runtime-subject coordinates "
                 "(resolved-profile / trust-policy / guard-policy / execution identity) — cannot derive the "
                 "measured subject; refusing to persist an un-attributable pass")
-        # correction 2: POST-run verify (defence-in-depth) — the run's MEASURED profile/trust/guard digests
-        # must equal the intent's EXPECTED digests. Near-tautological here (the same frozen objects ran under
-        # resolve-once), load-bearing for the async worker where boot objects could differ from expectations;
-        # fail-closed on any divergence during the run.
-        if _intent is not None and (rpd, tpd, gpd) != (
-            str(_intent["expected_profile_digest"]), str(_intent["expected_trust_policy_digest"]),
-            str(_intent["expected_guard_policy_digest"])):
-            raise ConfigurationError(
-                "post-run verify: the calibration's MEASURED profile/trust/guard digests do not match the "
-                "intent's EXPECTED digests — an applied policy object diverged during the run (fail-closed)")
         subject = calibrated_subject_identity(rpd, tpd, gpd, eid)
         ref = _result_ref(policy_id, calibration_chain_head, subject, result)
         store.record_calibration_pass(
             ref, policy_id=policy_id, pinned_set_version=calibration_chain_head,
             detector_identity=subject, identity_contract_version=IDENTITY_CONTRACT_VERSION, set_id=set_id,
         )
-        # sync resolution: PASS → the intent is SATISFIED (completion CAS under its captured fence
-        # coordinates). The policy STAYS CALIBRATING, awaiting human ratify_enable.
-        if _intent is not None:
-            store.mark_intent_satisfied(
-                policy_id, policy_generation=str(_intent["policy_generation"]),
-                target_revision=int(_intent["target_revision"]), target_head=str(_intent["target_head"]))
+        # sync resolution: PASS → completion CAS. No relay advances the intent during a synchronous run, so
+        # the CAS MUST succeed; a miss means the intent was superseded/advanced unexpectedly → fail-closed.
+        if not store.mark_intent_satisfied(policy_id, **_fence):  # type: ignore[arg-type]
+            raise ConfigurationError(
+                f"sync completion CAS missed for {policy_id} — the intent was superseded/advanced during a "
+                "synchronous calibration (fail-closed; unexpected concurrency)")
     else:
-        # sync resolution: deterministic FAIL → the intent is failed_detector (terminal, non-blocking) FIRST,
-        # then the policy is REJECTED (exits CALIBRATING; its atomic supersede finds the intent already
-        # terminal → no-op, preserving the failed_detector record).
-        store.mark_intent_failed_detector(policy_id)
+        # deterministic FAIL → transition REJECTED directly. The REJECTED transition ATOMICALLY supersedes
+        # the active intent. NO failed_detector on the SYNC path: a REJECTED policy never receives set-change
+        # triggers, so a failed_detector intent would be a dead state — failed_detector is the WORKER path
+        # (Slice C), where the policy stays CALIBRATING.
         store.transition(
             policy_id, PolicyState.REJECTED, approval=approval,
             pinned_set_version=calibration_chain_head,
