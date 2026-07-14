@@ -74,12 +74,12 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(res.measured_subject, _SUBJECT)  # recomputed from the report's coords
         self.assertIs(res.verdict, _PASS)                 # single source: the report's aggregate
 
-    def test_admitted_verdict_is_the_reports_aggregate_not_a_supplied_copy(self) -> None:
-        # even if a caller constructs AdmittedRunResult with a bogus verdict, __post_init__ pins the
-        # report's aggregate — one source of truth, no divergent second copy.
+    def test_admitted_verdict_is_a_derived_property_of_the_report_aggregate(self) -> None:
+        # single source: verdict is a DERIVED property (no stored copy) — it IS report.aggregate, so it
+        # cannot diverge from the report the admission inspected (same discipline as EngineRunResult.verdict).
         rep = _report(aggregate=_FAIL)
-        adm = AdmittedRunResult(plan=_plan(), report=rep, measured_subject=_SUBJECT,
-                                verdict=_PASS)  # supplied PASS is IGNORED
+        adm = AdmittedRunResult(plan=_plan(), report=rep, measured_subject=_SUBJECT)
+        self.assertIs(adm.verdict, rep.aggregate)
         self.assertIs(adm.verdict, _FAIL)
 
     def test_a_real_fail_run_admits_and_carries_the_fail_verdict(self) -> None:

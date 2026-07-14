@@ -43,7 +43,7 @@ engine runner never import this.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 from core import Reason, Verdict, VerdictType
@@ -159,28 +159,28 @@ class AdmittedRunResult:
     type that authorizes posting the measured ``verdict`` as an enforcement result — the publication path
     (CP2) accepts ``AdmittedRunResult | BlockingRefusal`` and nothing else.
 
-    ``verdict`` is the report's aggregate (single source — no second copy to diverge; the constructor pins
-    it from ``report.aggregate`` and ignores any supplied value). The constructor also re-asserts its own
-    coherence (defence in depth): the recorded ``measured_subject`` must equal the plan's ``target_subject``,
-    else it raises ``RunAdmissionError`` rather than yielding a mis-built admitted result. This is a
-    trusted-code construction check, not an unforgeable boundary — admission is the authority; this only
-    stops accidental misuse."""
+    ``verdict`` is a DERIVED property returning ``report.aggregate`` (the same single-source discipline as
+    ``EngineRunResult.verdict``): there is NO stored copy that could diverge from the report the admission
+    inspected. The constructor re-asserts its own coherence (defence in depth): the recorded
+    ``measured_subject`` must equal the plan's ``target_subject``, else it raises ``RunAdmissionError``
+    rather than yielding a mis-built admitted result. This is a trusted-code construction check, not an
+    unforgeable boundary — admission is the authority; this only stops accidental misuse."""
 
     plan: AuthorizedRunPlan
     report: TrialReport
     measured_subject: str
-    # pinned from ``report.aggregate`` in __post_init__ (single source); the default is a placeholder the
-    # constructor overwrites, so the verdict can never be a divergent second copy.
-    verdict: Verdict = field(default=None)  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
-        # single source: the admitted verdict IS the report's aggregate (never a supplied duplicate).
-        object.__setattr__(self, "verdict", self.report.aggregate)
         # defence in depth: an ``AdmittedRunResult`` may only exist for a coherent admission.
         if self.measured_subject != self.plan.target_subject:
             raise RunAdmissionError(
                 "AdmittedRunResult measured_subject != plan.target_subject — an admitted result must "
                 "attest the dispatched target subject (construct it via admit_run_result)")
+
+    @property
+    def verdict(self) -> Verdict:
+        # single source of truth: the admitted verdict IS the report's aggregate — no stored duplicate.
+        return self.report.aggregate
 
 
 def admit_run_result(unadmitted: UnadmittedRunResult) -> AdmittedRunResult | BlockingRefusal:
