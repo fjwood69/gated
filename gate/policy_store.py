@@ -679,9 +679,12 @@ class PolicyStore:
                         raise PrivilegedOperationError(
                             f"intent for {policy_id} at this fence is already satisfied under a DIFFERENT "
                             "calibration_result_ref — refusing to rebind (a satisfied intent binds one pass)")
-                    # verify the EXISTING pass row's full metadata matches this binding (not merely the
-                    # ref STRING) — a matching ref over mismatched metadata is cross-wiring corruption.
-                    self._record_calibration_pass_unlocked(
+                    # VERIFY the existing pass row matches this binding — NEVER recreate it. satisfy is
+                    # atomic (satisfied <=> pass exists), so a MISSING pass under a satisfied intent is
+                    # impossible under correct operation: it is CORRUPTION, not a recoverable crash (a crash
+                    # cannot split the one-txn bundle). Recreating it via the idempotent record helper would
+                    # MASK the corruption and fabricate a pass; verify-and-raise surfaces it instead.
+                    self._verify_calibration_pass_unlocked(
                         calibration_result_ref, policy_id=policy_id, pinned_set_version=pinned_set_version,
                         detector_identity=detector_identity,
                         identity_contract_version=identity_contract_version, set_id=set_id)
@@ -1062,6 +1065,39 @@ class PolicyStore:
             (calibration_result_ref, policy_id, set_id, pinned_set_version, detector_identity,
              identity_contract_version, self._clock()),
         )
+
+    def _verify_calibration_pass_unlocked(
+        self,
+        calibration_result_ref: str,
+        *,
+        policy_id: str,
+        pinned_set_version: str,
+        detector_identity: str,
+        identity_contract_version: int,
+        set_id: str,
+    ) -> None:
+        """Assert an EXISTING ``calibration_pass`` under ``ref`` matches this binding EXACTLY — and NEVER
+        insert. Unlike ``_record_calibration_pass_unlocked``, an absent pass is not repaired: under the
+        atomic ``satisfy_intent_with_pass`` (satisfied ⟺ pass exists), a satisfied intent whose pass is
+        MISSING is impossible under correct operation, so it is CORRUPTION (deletion, DB damage, a bug), not
+        a recoverable crash. Recreating it would mask the signal and fabricate evidence; raise instead. The
+        caller holds ``self._lock`` (and may be mid-transaction)."""
+        existing = self._conn().execute(
+            "SELECT policy_id, set_id, pinned_set_version, detector_identity, "
+            "identity_contract_version FROM calibration_pass WHERE calibration_result_ref=? LIMIT 1",
+            (calibration_result_ref,),
+        ).fetchone()
+        if existing is None:
+            raise PrivilegedOperationError(
+                f"intent is satisfied under ref {calibration_result_ref!r} but NO calibration_pass exists — "
+                "the satisfy-with-pass atomicity invariant (satisfied ⟺ pass) is violated; refusing to "
+                "fabricate a pass (this surfaces corruption rather than silently self-healing it)")
+        if (str(existing["policy_id"]), str(existing["set_id"]), str(existing["pinned_set_version"]),
+                str(existing["detector_identity"]), existing["identity_contract_version"]) != (
+                policy_id, set_id, pinned_set_version, detector_identity, identity_contract_version):
+            raise PrivilegedOperationError(
+                f"the calibration_pass for ref {calibration_result_ref!r} does not match the intent binding "
+                "— cross-wiring corruption; refusing to accept ALREADY_SATISFIED over a mismatched pass")
 
     def current_attestation(self, policy_id: str) -> tuple[str, str, str] | None:
         """The ``(set_id, oracle_head, detector_identity)`` the policy's CURRENT calibration was

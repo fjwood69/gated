@@ -67,6 +67,19 @@ class SatisfyIntentWithPassTests(unittest.TestCase):
         _satisfy(s, "p1", f)
         self.assertIs(_satisfy(s, "p1", f), IntentSatisfyOutcome.ALREADY_SATISFIED)  # idempotent crash-redeliver
 
+    def test_already_satisfied_with_missing_pass_raises_does_not_recreate(self) -> None:
+        # the pin: satisfied <=> pass is an atomicity invariant. A satisfied intent whose pass row is GONE is
+        # corruption (a crash can't split the one-txn bundle), so ALREADY_SATISFIED must VERIFY-and-raise, not
+        # recreate the pass via the idempotent helper.
+        s = _store()
+        f = _fence(_calibrating(s))
+        _satisfy(s, "p1", f, ref="ref-1")
+        s._conn().execute("DELETE FROM calibration_pass WHERE calibration_result_ref='ref-1'")
+        with self.assertRaises(PrivilegedOperationError):
+            _satisfy(s, "p1", f, ref="ref-1")
+        # the pass was NOT fabricated — the corruption is surfaced, not self-healed.
+        self.assertIsNone(s.pass_binding("ref-1", "p1", f["target_head"]))
+
     def test_advanced_fence_is_stale_no_mutation(self) -> None:
         s = _store()
         intent = _calibrating(s)
