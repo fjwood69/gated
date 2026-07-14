@@ -103,7 +103,8 @@ class AuthorizedRunPlan:
     controller reads via ``current_authorized_context``).
 
     ``target_subject`` and ``authorized_subject`` are DISTINCT operands, not a duplicated value: the former
-    is the subject THIS run was dispatched to enforce, the latter is what governance currently authorizes.
+    is the subject THIS run was dispatched to enforce, the latter is what governance authorized AT MINT (a
+    static snapshot — CP1 replaces it with a LIVE governance read at the admission commit point).
     At mint they are equal; admission CHECKS that equality (a superseded / mis-minted plan whose target no
     longer matches the authorized context is refused). Keeping them separate is what lets CP1 replace
     ``authorized_context`` with a LIVE re-read so drift between mint and admission is caught — the equality
