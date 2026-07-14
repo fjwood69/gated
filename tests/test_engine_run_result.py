@@ -62,6 +62,23 @@ class _ThrowingSink:
         raise RuntimeError("audit sink boom")
 
 
+class _FakeGuard:
+    """A guard OBJECT (structurally a BackendGuard): calling it records the invocation; ``policy_digest``
+    is read off the object. Models the reference guard so the runner derives the digest from what it ran."""
+
+    policy_id = "fake-guard:v1"
+
+    def __init__(self) -> None:
+        self.invoked = 0
+
+    @property
+    def policy_digest(self) -> str:
+        return "gd-derived"
+
+    def __call__(self, sandbox: object) -> None:
+        self.invoked += 1
+
+
 def _artifact() -> ArtifactSpec:
     tmp = Path(tempfile.mkdtemp(prefix="mv-err-"))
     return ArtifactSpec(path=tmp, tree_hash=tree_hash(tmp))
@@ -108,12 +125,27 @@ class AuthoritativeReturnTests(unittest.TestCase):
         self.assertIs(res.verdict.status, VerdictType.PASS)
         self.assertEqual(res.trial_report.trials_run, 1)  # full evidence returned despite sink failure
 
-    def test_measured_provenance_rides_the_authoritative_report(self) -> None:
-        # the profile + guard digests the caller resolved ONCE (frozen) are recorded on the return's report.
-        res = run_check(lambda: _HermeticNoOp(), _Scripted([_PASS]), _artifact(), _BUDGET, trials=1,
-                        resolved_profile_digest="pd-frozen", guard_policy_digest="gd-frozen")
+    def test_guard_digest_is_derived_from_the_invoked_object_not_a_caller_string(self) -> None:
+        # measured-not-declared: the runner INVOKES the guard on every sandbox and reads its digest OFF THE
+        # OBJECT. There is NO caller-string param — a caller cannot declare a guard it did not apply.
+        guard = _FakeGuard()
+        res = run_check(lambda: _HermeticNoOp(), _Scripted([_PASS] * 2), _artifact(), _BUDGET, trials=2,
+                        resolved_profile_digest="pd-frozen", backend_guard=guard)
+        self.assertEqual(res.trial_report.guard_policy_digest, "gd-derived")  # off the invoked object
+        self.assertEqual(guard.invoked, 2)  # invoked on EVERY sandbox (both trials)
         self.assertEqual(res.trial_report.resolved_profile_digest, "pd-frozen")
-        self.assertEqual(res.trial_report.guard_policy_digest, "gd-frozen")
+
+    def test_guard_rejection_propagates_fail_closed(self) -> None:
+        # a guard that RAISES (an unaudited backend) fails the run closed — never a silent pass.
+        class _RejectingGuard:
+            policy_digest = "x"
+
+            def __call__(self, sandbox: object) -> None:
+                raise RuntimeError("unaudited backend")
+
+        with self.assertRaises(RuntimeError):
+            run_check(lambda: _HermeticNoOp(), _Scripted([_PASS]), _artifact(), _BUDGET, trials=1,
+                      backend_guard=_RejectingGuard())
 
     def test_return_report_is_the_same_instance_the_sink_receives(self) -> None:
         # BYTE-IDENTITY PROOF for the calibration-path migration (sink -> authoritative return): the return

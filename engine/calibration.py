@@ -300,12 +300,15 @@ def calibrate(
     # mutable capture sink — the calibration decision sources its provenance from the direct return.
     for fixture in (*calibration_set.known_bad, *calibration_set.known_good):
         with _materialised(fixture) as artifact:
+            # S3-completion: pass the BASE factory + the guard OBJECT — the RUNNER invokes the guard on every
+            # sandbox and derives its digest off the invoked object (measured, not a caller string). The
+            # local guarded ``factory`` above is retained ONLY for the one-time ``_require_hermetic`` probe.
             run_result = run_check(
-                factory, detector, artifact, budget,
+                _base, detector, artifact, budget,
                 trials=trials, first_fail=False, detector_id=detector_id,
                 command=bundle.command, trust_policy=trust_policy,
                 resolved_profile_digest=resolved_profile_digest,
-                guard_policy_digest=guard_policy_digest,
+                backend_guard=backend_guard,
             )
         outcomes.append(
             FixtureOutcome(

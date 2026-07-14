@@ -303,6 +303,45 @@ class LiveFrozenCommandTests(unittest.TestCase):
         self.assertEqual(captured.get("command"), frozen)
         self.assertNotEqual(captured.get("command"), detector.entrypoint())
 
+    def test_live_path_supplies_full_four_coordinate_provenance(self) -> None:
+        # S3-completion: the LIVE path must hand run_check every provenance SOURCE for the measured 4-tuple —
+        # the resolved-profile digest (from the bundle), a NON-optional trust policy (applied, digest read off
+        # it), and a NON-optional guard OBJECT (invoked per sandbox, digest read off it). run_check measures
+        # the 4th (execution identity) from the sandbox. Here we prove run_engine_check SUPPLIES the three,
+        # from measured sources — not None, not caller strings.
+        from engine.calibration import ResolvedDetector
+        from engine.retry import RetryCheck
+        from engine.runner import EngineRunResult, TrialReport
+
+        detector = RetryCheck(("python3", "/artifact/main.py"))
+
+        def resolver(detector_id: str) -> ResolvedDetector:
+            return ResolvedDetector(assertion=detector, profile_digest="pd-live", command=None)
+
+        captured: dict[str, object] = {}
+
+        def fake_run_check(make_sandbox, det, artifact, budget, **kw):  # type: ignore[no-untyped-def]
+            captured.update(kw)
+            _pass = Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
+            return EngineRunResult(trial_report=TrialReport(
+                trials=(_pass,), trials_configured=1, short_circuited=False, aggregate=_pass))
+
+        artifact = ArtifactSpec(path=Path(tempfile.mkdtemp(prefix="mv-live4-")), tree_hash="sha256:x")
+        with mock.patch("gate.pipeline.run_check", side_effect=fake_run_check):
+            run_engine_check(artifact, image=_IMAGE, resolve=resolver, detector_id="retry")
+        # coord 1: resolved-profile digest from the bundle (not None).
+        self.assertEqual(captured.get("resolved_profile_digest"), "pd-live")
+        # coord 2: a non-optional trust policy OBJECT is applied (its digest is read off it, not declared).
+        trust = captured.get("trust_policy")
+        self.assertIsNotNone(trust)
+        self.assertTrue(getattr(trust, "policy_digest", None))
+        # coord 3: a non-optional guard OBJECT is supplied (run_check invokes it + reads its digest).
+        guard = captured.get("backend_guard")
+        self.assertIsNotNone(guard)
+        self.assertTrue(getattr(guard, "policy_digest", None))
+        # and NO caller-string guard digest is threaded (the defect this fix closes).
+        self.assertNotIn("guard_policy_digest", captured)
+
 
 class CheckRunProvenanceTests(unittest.TestCase):
     """3.5-close #1.5: the Check Run summary carries the ATTESTED detector_id + image_digest (non-

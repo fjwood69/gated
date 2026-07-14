@@ -201,7 +201,7 @@ def run_check(
     command: Command | None = None,
     trust_policy: TrustPolicy | None = None,
     resolved_profile_digest: str | None = None,
-    guard_policy_digest: str | None = None,
+    backend_guard: Callable[[Sandbox], None] | None = None,
 ) -> EngineRunResult:
     """Run ``check`` on ``artifact`` across up to ``trials`` isolated trials -> one
     Verdict. ``make_sandbox`` is a factory so each trial gets a fresh sandbox instance
@@ -212,10 +212,15 @@ def run_check(
     S3-completion: returns an AUTHORITATIVE, immutable ``EngineRunResult`` carrying the always-constructed
     ``TrialReport`` DIRECTLY (the verdict is a derived property of that report — one source of truth). The
     ``report_sink`` is now a SECONDARY audit copy: it receives the SAME report AFTER it is built, and a
-    sink failure is logged, never affecting the returned evidence. ``resolved_profile_digest`` (the digest
-    of the bundle actually run — resolved ONCE by the caller, never re-resolved per trial) and
-    ``guard_policy_digest`` (read off the guard object ACTUALLY APPLIED) are frozen provenance recorded on
-    the report so the LIVE admission path gets the full measured 4-tuple, not just calibration.
+    sink failure is logged, never affecting the returned evidence.
+
+    S3-completion (measured-not-declared): ``backend_guard`` is the guard OBJECT — the runner INVOKES it on
+    EVERY constructed sandbox (it raises on rejection) and derives ``guard_policy_digest`` internally by
+    reading ``policy_digest`` OFF THAT INVOKED OBJECT. The digest is NEVER accepted as a caller string, so a
+    caller cannot declare a guard it did not apply. ``resolved_profile_digest`` is the digest of the bundle
+    resolved ONCE by the caller (the runner runs the frozen ``command``, never re-resolving per trial), and
+    ``trust_policy``'s digest is read off the policy actually applied in ``_judge`` — so the report's
+    measured 4-tuple originates from the applied objects, not declarations.
 
     3.5 #3 + 3.5-close #1.1: the runner PARENT-MEASURES each trial's execution identity — backend +
     isolation + observer-config from the trusted sandbox object, and the IMMUTABLE image digest the
@@ -232,6 +237,11 @@ def run_check(
     cmd = command if command is not None else check.entrypoint()
     for _ in range(trials):
         sb = make_sandbox()
+        if backend_guard is not None:
+            # S3-completion: the RUNNER invokes the guard on EVERY constructed sandbox (it RAISES on
+            # rejection, fail-closed) — so the guard whose digest is bound to the report is the guard that
+            # actually ran on every trial (measured, not a caller declaration).
+            backend_guard(sb)
         try:
             with sb.session(artifact, check.fixtures) as handle:
                 result = sb.run(handle, cmd, budget)
@@ -277,7 +287,8 @@ def run_check(
         detector_id=detector_id,
         trust_policy_digest=trust_policy.policy_digest if trust_policy is not None else None,
         resolved_profile_digest=resolved_profile_digest,
-        guard_policy_digest=guard_policy_digest,
+        # DERIVED from the guard object the runner actually invoked above — never a caller string.
+        guard_policy_digest=getattr(backend_guard, "policy_digest", None),
     )
     if report_sink is not None:
         # The audit sink is now a SECONDARY consumer of a COPY — it receives the authoritative report but

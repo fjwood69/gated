@@ -57,27 +57,45 @@ _TICKET_ATTR = "_gated_trusted_backend_ticket"
 # the CLOSED set of audited backends. NOT the generic ``Sandbox`` interface: only backends whose
 # isolation is verified in code are here (OCISandbox --network=none; ObservedOCISandbox sealed net +
 # external proxy + escape probe). Adding a backend here is a reviewed, security-relevant change.
-_APPROVED: dict[str, Callable[[str], Sandbox]] = {
-    "oci": lambda image: OCISandbox(image=image),
-    "observed": lambda image: ObservedOCISandbox(image=image),
+_APPROVED: dict[str, Callable[[str, str | None], Sandbox]] = {
+    "oci": lambda image, runtime: OCISandbox(image=image, runtime=runtime),
+    "observed": lambda image, runtime: ObservedOCISandbox(image=image, runtime=runtime),
 }
+
+# S3-completion: the CLOSED set of audited RUNTIMES a trusted factory may PIN (mirrors the sandbox
+# backends' own audited ``_RUNTIMES``). ``runtime=None`` means DETECT (the sandbox probes for a working
+# runtime); an EXPLICIT runtime must be one of THESE — never an arbitrary executable string or path, which
+# would be an exec-injection surface into the container runtime. Adding one is a reviewed change.
+_APPROVED_RUNTIMES: frozenset[str] = frozenset({"podman", "nerdctl", "docker"})
 
 
 def approved_backends() -> tuple[str, ...]:
     return tuple(sorted(_APPROVED))
 
 
-def trusted_sandbox_factory(kind: str, image: str) -> Callable[[], Sandbox]:
+def approved_runtimes() -> tuple[str, ...]:
+    return tuple(sorted(_APPROVED_RUNTIMES))
+
+
+def trusted_sandbox_factory(kind: str, image: str, *, runtime: str | None = None) -> Callable[[], Sandbox]:
     """A ``make_sandbox`` factory that builds an AUDITED backend and stamps it with the trusted-backend
-    token. ``kind`` must name an approved backend; an unknown kind is refused (no arbitrary factory)."""
+    token. ``kind`` must name an approved backend; an unknown kind is refused (no arbitrary factory).
+    ``runtime`` optionally PINS an audited runtime (bypassing per-sandbox detection, preserving explicit
+    behaviour); it must be in the CLOSED ``_APPROVED_RUNTIMES`` set (never an arbitrary string/path) or it
+    is refused BEFORE any sandbox is constructed. ``None`` = detect."""
     if kind not in _APPROVED:
         raise UntrustedBackendError(
             f"backend {kind!r} is not an audited backend {list(approved_backends())}"
         )
+    if runtime is not None and runtime not in _APPROVED_RUNTIMES:
+        raise UntrustedBackendError(
+            f"runtime {runtime!r} is not an approved runtime {list(approved_runtimes())} — refused BEFORE "
+            "construction (an arbitrary runtime string/path would be an exec-injection surface)"
+        )
     build = _APPROVED[kind]
 
     def make() -> Sandbox:
-        sb = build(image)
+        sb = build(image, runtime)
         object.__setattr__(sb, _TICKET_ATTR, _TICKET)  # stamp the audited instance
         return sb
 
@@ -145,18 +163,19 @@ def approved_guard_policies() -> tuple[str, ...]:
 
 
 def guarded_backend(
-    backend_kind: str, image: str, *, guard_policy: str = "trusted-backend",
+    backend_kind: str, image: str, *, guard_policy: str = "trusted-backend", runtime: str | None = None,
 ) -> tuple[Callable[[], Sandbox], BackendGuardPolicy]:
     """Production composition root (B3 / D3): select an approved BACKEND kind AND an approved GUARD POLICY
     from the two DISTINCT closed registries, returning the guarded factory + the guard the entry points
-    now REQUIRE (no ``None`` default). An unknown backend kind or guard policy is refused — no arbitrary
-    factory, no arbitrary guard."""
+    now REQUIRE (no ``None`` default). An unknown backend kind, guard policy, or ``runtime`` is refused —
+    no arbitrary factory, no arbitrary guard, no arbitrary runtime. ``runtime`` PINS an audited runtime
+    (bypassing detection); ``None`` = detect."""
     if guard_policy not in _APPROVED_GUARD_POLICIES:
         raise UntrustedBackendError(
             f"guard policy {guard_policy!r} is not an approved guard policy "
             f"{list(approved_guard_policies())}"
         )
-    make = trusted_sandbox_factory(backend_kind, image)  # refuses an unapproved backend kind
+    make = trusted_sandbox_factory(backend_kind, image, runtime=runtime)  # refuses bad kind OR runtime
     return make, _APPROVED_GUARD_POLICIES[guard_policy]
 
 
@@ -165,6 +184,7 @@ __all__ = [
     "trusted_sandbox_factory",
     "trusted_backend_guard",
     "approved_backends",
+    "approved_runtimes",
     "BackendGuardPolicy",
     "approved_guard_policies",
     "guarded_backend",

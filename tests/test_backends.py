@@ -16,13 +16,18 @@ from core import (
     IsolationLevel,
     ResourceBudget,
 )
+from unittest import mock
+
 from gate.backends import (
     UntrustedBackendError,
     approved_backends,
+    approved_runtimes,
+    guarded_backend,
     trusted_backend_guard,
     trusted_sandbox_factory,
 )
 from sandbox.noop import NoOpSandbox
+from sandbox.oci import OCISandbox
 
 
 class _HermeticNoOp(NoOpSandbox):
@@ -52,18 +57,10 @@ class TrustedBackendGuardTests(unittest.TestCase):
         self.assertEqual(approved_backends(), ("observed", "oci"))  # sorted
 
     def test_trusted_factory_stamps_a_backend_the_guard_accepts(self) -> None:
-        # a backend built through the trusted factory bears the token -> the guard accepts it.
-        # (constructing OCISandbox does NOT run a container — runtime detection is passed explicitly.)
-        from sandbox.oci import OCISandbox
-
-        # the factory's build() would auto-detect a runtime; inject one to avoid a container probe.
-        import gate.backends as _b
-        orig = _b._APPROVED["oci"]
-        _b._APPROVED["oci"] = lambda image: OCISandbox(image=image, runtime="podman")
-        try:
-            sb = trusted_sandbox_factory("oci", "scratch")()
-        finally:
-            _b._APPROVED["oci"] = orig
+        # a backend built through the trusted factory bears the token -> the guard accepts it. The explicit
+        # ``runtime="podman"`` PINS the runtime (S3-completion closed-runtime contract) so construction does
+        # NOT run a container probe.
+        sb = trusted_sandbox_factory("oci", "scratch", runtime="podman")()
         trusted_backend_guard(sb)  # does not raise
         self.assertIsInstance(sb, OCISandbox)
 
@@ -79,6 +76,39 @@ class TrustedBackendGuardTests(unittest.TestCase):
 
         with self.assertRaises(UntrustedBackendError):
             trusted_backend_guard(forged_factory())
+
+
+class ClosedRuntimeContractTests(unittest.TestCase):
+    """S3-completion: the trusted factory may PIN an audited runtime (closed set) so the live path preserves
+    explicit ``podman`` without a detection probe. An arbitrary runtime string/path is refused BEFORE any
+    sandbox is constructed (no exec-injection surface)."""
+
+    def test_approved_runtimes_is_a_closed_set(self) -> None:
+        self.assertEqual(approved_runtimes(), ("docker", "nerdctl", "podman"))  # sorted, closed
+
+    def test_explicit_runtime_is_pinned_and_propagated(self) -> None:
+        sb = trusted_sandbox_factory("oci", "scratch", runtime="podman")()
+        self.assertEqual(sb.runtime, "podman")  # the pinned runtime propagates to the sandbox
+        trusted_backend_guard(sb)  # still token-stamped -> guard accepts
+
+    def test_explicit_runtime_bypasses_the_detection_probe(self) -> None:
+        # a pinned runtime must NOT trigger the per-sandbox container detection probe.
+        with mock.patch.object(OCISandbox, "_detect_runtime") as detect:
+            sb = trusted_sandbox_factory("oci", "scratch", runtime="podman")()
+        detect.assert_not_called()
+        self.assertEqual(sb.runtime, "podman")
+
+    def test_unknown_runtime_refused_before_construction(self) -> None:
+        # an unapproved runtime is refused by the factory BEFORE it builds (or stamps) any sandbox.
+        with mock.patch.object(OCISandbox, "__init__", side_effect=AssertionError("must not construct")):
+            with self.assertRaises(UntrustedBackendError):
+                trusted_sandbox_factory("oci", "scratch", runtime="/bin/evil")
+
+    def test_guarded_backend_threads_the_pinned_runtime(self) -> None:
+        make, guard = guarded_backend("observed", "scratch", runtime="podman")
+        sb = make()
+        self.assertEqual(sb.runtime, "podman")
+        guard(sb)  # the paired reference guard accepts the token-stamped, runtime-pinned sandbox
 
 
 class _AlwaysPass:

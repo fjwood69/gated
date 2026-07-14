@@ -36,9 +36,10 @@ from core import (
 from engine.calibration import BundleResolver, DetectorResolver
 from engine.retry import RetryCheck
 from engine.runner import EngineRunResult, TrialReport, TrialReportSink, run_check
-from sandbox.observed import ObservedOCISandbox
 
 from .artifact import build_artifact_spec, extraction_workspace, safe_extract_tarball
+from .backends import guarded_backend
+from .trust_policy import resolve_trust_policy
 from .detector_registry import (
     DetectorRegistry,
     DetectorResolutionError,
@@ -63,6 +64,9 @@ from .summary import render_check_summary
 DEFAULT_ENGINE_BUDGET = ResourceBudget(wall_clock_seconds=120.0)
 DEFAULT_TRIALS = 3
 DEFAULT_ENTRYPOINT = ("python3", "/artifact/main.py")
+# S3-completion: the reference observation-trust policy the LIVE enforcement path applies (untrusted
+# observations -> ERROR before the detector; measured provenance from the APPLIED policy). completed-only:v1.
+_REFERENCE_TRUST_POLICY = "trust-policy:completed-only"
 
 # artifact_source(event, workspace) -> ArtifactSpec: fetch + extract the PR head into the
 # RAII workspace. Faked in 2.4 (local fixture); the real tarball download lands at 2.5.
@@ -161,14 +165,19 @@ def run_engine_check(
     # detector could answer differently. (Was: resolve() + run_check without command -> re-called entrypoint.)
     bundle = resolve(detector_id)  # trusted registry: unregistered / drifted -> raises -> ERROR
     detector = bundle.assertion
-
-    def make_sandbox() -> ObservedOCISandbox:
-        return ObservedOCISandbox(image=image, runtime="podman")
+    # S3-completion (live 4-tuple): build the AUDITED, token-stamped factory + the reference guard from the
+    # closed composition root, with the runtime PINNED to "podman" (no detection probe, behaviour preserved),
+    # and apply the reference observation-trust policy. The runner INVOKES the guard on every token-stamped
+    # sandbox and derives the guard/trust digests OFF the applied objects — so the live authoritative report
+    # carries all FOUR measured coordinates (profile / trust / guard / execution), not two.
+    make_sandbox, backend_guard = guarded_backend("observed", image, runtime="podman")
+    trust_policy = resolve_trust_policy(_REFERENCE_TRUST_POLICY)
 
     return run_check(
         make_sandbox, detector, artifact, budget,
         trials=trials, first_fail=first_fail, report_sink=report_sink, detector_id=detector_id,
         command=bundle.command, resolved_profile_digest=bundle.profile_digest,
+        trust_policy=trust_policy, backend_guard=backend_guard,
     )
 
 
