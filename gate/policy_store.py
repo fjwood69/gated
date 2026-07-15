@@ -71,6 +71,21 @@ class IntentSatisfyOutcome(Enum):
     STALE = "stale"
 
 
+class IntentFailOutcome(Enum):
+    """3.5 CP4 CP3: the result of ``terminalize_intent_failed_detector`` — the FAIL-side MIRROR of
+    ``IntentSatisfyOutcome``. The worker produces exactly two durable terminals; this is the typed outcome of
+    the clean-FAIL one. ``FAILED`` = the active intent at the fence was terminalized to ``failed_detector`` by
+    THIS call. ``ALREADY_FAILED`` = the intent at the fence is ALREADY ``failed_detector`` (an idempotent
+    crash-redelivery, OR a paused worker resuming after another worker terminalized the SAME fence — the
+    classification is computed IN the mutation's critical section, so this is honest, never a mis-mapped
+    ``STALE``). ``STALE`` = no row at the fence, or it advanced / was superseded / churn-dead / satisfied — no
+    mutation."""
+
+    FAILED = "failed"
+    ALREADY_FAILED = "already_failed"
+    STALE = "stale"
+
+
 class PrivilegedOperationError(PermissionError):
     """A tier transition was attempted without sufficient governance approval (or missing the
     anchors an enablement requires)."""
@@ -563,9 +578,68 @@ class PolicyStore:
         """Terminalize the active intent to ``failed_detector`` under the SAME triple CAS as satisfaction —
         a stale worker cannot terminalize a NEWER target. A DETERMINISTIC calibration failure on the WORKER
         path (Slice C); the policy STAYS CALIBRATING, and ``failed_detector`` does NOT block a new auto-intent
-        (a set change can legitimately re-trigger). Returns True iff this exact target was terminalized."""
+        (a set change can legitimately re-trigger). Returns True iff this exact target was terminalized.
+
+        NOTE: this bare-bool CAS is the standalone primitive (parity with ``mark_intent_satisfied``). The
+        WORKER's completion path is ``terminalize_intent_failed_detector`` — the TYPED primitive whose
+        classification is atomic with the mutation, so a lease that expired-then-was-re-leased cannot make a
+        ``False`` ambiguous (CP3)."""
         return self._cas_terminalize(
             policy_id, "failed_detector", policy_generation, target_revision, target_head)
+
+    def terminalize_intent_failed_detector(
+        self, policy_id: str, *, policy_generation: str, target_revision: int, target_head: str,
+    ) -> IntentFailOutcome:
+        """3.5 CP4 CP3 (board): the WORKER's typed clean-FAIL terminalization — the FAIL-side MIRROR of
+        ``satisfy_intent_with_pass``. The CLASSIFICATION is computed IN the same critical section as the
+        mutation (``BEGIN IMMEDIATE`` under the store lock), which is why it is stronger than a bare-``False``
+        CAS followed by an UNLOCKED re-read.
+
+        The race it closes (board): worker A renews its lease, is PAUSED past the visibility timeout, worker B
+        re-leases the SAME job and terminalizes this fence ``failed_detector``, then A resumes. A bare
+        ``mark_intent_failed_detector`` would return ``False`` and the worker could not distinguish 'advanced'
+        from 'already-failed-at-THIS-fence-by-B' — the queue token-CAS proves ownership only at the renew
+        linearization point, NOT atomically with the PolicyStore write. Here A instead reads ``failed_detector``
+        at the fence WITHIN the terminalizing transaction and gets ``ALREADY_FAILED`` — honest, no mutation.
+
+        Fence-keyed with ``ORDER BY seq DESC LIMIT 1`` (identical to satisfy). Returns ``FAILED`` (this call
+        terminalized the active intent at the fence), ``ALREADY_FAILED`` (the fence is already
+        ``failed_detector``), or ``STALE`` (no row at the fence, or it advanced / superseded / churn-dead /
+        satisfied — no mutation)."""
+        with self._lock:
+            conn = self._conn()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT status FROM refresh_intent "
+                    "WHERE policy_id=? AND policy_generation=? AND target_revision=? AND target_head=? "
+                    "ORDER BY seq DESC LIMIT 1",
+                    (policy_id, policy_generation, target_revision, target_head),
+                ).fetchone()
+                if row is None:
+                    conn.execute("COMMIT")
+                    return IntentFailOutcome.STALE
+                status = str(row["status"])
+                if status == "failed_detector":
+                    conn.execute("COMMIT")
+                    return IntentFailOutcome.ALREADY_FAILED
+                if status not in ("pending", "dispatched"):
+                    conn.execute("COMMIT")  # satisfied / superseded / failed_churn — not this fence's live work
+                    return IntentFailOutcome.STALE
+                cur = conn.execute(
+                    "UPDATE refresh_intent SET status='failed_detector', updated_at=? "
+                    "WHERE policy_id=? AND status IN ('pending','dispatched') AND policy_generation=? "
+                    "AND target_revision=? AND target_head=?",
+                    (self._clock(), policy_id, policy_generation, target_revision, target_head),
+                )
+                if int(cur.rowcount or 0) == 0:
+                    conn.execute("ROLLBACK")  # fence moved between read and write (unreachable under the lock)
+                    return IntentFailOutcome.STALE
+                conn.execute("COMMIT")
+                return IntentFailOutcome.FAILED
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def mark_intent_failed_churn(
         self, policy_id: str, *, policy_generation: str, target_revision: int, target_head: str,
@@ -725,6 +799,55 @@ class PolicyStore:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+
+    def verify_satisfied_pass(
+        self, policy_id: str, *, policy_generation: str, target_revision: int, target_head: str,
+    ) -> bool:
+        """3.5 CP4 CP3 (board): the ALREADY_DONE integrity pin. Before the WORKER's preflight completes a
+        crash-redelivered job as ``ALREADY_DONE``, it must assert the satisfied intent's pass is INTACT — the
+        SAME verify-only corruption rule ``satisfy_intent_with_pass`` enforces on ``ALREADY_SATISFIED`` (a
+        satisfied intent whose pass is missing/mismatched is corruption, never a recoverable crash). Without
+        this, a preflight would complete-as-done over a vanished pass and silently mask the corruption.
+
+        Under the lock, re-read the row at the fence (``ORDER BY seq DESC LIMIT 1``). Returns ``True`` iff it
+        is ``satisfied`` AND its ``calibration_result_ref`` is non-empty AND a ``calibration_pass`` exists
+        under that ref whose ``(policy_id, set_id, pinned_set_version=head, identity_contract_version)`` bind
+        to the intent. Returns ``False`` if the fence is NO LONGER satisfied (a raced reactivation/advance —
+        NOT corruption; the caller treats it as ``STALE``). RAISES ``PrivilegedOperationError`` when satisfied
+        at the fence but the pass is MISSING or MISMATCHED. NO ``detector_identity`` check: the preflight is
+        PRE-measurement and has no fresh subject to compare — pass EXISTENCE + the structural binding is what
+        the ``satisfied ⟺ pass`` invariant guarantees at this point (the subject was fixed at satisfy time)."""
+        with self._lock:
+            row = self._conn().execute(
+                "SELECT status, calibration_result_ref, set_id, identity_contract_version "
+                "FROM refresh_intent "
+                "WHERE policy_id=? AND policy_generation=? AND target_revision=? AND target_head=? "
+                "ORDER BY seq DESC LIMIT 1",
+                (policy_id, policy_generation, target_revision, target_head),
+            ).fetchone()
+            if row is None or str(row["status"]) != "satisfied":
+                return False  # not satisfied at this fence anymore -> STALE, not corruption
+            ref = str(row["calibration_result_ref"] or "")
+            if not ref:
+                raise PrivilegedOperationError(
+                    f"satisfied intent for {policy_id} at this fence has an EMPTY calibration_result_ref — the "
+                    "satisfied⟺pass invariant is violated (corruption); refusing to complete as ALREADY_DONE")
+            existing = self._conn().execute(
+                "SELECT policy_id, set_id, pinned_set_version, identity_contract_version "
+                "FROM calibration_pass WHERE calibration_result_ref=? LIMIT 1",
+                (ref,),
+            ).fetchone()
+            if existing is None:
+                raise PrivilegedOperationError(
+                    f"intent for {policy_id} is satisfied under ref {ref!r} but NO calibration_pass exists — "
+                    "the satisfied⟺pass atomicity invariant is violated (corruption); refusing ALREADY_DONE")
+            if (str(existing["policy_id"]), str(existing["set_id"]), str(existing["pinned_set_version"]),
+                    existing["identity_contract_version"]) != (
+                    policy_id, str(row["set_id"]), target_head, int(row["identity_contract_version"])):
+                raise PrivilegedOperationError(
+                    f"the calibration_pass for ref {ref!r} does not bind to the satisfied intent "
+                    "(policy_id/set_id/head/ICV mismatch) — cross-wiring corruption; refusing ALREADY_DONE")
+            return True
 
     def reactivate_failed_detector(
         self,

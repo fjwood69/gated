@@ -15,7 +15,12 @@ from pathlib import Path
 from gate.attestation import IDENTITY_CONTRACT_VERSION
 from gate.authority import GovernanceApproval
 from gate.policy_state import PolicyState
-from gate.policy_store import IntentSatisfyOutcome, PolicyStore, PrivilegedOperationError
+from gate.policy_store import (
+    IntentFailOutcome,
+    IntentSatisfyOutcome,
+    PolicyStore,
+    PrivilegedOperationError,
+)
 
 _ROUTING = dict(set_id="setA", pinned_set_version="oracle-head-1", detector_id="retry",
                 expected_profile_digest="pd", expected_trust_policy_digest="tp",
@@ -116,6 +121,86 @@ class SatisfyIntentWithPassTests(unittest.TestCase):
                                 "WHERE policy_id='p1'").fetchone()
         self.assertIn(row["status"], ("pending", "dispatched"))     # rolled back — still active
         self.assertIsNone(row["calibration_result_ref"])
+
+
+class TerminalizeFailedDetectorTests(unittest.TestCase):
+    """CP3: the typed FAIL-side mirror of ``satisfy_intent_with_pass``. The classification is computed IN the
+    mutating transaction, so a second terminalize of the SAME fence is ``ALREADY_FAILED`` (the board D3 race),
+    never a mis-mapped ``STALE`` or a double mutation."""
+
+    def test_active_fence_terminalizes_and_returns_failed(self) -> None:
+        s = _store()
+        f = _fence(_calibrating(s))
+        self.assertIs(s.terminalize_intent_failed_detector("p1", **f), IntentFailOutcome.FAILED)
+        row = s._conn().execute("SELECT status FROM refresh_intent WHERE policy_id='p1'").fetchone()
+        self.assertEqual(row["status"], "failed_detector")
+
+    def test_already_failed_fence_returns_already_failed(self) -> None:
+        # D3 at the primitive: A terminalizes; a paused worker B re-runs the SAME fence -> ALREADY_FAILED
+        # (honest, computed inside the txn), NOT a bare-False the caller would mis-map to STALE.
+        s = _store()
+        f = _fence(_calibrating(s))
+        self.assertIs(s.terminalize_intent_failed_detector("p1", **f), IntentFailOutcome.FAILED)
+        self.assertIs(s.terminalize_intent_failed_detector("p1", **f), IntentFailOutcome.ALREADY_FAILED)
+
+    def test_satisfied_fence_is_stale(self) -> None:
+        s = _store()
+        f = _fence(_calibrating(s))
+        _satisfy(s, "p1", f)
+        self.assertIs(s.terminalize_intent_failed_detector("p1", **f), IntentFailOutcome.STALE)
+        self.assertEqual(  # the satisfied row is untouched
+            s._conn().execute("SELECT status FROM refresh_intent WHERE policy_id='p1'").fetchone()["status"],
+            "satisfied")
+
+    def test_advanced_fence_is_stale_no_mutation(self) -> None:
+        s = _store()
+        f = _fence(_calibrating(s))
+        s.advance_intent("p1", expect_policy_generation=f["policy_generation"],
+                         expect_target_revision=f["target_revision"], expect_target_head=f["target_head"],
+                         new_target_head="oracle-head-2", churn_bound=8)
+        self.assertIs(s.terminalize_intent_failed_detector("p1", **f), IntentFailOutcome.STALE)
+        row = s._conn().execute("SELECT status FROM refresh_intent WHERE policy_id='p1' "
+                                "ORDER BY seq DESC LIMIT 1").fetchone()
+        self.assertIn(row["status"], ("pending", "dispatched"))  # the advanced active row untouched
+
+    def test_vanished_fence_is_stale(self) -> None:
+        s = _store()
+        f = dict(policy_generation="nope", target_revision=0, target_head="nope")
+        self.assertIs(s.terminalize_intent_failed_detector("p1", **f), IntentFailOutcome.STALE)
+
+
+class VerifySatisfiedPassTests(unittest.TestCase):
+    """CP3 ALREADY_DONE integrity pin: the preflight-side verify-only corruption rule (mirror of the
+    ALREADY_SATISFIED verify), minus the fresh-subject check (preflight is pre-measurement)."""
+
+    def test_intact_pass_returns_true(self) -> None:
+        s = _store()
+        f = _fence(_calibrating(s))
+        _satisfy(s, "p1", f, ref="ref-1")
+        self.assertTrue(s.verify_satisfied_pass(policy_id="p1", **f))
+
+    def test_missing_pass_raises_corruption(self) -> None:
+        s = _store()
+        f = _fence(_calibrating(s))
+        _satisfy(s, "p1", f, ref="ref-1")
+        s._conn().execute("DELETE FROM calibration_pass WHERE calibration_result_ref='ref-1'")
+        with self.assertRaises(PrivilegedOperationError):
+            s.verify_satisfied_pass(policy_id="p1", **f)
+
+    def test_mismatched_pass_binding_raises_corruption(self) -> None:
+        s = _store()
+        f = _fence(_calibrating(s))
+        _satisfy(s, "p1", f, ref="ref-1")
+        s._conn().execute("UPDATE calibration_pass SET pinned_set_version='WRONG' "
+                          "WHERE calibration_result_ref='ref-1'")
+        with self.assertRaises(PrivilegedOperationError):
+            s.verify_satisfied_pass(policy_id="p1", **f)
+
+    def test_not_satisfied_fence_returns_false_not_corruption(self) -> None:
+        # a still-ACTIVE fence is not satisfied -> False (the caller treats it as STALE); no raise.
+        s = _store()
+        f = _fence(_calibrating(s))
+        self.assertFalse(s.verify_satisfied_pass(policy_id="p1", **f))
 
 
 class ReactivateFailedDetectorTests(unittest.TestCase):

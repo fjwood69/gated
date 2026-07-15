@@ -22,7 +22,7 @@ from gate.authority import GovernanceApproval
 from gate.calibration_store import AdmissionCapability, CalibrationStore, ChangeOp
 from gate.detector_registry import profile_of
 from gate.policy_state import PolicyState
-from gate.policy_store import PolicyStore
+from gate.policy_store import PolicyStore, PrivilegedOperationError
 from gate.recal_queue import JobStatus, RecalQueue
 from gate.recal_relay import relay_intents
 from gate.recal_worker import WorkerOutcome, run_one
@@ -228,6 +228,88 @@ class WorkerCrashAndRaceTests(unittest.TestCase):
         self.assertIsNot(q.get(jid).status, JobStatus.DONE)  # released, NOT completed
         row = s._conn().execute("SELECT status FROM refresh_intent WHERE policy_id='p1'").fetchone()
         self.assertIn(row["status"], ("pending", "dispatched"))  # untouched
+
+
+class _FailBeforeTerminalize(PolicyStore):
+    """Once ARMED, terminalizes the intent's fence ``failed_detector`` the next time
+    ``terminalize_intent_failed_detector`` runs, BEFORE delegating — simulating worker B terminalizing this
+    EXACT fence while worker A was paused past its lease. A's real terminalize then sees the already-failed
+    fence WITHIN its transaction and must return ALREADY_FAILED (the board D3 race, closed structurally)."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.arm = False
+
+    def terminalize_intent_failed_detector(self, policy_id: str, **kw: object):  # type: ignore[no-untyped-def, override]
+        if self.arm:
+            self.arm = False
+            self.mark_intent_failed_detector(policy_id, **kw)  # type: ignore[arg-type]  # worker B, same fence
+        return super().terminalize_intent_failed_detector(policy_id, **kw)  # type: ignore[arg-type]
+
+
+class WorkerFailedTerminalTaxonomyTests(unittest.TestCase):
+    """CP3 formal terminal taxonomy: the FAILED terminal is recognised on crash-redelivery (ALREADY_FAILED,
+    the mirror of ALREADY_DONE) and under the pause-race, and the taxonomy does not LEAK (a non-worker terminal
+    stays STALE). Exact-enum assertions are mandatory (board): a 'no-measure+no-mutation' check alone would
+    pass for BOTH STALE and ALREADY_FAILED."""
+
+    def test_already_failed_job_completes_without_remeasuring(self) -> None:
+        # crash after failed_detector, before queue.complete: the re-delivered worker sees failed_detector +
+        # fence-match at the DOOR -> ALREADY_FAILED, no re-measurement (a PASS detector must NOT satisfy it).
+        cal, s, q = _scenario()
+        intent = s.active_intent("p1")
+        assert intent is not None
+        head = cal.set_head("default")
+        s.mark_intent_failed_detector("p1", policy_generation=intent["policy_generation"],
+                                      target_revision=int(intent["target_revision"]), target_head=head)
+        self.assertIs(_run(cal, s, q, _pass_det()), WorkerOutcome.ALREADY_FAILED)
+        row = s._conn().execute("SELECT status FROM refresh_intent WHERE policy_id='p1'").fetchone()
+        self.assertEqual(row["status"], "failed_detector")           # unchanged, not satisfied
+        self.assertEqual(int(s._conn().execute(                      # NO pass recorded
+            "SELECT COUNT(*) AS n FROM calibration_pass WHERE policy_id='p1'").fetchone()["n"]), 0)
+        self.assertIs(q.get(next(iter(_job_ids(q)))).status, JobStatus.DONE)  # obsolete job completed
+
+    def test_pause_race_other_worker_terminalized_same_fence_is_already_failed(self) -> None:
+        # THE board D3 proof-by-construction: A measures a clean FAIL, renews, then (paused) worker B
+        # terminalizes this EXACT fence; A's atomic terminalize returns ALREADY_FAILED, not a mis-mapped STALE
+        # and not a second mutation.
+        s0 = _FailBeforeTerminalize(Path(tempfile.mkdtemp(prefix="mv-wk-race-")) / "p.db")
+        cal, s, q = _scenario(s=s0)
+        s0.arm = True
+        self.assertIs(_run(cal, s, q, _miss_det()), WorkerOutcome.ALREADY_FAILED)
+        row = s._conn().execute("SELECT status FROM refresh_intent WHERE policy_id='p1'").fetchone()
+        self.assertEqual(row["status"], "failed_detector")
+        self.assertEqual(int(s._conn().execute(                      # no pass, no double mutation
+            "SELECT COUNT(*) AS n FROM calibration_pass WHERE policy_id='p1'").fetchone()["n"]), 0)
+        self.assertIs(q.get(next(iter(_job_ids(q)))).status, JobStatus.DONE)
+
+    def test_failed_churn_at_fence_is_stale_not_already_failed(self) -> None:
+        # taxonomy DOES NOT LEAK: a failed_churn fence (a NON-worker, human-gated terminal) redelivered is
+        # STALE, never ALREADY_FAILED — only worker-produced terminals get ALREADY_* recognition.
+        cal, s, q = _scenario()
+        intent = s.active_intent("p1")
+        assert intent is not None
+        head = cal.set_head("default")
+        s.mark_intent_failed_churn("p1", policy_generation=intent["policy_generation"],
+                                   target_revision=int(intent["target_revision"]), target_head=head)
+        self.assertIs(_run(cal, s, q, _pass_det()), WorkerOutcome.STALE)  # exact enum: STALE, not ALREADY_FAILED
+        self.assertIs(q.get(next(iter(_job_ids(q)))).status, JobStatus.DONE)
+
+    def test_already_done_over_missing_pass_raises_corruption(self) -> None:
+        # ALREADY_DONE integrity pin: a satisfied fence whose pass row is GONE is corruption — the preflight
+        # must RAISE, never complete-as-done over a vanished pass.
+        cal, s, q = _scenario()
+        intent = s.active_intent("p1")
+        assert intent is not None
+        head = cal.set_head("default")
+        s.satisfy_intent_with_pass("p1", policy_generation=intent["policy_generation"],
+                                   target_revision=int(intent["target_revision"]), target_head=head,
+                                   calibration_result_ref="ref-1", pinned_set_version=head,
+                                   detector_identity="subj", identity_contract_version=IDENTITY_CONTRACT_VERSION,
+                                   set_id="default")
+        s._conn().execute("DELETE FROM calibration_pass WHERE calibration_result_ref='ref-1'")
+        with self.assertRaises(PrivilegedOperationError):
+            _run(cal, s, q, _pass_det())
 
 
 def _job_ids(q: RecalQueue) -> set[str]:

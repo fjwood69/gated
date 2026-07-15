@@ -15,14 +15,26 @@ The ordering is the correctness spine (board + deep consult, 7-item checklist):
   with ZERO PolicyStore mutations) → the intent triple-CAS is the completion authority (post-renew races
   resolve through it) → complete the queue lease last.
 
-Taxonomy (ratified): PASS → satisfy_intent_with_pass + complete. Clean deterministic FAIL →
-``failed_detector`` + complete (the policy stays CALIBRATING; never worker-REJECTED). ERROR / unattested /
-boot-digest mismatch / set-head drift (the intent is still ACTIVE at this fence) → RELEASE the lease for a
-prompt re-lease with backoff (``attempts`` → dead-letter after ``max_attempts`` is the calibration-failure
-budget) — NEVER complete, because completing (DONE) a job whose intent is still active would let the
-deterministic job-id dedup STRAND the policy if the set head returns. Only a job that is genuinely OBSOLETE
-— the intent ADVANCED past this fence, or is TERMINAL (satisfied/superseded/failed), or a matching SATISFIED
-job — is completed (DONE) with NO work and NO mutation.
+Terminal taxonomy (CP3 — FORMAL). The worker produces exactly TWO durable PolicyStore terminals, and
+recognises each on crash-redelivery, SYMMETRICALLY:
+
+  PASS → satisfy_intent_with_pass → SATISFIED (idempotent redelivery → ALREADY_SATISFIED, mapped SATISFIED).
+  Clean deterministic FAIL → terminalize_intent_failed_detector → FAILED_DETECTOR (the policy stays
+  CALIBRATING; NEVER worker-REJECTED). A redelivered job whose intent is ALREADY satisfied / failed_detector
+  AT THE MATCHING FENCE → ALREADY_DONE / ALREADY_FAILED: complete, no re-measure. ALREADY_DONE VERIFIES the
+  pass first (a missing/mismatched pass is corruption → raises, never a silent complete).
+
+Both terminalizations are TYPED primitives whose classification is atomic WITH the mutation (one PolicyStore
+critical section), so a lease that expired-then-was-re-leased during a worker pause cannot make the outcome
+ambiguous — the resuming worker reads the already-terminal fence inside the transaction and reports
+ALREADY_* honestly (board D3), never a mis-mapped STALE.
+
+ERROR / unattested / boot-digest mismatch / set-head drift (the intent is still ACTIVE at this fence) →
+RETRY: RELEASE the lease for a prompt re-lease with backoff (``attempts`` → dead-letter after ``max_attempts``
+is the calibration-failure budget) — NEVER complete, because completing (DONE) a job whose intent is still
+active would let the deterministic job-id dedup STRAND the policy if the set head returns. STALE means
+precisely OBSOLETE — the intent ADVANCED past this fence, is a NON-worker terminal (superseded / failed_churn),
+was satisfied-at-ANOTHER-fence, or VANISHED — completed (DONE) with NO work and NO mutation.
 """
 from __future__ import annotations
 
@@ -43,7 +55,7 @@ from gate.candidate_measurement import (
     produce_candidate_measurement,
 )
 from gate.detector_registry import DetectorResolutionError
-from gate.policy_store import IntentSatisfyOutcome, PolicyStore
+from gate.policy_store import IntentFailOutcome, IntentSatisfyOutcome, PolicyStore
 from gate.recal_queue import RecalQueue
 
 
@@ -53,10 +65,11 @@ class WorkerOutcome(Enum):
 
     IDLE = "idle"                              # nothing runnable to lease
     SATISFIED = "satisfied"                    # PASS -> satisfy_with_pass -> complete
-    ALREADY_DONE = "already_done"              # a matching satisfied job -> complete, no measurement
+    ALREADY_DONE = "already_done"              # a matching SATISFIED job (verified pass) -> complete, no measure
     FAILED_DETECTOR = "failed_detector"        # clean deterministic FAIL -> failed_detector -> complete
+    ALREADY_FAILED = "already_failed"          # a matching FAILED_DETECTOR job -> complete, no measure (mirror)
     RETRY = "retry"                            # ERROR / boot mismatch / drift -> release (backoff), no complete
-    STALE = "stale"                            # intent advanced-past / terminal -> complete (obsolete), no mutation
+    STALE = "stale"                            # intent advanced-past / terminal / vanished -> complete, no mutation
     ABORTED_LEASE_LOST = "aborted_lease_lost"  # renewal failed -> ZERO PolicyStore mutations
 
 
@@ -134,11 +147,23 @@ def run_one(
         and job.target_revision == int(intent["target_revision"])
         and job.oracle_head == str(intent["target_head"])
     )
-    if status == "satisfied" and fence_matches:
+    if fence_matches and status == "satisfied":
         # #1 crash-redelivery at the door: a matching satisfied job is done — complete WITHOUT re-measuring.
-        return _complete_no_work(WorkerOutcome.ALREADY_DONE)
+        # ALREADY_DONE integrity pin (board): VERIFY the pass is intact first (the same verify-only corruption
+        # rule satisfy enforces on ALREADY_SATISFIED). A missing/mismatched pass RAISES (surfaced, not masked);
+        # a fence raced off 'satisfied' (reactivation) returns False -> STALE, not a spurious ALREADY_DONE.
+        if policy_store.verify_satisfied_pass(
+                policy_id=job.policy_id, policy_generation=str(intent["policy_generation"]),
+                target_revision=int(intent["target_revision"]), target_head=str(intent["target_head"])):
+            return _complete_no_work(WorkerOutcome.ALREADY_DONE)
+        return _complete_no_work(WorkerOutcome.STALE)
+    if fence_matches and status == "failed_detector":
+        # crash-redelivery of the FAILED terminal (mirror of ALREADY_DONE): the worker already terminalized
+        # this fence failed_detector on a prior lease and crashed before completing the queue — complete
+        # WITHOUT re-measuring. The authoritative post-measurement path is the typed terminalize below.
+        return _complete_no_work(WorkerOutcome.ALREADY_FAILED)
     if status not in ("pending", "dispatched") or not fence_matches:
-        # superseded / failed_* / advanced-past / satisfied-at-another-fence -> stale; complete, no work.
+        # superseded / failed_churn / advanced-past / satisfied-at-another-fence / vanished -> obsolete; STALE.
         return _complete_no_work(WorkerOutcome.STALE)
 
     # the intent's CURRENT fence == the job's (verified) — use it for the completion CAS.
@@ -226,10 +251,18 @@ def run_one(
         return _complete_no_work(WorkerOutcome.SATISFIED)  # SATISFIED or idempotent ALREADY_SATISFIED
 
     # VerdictType.FAIL — an ATTESTED deterministic miss / false-positive / flake -> failed_detector (policy
-    # stays CALIBRATING; NEVER worker-REJECTED). The CAS fences the fence: a miss means the intent advanced.
-    if policy_store.mark_intent_failed_detector(policy_id, policy_generation=pg, target_revision=tr,
-                                                target_head=th):
+    # stays CALIBRATING; NEVER worker-REJECTED). Use the TYPED atomic terminalize: the classification is
+    # computed IN the mutation's critical section, so a lease that expired-then-was-re-leased during our pause
+    # cannot make the outcome ambiguous. FAILED = we terminalized the active fence. ALREADY_FAILED = another
+    # worker terminalized this EXACT fence while we were paused (honest, no double mutation) — this is the
+    # board's D3 race, closed structurally here, NOT by a bare-False-then-unlocked-re-read. STALE = the intent
+    # advanced / was superseded between our live-head recheck and here (a same-store advance the CAS fences).
+    fail = policy_store.terminalize_intent_failed_detector(
+        policy_id, policy_generation=pg, target_revision=tr, target_head=th)
+    if fail is IntentFailOutcome.FAILED:
         return _complete_no_work(WorkerOutcome.FAILED_DETECTOR)
+    if fail is IntentFailOutcome.ALREADY_FAILED:
+        return _complete_no_work(WorkerOutcome.ALREADY_FAILED)
     return _complete_no_work(WorkerOutcome.STALE)
 
 
