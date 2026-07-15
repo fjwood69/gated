@@ -39,7 +39,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 _PROD_PKGS = ("core", "sandbox", "engine", "observe", "gate", "cli")
 # The proxy-bytes golden (shared with the execution-identity golden): re-verified after a REAL install to
 # prove observe/proxy.py shipped and its bytes are unchanged (confound #7).
-_GOLDEN_OBSERVER_CONFIG_HASH = "cb587495998cdde73b2b7a44c5dcfda315e69142ae1c3b812f7a9492c0e38b72"
+_GOLDEN_OBSERVER_CONFIG_HASH = "9e2b216aa2164eca6f513d9cc7a0d7d7bbb96dc1496ab0cda476527e82422862"
 
 
 def _iter_prod_py() -> "list[Path]":

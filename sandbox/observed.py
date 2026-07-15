@@ -133,15 +133,24 @@ def reap_orphans(runtime: str = "podman") -> None:
                 f"startup reaper list of orphan {what} returned {r.returncode} — cannot guarantee a clean slate")
         return r.stdout.split()
 
+    def _rm(args: list[str]) -> None:
+        # best-effort removal; a raw TimeoutExpired/OSError from rm would ESCAPE the reaper's
+        # SandboxLeakError contract, so swallow it — the re-probe below is the sole destruction
+        # authority and normalises every not-CONFIRMED-gone outcome to SandboxLeakError.
+        try:
+            subprocess.run(args, capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
     for c in _names([runtime, "ps", "-a", "--filter", f"name={_PREFIX}", "--format", "{{.Names}}"],
                     "containers"):
-        subprocess.run([runtime, "rm", "-f", c], capture_output=True, timeout=30)
+        _rm([runtime, "rm", "-f", c])
         if probe_existence([runtime, "ps", "-a", "--filter", f"name=^{c}$", "--format", "{{.Names}}"],
                            c) is not Existence.ABSENT:
             raise SandboxLeakError(f"startup reaper could not CONFIRM orphan container {c} destroyed")
     for n in _names([runtime, "network", "ls", "--filter", f"name={_PREFIX}", "--format", "{{.Name}}"],
                     "networks"):
-        subprocess.run([runtime, "network", "rm", "-f", n], capture_output=True, timeout=30)
+        _rm([runtime, "network", "rm", "-f", n])
         if probe_existence([runtime, "network", "ls", "--filter", f"name=^{n}$", "--format", "{{.Name}}"],
                            n) is not Existence.ABSENT:
             raise SandboxLeakError(f"startup reaper could not CONFIRM orphan network {n} destroyed")
@@ -235,9 +244,18 @@ class ObservedOCISandbox(BaseSandbox):
             self._force_remove(proxy)
             proxy_ip = self._start_proxy(network, proxy, fault_mode, image_id)
             baseline = 0
-        except BaseException:
-            self._teardown_infra(network, proxy)
+        except BaseException as setup_exc:
+            # Partial-setup cleanup is under the SAME fail-closed contract as teardown(): the survivor
+            # list is authority, not decoration. If cleanup cannot PROVE the infra gone (EXISTS/UNKNOWN),
+            # surface the lifecycle-containment failure rather than swallow it behind the setup error —
+            # keeping the original setup exception as the cause for diagnosis.
+            survivors = self._teardown_infra(network, proxy)
             shutil.rmtree(snapshot, ignore_errors=True)
+            if survivors:
+                raise SandboxLeakError(
+                    f"partial-setup teardown left survivors {survivors}; "
+                    f"original setup error: {setup_exc!r}"
+                ) from setup_exc
             raise
         return ObservedHandle(
             id=uuid.uuid4().hex, artifact_hash=artifact.tree_hash, snapshot=snapshot,

@@ -30,11 +30,13 @@ _GOLDEN_BACKEND_NAMES = {
 }
 # The proxy-bytes golden: sha256 over observe/proxy.py bytes + escape probe + sealed-network flags
 # (confound #7 — the proxy source is part of identity; pin it and re-verify after a wheel install).
-_GOLDEN_OBSERVER_CONFIG_HASH = "cb587495998cdde73b2b7a44c5dcfda315e69142ae1c3b812f7a9492c0e38b72"
+# rebaked when observe/proxy.py moved the egress count to accept-time (3.5 security dissent, count-at-accept);
+# the proxy source bytes are part of the observer identity, so a legitimate proxy change re-pins this golden.
+_GOLDEN_OBSERVER_CONFIG_HASH = "9e2b216aa2164eca6f513d9cc7a0d7d7bbb96dc1496ab0cda476527e82422862"
 # A representative FULL Observed identity (image_ref a fixed sentinel) and its digest — the tuple AND the
 # digest are pinned so neither a coordinate change nor a digest-formula change slips through.
 _GOLDEN_OBSERVED_IMAGE_REF = "sha256:GOLDEN"
-_GOLDEN_OBSERVED_DIGEST = "dd2e8270feb8c0335f00e94310ad476537ef40e12357867e1b07d0c8726cc970"
+_GOLDEN_OBSERVED_DIGEST = "a1de594c5f7c8745fd7d2404149cbab5c063eb047a89e391ac4006109bd4b79c"
 
 
 class ExecutionIdentityGoldenTests(unittest.TestCase):
