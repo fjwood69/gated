@@ -52,7 +52,14 @@ from gate.candidate_measurement import (
 from gate.policy_state import Disposition, PolicyState, disposition_for
 from gate.policy_store import ChainIntegrityError, IntentSatisfyOutcome, PolicyStore
 from gate.preflight import ConfigurationError
-from gate.snapshot import CalibrationSnapshot, SnapshotError, attested_record, verify_snapshot
+from gate.run_admission import AuthorizedRunPlan
+from gate.snapshot import (
+    CalibrationSnapshot,
+    SnapshotError,
+    attested_record,
+    is_provisionable,
+    verify_snapshot,
+)
 
 # Exceptions that mean "the tier store could not be reached" (vs "the chain is tampered", which is
 # ChainIntegrityError and always blocks). A networked/locked store surfaces these; the gatekeeper
@@ -61,15 +68,37 @@ from gate.snapshot import CalibrationSnapshot, SnapshotError, attested_record, v
 _UNREACHABLE = (sqlite3.OperationalError, OSError)
 
 
+class GateDecisionError(Exception):
+    """A GateDecision was assembled incoherently — RUN_ENFORCING without an AuthorizedRunPlan, or a
+    non-RUN disposition carrying one. Raised at construction so an incoherent decision cannot exist for the
+    dispatcher to act on (CP2 invariant)."""
+
+
 @dataclass(frozen=True)
 class GateDecision:
     """The dispatcher-facing outcome: what to do, the durable state it was based on (None if the
-    decision came from a transient/unattestable condition), why, and the source."""
+    decision came from a transient/unattestable condition), why, the source, and (CP2) the pre-run
+    ``AuthorizedRunPlan`` the run is dispatched under.
+
+    INVARIANT (CP2, enforced in ``__post_init__``): ``disposition is RUN_ENFORCING`` iff ``plan is not
+    None``. Only an enforcing decision carries a plan (minted from the SAME governance snapshot that decided
+    to enforce, so mint-coherence holds by construction); every non-run disposition carries ``None``. The
+    dispatcher therefore never has to synthesise a plan, and an unplanned enforce is impossible."""
 
     disposition: Disposition
     state: PolicyState | None
     reason: str
     source: str  # "live" | "snapshot" | "unattestable"
+    plan: AuthorizedRunPlan | None = None
+
+    def __post_init__(self) -> None:
+        enforcing = self.disposition is Disposition.RUN_ENFORCING
+        if enforcing and self.plan is None:
+            raise GateDecisionError(
+                "a RUN_ENFORCING decision must carry an AuthorizedRunPlan (CP2 invariant)")
+        if not enforcing and self.plan is not None:
+            raise GateDecisionError(
+                f"a {self.disposition.value} decision must NOT carry an AuthorizedRunPlan (CP2 invariant)")
 
 
 def _unattestable(reason: str) -> GateDecision:
@@ -137,10 +166,12 @@ def _enforce_if_oracle_current(
     transitive-spoof the identity binding exists to refuse). The identity check is symmetric with the
     signed-snapshot fallback (``_from_snapshot``); without it, the identity invariant held only during
     a store outage and fell open on the primary path."""
-    attestation = store.current_attestation(policy_id)
-    if attestation is None:
+    # CP2: read the SINGLE chain-verified snapshot ``(set_id, bound_head, subject, ICV)`` — the same row the
+    # AuthorizedRunPlan mints from, so the identity/oracle checks and the mint share ONE governance view.
+    snap = store.current_attestation_snapshot(policy_id)
+    if snap is None:
         return _unattestable("ENABLED policy has no calibration attestation to check the oracle head")
-    set_id, bound_head, bound_identity = attestation
+    set_id, bound_head, bound_identity, icv = snap
     if bound_identity != expected_detector_identity:
         return _unattestable(
             f"live ENABLED calibration attests detector {bound_identity!r} but "
@@ -155,8 +186,13 @@ def _enforce_if_oracle_current(
             f"oracle set {set_id!r} has grown since calibration (head {bound_head[:12]}.. -> "
             f"{current_head[:12]}..) — re-calibration pending"
         )
+    # mint the pre-run plan from the SAME snapshot: mint-coherence (target_subject == authorized_subject ==
+    # the bound subject) holds BY CONSTRUCTION, and set/ICV come from the one row (no read-between-reads).
+    # admit_run_result re-reads live governance POST-run as the authority; this is the dispatched intent.
+    plan = AuthorizedRunPlan(policy_id, target_subject=bound_identity,
+                             authorized_context=(set_id, bound_identity, icv))
     return GateDecision(Disposition.RUN_ENFORCING, PolicyState.ENABLED,
-                        f"live ENABLED, oracle set {set_id!r} current", "live")
+                        f"live ENABLED, oracle set {set_id!r} current", "live", plan=plan)
 
 
 def _from_snapshot(
@@ -204,9 +240,22 @@ def _from_snapshot(
             f"store unreachable; snapshot oracle set {record.set_id!r} drifted since mint "
             f"({record.oracle_head[:12]}.. -> {current_head[:12]}..) — re-calibration pending"
         )
+    # CP2: the record must be PROVISIONABLE under the CURRENT identity contract to mint a plan — a legacy v2
+    # snapshot, an ICV mismatch, or a record not bound to this snapshot CANNOT authorise a current-contract
+    # run. Not provisionable -> UNATTESTABLE (an old artifact proves the past; it cannot dictate current
+    # authority). ``record`` IS the snapshot's own entry (attested_record), so the binding check holds here.
+    if not is_provisionable(snapshot, record, current_icv=IDENTITY_CONTRACT_VERSION):
+        return _unattestable(
+            f"store unreachable; snapshot record for {policy_id!r} is not provisionable under the current "
+            "identity contract (legacy schema or ICV mismatch) — cannot mint an enforcement plan"
+        )
+    plan = AuthorizedRunPlan(
+        policy_id, target_subject=record.detector_identity,
+        authorized_context=(record.set_id, record.detector_identity, record.identity_contract_version))
     return GateDecision(
         Disposition.RUN_ENFORCING, PolicyState.ENABLED,
         f"store unreachable; snapshot attests ENABLED for {record.detector_identity!r}", "snapshot",
+        plan=plan,
     )
 
 

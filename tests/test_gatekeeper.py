@@ -34,11 +34,24 @@ from gate.authority import GovernanceApproval
 from gate.calibration_store import AdmissionCapability, CalibrationStore, ChangeOp
 from gate.detector_registry import profile_of
 from gate.attestation import IDENTITY_CONTRACT_VERSION
-from gate.gatekeeper import ratify_enable, resolve_disposition, run_calibration
+from gate.gatekeeper import (
+    GateDecision,
+    GateDecisionError,
+    ratify_enable,
+    resolve_disposition,
+    run_calibration,
+)
 from gate.preflight import ConfigurationError
 from gate.policy_state import Disposition, PolicyState
 from gate.policy_store import PolicyStore
-from gate.snapshot import AttestationRecord, issue_snapshot
+from gate.run_admission import AuthorizedRunPlan
+from gate.snapshot import (
+    SNAPSHOT_SCHEMA_V2,
+    AttestationRecord,
+    CalibrationSnapshot,
+    _sign,
+    issue_snapshot,
+)
 from sandbox.noop import NoOpSandbox
 from gate.trust_policy import resolve_trust_policy
 from tests._backend_optout import test_guard_policy
@@ -149,6 +162,74 @@ def _resolve(store, pid, *, detector="det-1", snapshot=None, now=1100.0,  # type
         pid, expected_detector_identity=detector, store=store, snapshot=snapshot,
         snapshot_key=_KEY, now=now, oracle_head_for=oracle_head_for,
     )
+
+
+def _legacy_v2_snap(pid: str, detector: str, *, set_id: str = "default", oracle_head: str = "fx-head"):  # type: ignore[no-untyped-def]
+    # a LEGACY v2 snapshot (no signed ICV) with a VALID v2 MAC — verifies, but is not provisionable.
+    rec = AttestationRecord(policy_id=pid, detector_identity=detector, calibration_result_ref="cal-1",
+                            fixture_set_version="fx-head", tier_chain_head="tier-head", backend="podman",
+                            set_id=set_id, oracle_head=oracle_head)
+    unsigned = CalibrationSnapshot(records={pid: rec}, issued_at=1000.0, valid_until=1300.0, mac="",
+                                   schema_version=SNAPSHOT_SCHEMA_V2)
+    return CalibrationSnapshot(records={pid: rec}, issued_at=1000.0, valid_until=1300.0,
+                               mac=_sign(unsigned._payload(), _KEY), schema_version=SNAPSHOT_SCHEMA_V2)
+
+
+class Cp2PlanMintTests(unittest.TestCase):
+    """CP2 S3: a RUN_ENFORCING decision carries a mint-COHERENT AuthorizedRunPlan (target == authorized ==
+    the bound subject, set + ICV from ONE governance snapshot); every non-run carries None; the invariant is
+    enforced at construction; and a LEGACY v2 snapshot cannot mint a plan (fail-closed to UNATTESTABLE)."""
+
+    def _unreach(self):  # type: ignore[no-untyped-def]
+        return _UnreachableStore(Path(tempfile.mkdtemp(prefix="mv-gk-cp2-")) / "t.db")
+
+    def test_live_enforce_mints_a_coherent_plan(self) -> None:
+        s = _store()
+        _enable(s, "p1", detector="det-1", set_id="default", head="fx-head")
+        d = _resolve(s, "p1", detector="det-1")
+        self.assertIs(d.disposition, Disposition.RUN_ENFORCING)
+        assert d.plan is not None
+        self.assertEqual(d.plan.policy_id, "p1")
+        self.assertEqual(d.plan.target_subject, "det-1")
+        self.assertEqual(d.plan.authorized_subject, "det-1")          # mint-coherent
+        self.assertEqual(d.plan.authorized_set, "default")
+        self.assertEqual(d.plan.identity_contract_version, IDENTITY_CONTRACT_VERSION)
+
+    def test_snapshot_enforce_mints_a_coherent_plan(self) -> None:
+        d = _resolve(self._unreach(), "p1", detector="det-1", snapshot=_snap("p1", "det-1"))
+        self.assertIs(d.disposition, Disposition.RUN_ENFORCING)
+        self.assertEqual(d.source, "snapshot")
+        assert d.plan is not None
+        self.assertEqual(d.plan.target_subject, "det-1")
+        self.assertEqual(d.plan.authorized_set, "default")
+        self.assertEqual(d.plan.identity_contract_version, IDENTITY_CONTRACT_VERSION)
+
+    def test_live_and_snapshot_paths_mint_equivalent_plans(self) -> None:
+        # decision equivalence (mini-keystone): the same policy mints the SAME authorized_context both ways.
+        s = _store()
+        _enable(s, "p1", detector="det-1")
+        live = _resolve(s, "p1", detector="det-1")
+        fallback = _resolve(self._unreach(), "p1", detector="det-1", snapshot=_snap("p1", "det-1"))
+        assert live.plan is not None and fallback.plan is not None
+        self.assertEqual(live.plan.authorized_context, fallback.plan.authorized_context)
+
+    def test_non_run_decision_carries_no_plan(self) -> None:
+        d = _resolve(_store(), "absent")                              # no policy -> SKIP_NEUTRAL
+        self.assertIsNot(d.disposition, Disposition.RUN_ENFORCING)
+        self.assertIsNone(d.plan)
+
+    def test_gatedecision_invariant_rejects_incoherent(self) -> None:
+        with self.assertRaises(GateDecisionError):                    # RUN_ENFORCING without a plan
+            GateDecision(Disposition.RUN_ENFORCING, PolicyState.ENABLED, "x", "live", plan=None)
+        with self.assertRaises(GateDecisionError):                    # non-run WITH a plan
+            GateDecision(Disposition.SKIP_NEUTRAL, None, "x", "live",
+                         plan=AuthorizedRunPlan("p", "s", ("set", "s", IDENTITY_CONTRACT_VERSION)))
+
+    def test_legacy_v2_snapshot_cannot_mint_and_is_unattestable(self) -> None:
+        d = _resolve(self._unreach(), "p1", detector="det-1", snapshot=_legacy_v2_snap("p1", "det-1"))
+        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)  # can't mint under current contract
+        self.assertEqual(d.source, "unattestable")
+        self.assertIsNone(d.plan)
 
 
 class Done1_UnattestableBlocksTests(unittest.TestCase):
