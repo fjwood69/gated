@@ -55,7 +55,10 @@ from engine.calibration import (
     CalibrationResult,
     calibrate,
 )
+from engine.observation_trust import TrustPolicy
+from gate.attestation import IDENTITY_CONTRACT_VERSION
 from gate.authority import AuthorityDomain, GovernanceApproval
+from gate.trust_policy import resolve_trust_policy
 
 
 class BlindHoldoutError(RuntimeError):
@@ -169,7 +172,15 @@ class BlindHoldoutStore:
 
 # ---- the signed acceptance report ----------------------------------------------------------------
 
-CALIBRATION_ENVELOPE_VERSION = 1
+# CP2 S4b — the acceptance receipt is EVIDENCE-CHAIN load-bearing: without an explicit ICV + the full
+# four measured coordinate digests, an old v1 receipt is indistinguishable from evidence produced under the
+# current four-coordinate identity contract. v2 binds all four MEASURED coordinates (profile / trust / guard
+# / execution) + the ICV, version-discriminated. Legacy v1 receipts stay AUTHENTIC (verify via their exact
+# historical rendering + domain version) but are NOT ADMISSIBLE for current provisioning.
+CALIBRATION_ENVELOPE_V1 = 1
+CALIBRATION_ENVELOPE_V2 = 2
+CALIBRATION_ENVELOPE_CURRENT = CALIBRATION_ENVELOPE_V2
+_LEGACY_ENVELOPE_ICV = -1  # sentinel: a v1 receipt has no signed ICV -> not admissible
 _ENVELOPE_DOMAIN = "gated.acceptance-envelope"
 
 
@@ -213,14 +224,26 @@ class AcceptanceReport:
     claim: str
     issued_at: float
     signature: str = ""
+    # CP2 S4b v2 fields — the current four-coordinate identity contract. Defaults are the LEGACY sentinels
+    # (only for loading/representing a v1 receipt); a v2 mint sets every one (no compatibility default).
+    schema_version: int = CALIBRATION_ENVELOPE_V1
+    identity_contract_version: int = _LEGACY_ENVELOPE_ICV
+    trust_policy_digest: str = ""    # MEASURED applied trust-policy digest (from the lanes' CalibrationResult)
+    guard_policy_digest: str = ""    # MEASURED applied guard-policy digest (from the lanes' CalibrationResult)
 
     def _envelope(self) -> dict[str, object]:
         """The CalibrationEnvelope — the SIGNED content, EXCLUDING ``signature``. Four domain groups:
         the resolver-derived detector identity, the calibration inputs, the measured execution identity,
         and the outcome/coverage. Every field except the signature is inside it, so a signature covers the
         whole receipt. Float-free (``issued_at`` is bound as integer ms) so ``canonical_digest`` accepts
-        it — the schema validation is the point, not a workaround."""
-        return {
+        it — the schema validation is the point, not a workaround.
+
+        VERSION-BRANCHED (CP2 S4b): a v1 receipt renders EXACTLY as it historically did so its signature
+        stays verifiable; a v2 receipt additionally binds the ICV + the MEASURED trust/guard coordinate
+        digests (profile + execution were already bound), so all four coordinates + the identity contract
+        are signed. The domain version (``_envelope_digest``) is bumped in lock-step, so a v1 and a v2
+        receipt over the same fields never share signed bytes."""
+        env: dict[str, object] = {
             "resolved_profile_digest": self.resolved_profile_digest,
             "calibration_inputs": {
                 "visible_corpus_digest": self.visible_corpus_digest,
@@ -242,6 +265,16 @@ class AcceptanceReport:
                 "issued_at_ms": int(round(self.issued_at * 1000)),
             },
         }
+        if self.schema_version >= CALIBRATION_ENVELOPE_V2:
+            env["schema_version"] = self.schema_version
+            env["identity_contract_version"] = self.identity_contract_version
+            env["measured_coordinates"] = {
+                # profile + execution are already bound above; the v2 receipt adds the two that were missing,
+                # so the signed receipt carries the WHOLE four-coordinate measured identity.
+                "trust_policy_digest": self.trust_policy_digest,
+                "guard_policy_digest": self.guard_policy_digest,
+            }
+        return env
 
 
 _HONEST_CLAIM = ("resists the CURRENT corpus (visible + blind holdout) — provisional, the corpus grows; "
@@ -267,8 +300,39 @@ def _content_hashes(cset: CalibrationSet) -> set[str]:
 def _envelope_digest(report: AcceptanceReport) -> str:
     """The domain-separated, schema-validated digest of the CalibrationEnvelope — what gets signed. Uses
     ``canonical_digest`` (NFC-normalised, float-rejecting, domain-tagged, versioned), so the signed bytes
-    are cross-language reproducible and a type-confusion cannot collide two distinct receipts."""
-    return canonical_digest(_ENVELOPE_DOMAIN, report._envelope(), version=CALIBRATION_ENVELOPE_VERSION)
+    are cross-language reproducible and a type-confusion cannot collide two distinct receipts. The domain
+    ``version`` is the receipt's OWN ``schema_version`` (CP2 S4b), so a v1 receipt is digested exactly as it
+    historically was (its signature stays verifiable) and a v2 receipt is digested over the enriched envelope
+    — verification is version-faithful without a re-sign."""
+    return canonical_digest(_ENVELOPE_DOMAIN, report._envelope(), version=report.schema_version)
+
+
+def is_acceptance_admissible(report: AcceptanceReport, *, current_icv: int) -> bool:
+    """CP2 S4b — ADMISSIBILITY, STRICTLY STRONGER than ``verify_report`` (authenticity). A receipt may be
+    perfectly authentic yet inadmissible for CURRENT provisioning; this rejects the four authentic-but-
+    inadmissible classes (each has an isolating negative that PASSES ``verify_report`` and FAILS here):
+
+      1. LEGACY schema / ICV — not v2, or its ICV != the current identity contract (an old receipt cannot
+         provision under the current four-coordinate contract).
+      2. FALSE / internally-inconsistent outcome — ``accepted`` must be True AND be EARNED: every sub-outcome
+         that composes acceptance (honest_passes ∧ refuses_on_fn ∧ refuses_on_fp ∧ generalises) must hold. A
+         receipt that claims ``accepted`` while a sub-outcome is False is internally inconsistent.
+      3. SHORT-CIRCUITED — ``short_circuit`` must be False: admissibility POSITIVELY confirms the full
+         evaluation ran (an outcome that looks complete but skipped checks is not earned).
+      4. MISSING / degenerate coordinate digest — all FOUR measured coordinates (profile / trust / guard /
+         execution) must be present + non-empty; a blank coordinate is not attestable to a single identity.
+
+    Authenticity is the caller's precondition (verify the signature first); this is the meets-the-bar gate."""
+    if report.schema_version != CALIBRATION_ENVELOPE_V2 or report.identity_contract_version != current_icv:
+        return False
+    if not report.accepted or not (report.honest_passes and report.refuses_on_fn
+                                   and report.refuses_on_fp and report.generalises):
+        return False
+    if report.short_circuit:
+        return False
+    coords = (report.resolved_profile_digest, report.trust_policy_digest,
+              report.guard_policy_digest, report.measured_execution_identity)
+    return all(isinstance(c, str) and c != "" for c in coords)
 
 
 def _sign_report(unsigned: AcceptanceReport, signer: signing.Signer) -> AcceptanceReport:
@@ -356,9 +420,14 @@ def run_acceptance_anchor(
     # every detector arrives by NAME and is resolved ONLY through the trusted registry (``resolve``);
     # the anchor never accepts a detector object, so an author cannot smuggle in a holdout-gaming
     # detector. The honest id is graded on BOTH the visible and holdout lanes (same trusted build).
-    def _cal(did: str, cset: CalibrationSet) -> CalibrationResult:  # thread the §1.6 guard uniformly
+    # CP2 S4b: resolve the trust policy ONCE and APPLY it in EVERY lane — so the receipt binds a MEASURED
+    # trust coordinate (from the run that actually governed execution), not a declared id. The measured
+    # digest is authoritative; ``trust_policy_id`` remains signed routing/legibility.
+    trust_policy: TrustPolicy = resolve_trust_policy(trust_policy_id)
+
+    def _cal(did: str, cset: CalibrationSet) -> CalibrationResult:  # thread the §1.6 guard + trust uniformly
         return calibrate(make_sandbox, did, resolve, cset, budget,
-                         trials=trials, backend_guard=backend_guard)
+                         trials=trials, backend_guard=backend_guard, trust_policy=trust_policy)
 
     honest = _cal(honest_detector_id, visible_set)
     fn = _cal(fn_deficient_detector_id, visible_set)
@@ -383,6 +452,23 @@ def run_acceptance_anchor(
     image_ref = identity.image_ref
     sandbox_config_hash = sandbox_config_digest(isolation=identity.isolation_level, image=image_ref)
     measured_execution_identity = identity.digest()
+    # CP2 S4b: the MEASURED trust + guard coordinates — every lane must report the SAME NON-EMPTY digest
+    # (positive-shape), else the receipt has no single attestable trust/guard coordinate and the anchor
+    # refuses. A digestless (opt-out) guard or an unapplied trust policy yields None -> refuse (no v2 mint).
+    trust_digests = {r.trust_policy_digest for r in (honest, fn, fp, gen)}
+    guard_digests = {r.guard_policy_digest for r in (honest, fn, fp, gen)}
+    if len(trust_digests) != 1 or not (isinstance(honest.trust_policy_digest, str)
+                                       and honest.trust_policy_digest):
+        raise AcceptanceError(
+            "the acceptance lanes did not all measure ONE non-empty trust-policy digest — the applied trust "
+            "policy is not a single attestable coordinate (a v2 receipt binds a MEASURED trust coordinate)")
+    if len(guard_digests) != 1 or not (isinstance(honest.guard_policy_digest, str)
+                                       and honest.guard_policy_digest):
+        raise AcceptanceError(
+            "the acceptance lanes did not all measure ONE non-empty guard-policy digest — the applied backend "
+            "guard is not a single attestable coordinate (a digestless opt-out guard cannot mint v2 evidence)")
+    trust_policy_digest = honest.trust_policy_digest
+    guard_policy_digest = honest.guard_policy_digest
     # P1-3 v3 (atomicity): the DETECTOR identity comes from the SAME calibration op that ran it — the
     # honest lane's ``resolved_profile_digest`` (carried out of ``calibrate`` via the atomic bundle),
     # NOT a separate post-hoc resolution. The FN/FP control profile digests are bound too, so the receipt
@@ -422,6 +508,10 @@ def run_acceptance_anchor(
         visible_coverage=len(visible_set.known_good) + len(visible_set.known_bad),
         holdout_coverage=len(holdout.known_good) + len(holdout.known_bad),
         signer_principal=signer_principal, claim=_HONEST_CLAIM, issued_at=now,
+        # CP2 S4b v2: the current four-coordinate identity contract — every field set (no compat default).
+        schema_version=CALIBRATION_ENVELOPE_CURRENT,
+        identity_contract_version=IDENTITY_CONTRACT_VERSION,
+        trust_policy_digest=trust_policy_digest, guard_policy_digest=guard_policy_digest,
     )
     return _sign_report(unsigned, signer)
 
@@ -437,7 +527,11 @@ __all__ = [
     "AcceptanceError",
     "BlindHoldoutStore",
     "AcceptanceReport",
+    "CALIBRATION_ENVELOPE_V1",
+    "CALIBRATION_ENVELOPE_V2",
+    "CALIBRATION_ENVELOPE_CURRENT",
     "run_acceptance_anchor",
     "verify_report",
+    "is_acceptance_admissible",
     "sandbox_config_digest",
 ]

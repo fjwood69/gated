@@ -18,16 +18,21 @@ from core import Command, Fixtures, IsolationLevel, Reason, ResourceBudget, Verd
 from core.calibration import CalibrationSet, Fixture, FixtureLabel
 from gate.signing import KeyVerifier, SeedSigner, public_key
 from gate.acceptance import (
+    CALIBRATION_ENVELOPE_V1,
+    CALIBRATION_ENVELOPE_V2,
     AcceptanceError,
     BlindHoldoutError,
     BlindHoldoutStore,
+    _sign_report,
+    is_acceptance_admissible,
     run_acceptance_anchor,
     verify_report,
 )
+from gate.attestation import IDENTITY_CONTRACT_VERSION
 from gate.authority import AuthorityDomain, GovernanceApproval
 from gate.detector_registry import DetectorRegistry, profile_of
 from sandbox.noop import NoOpSandbox
-from tests._backend_optout import allow_any_backend
+from tests._backend_optout import test_guard_policy
 
 _BUDGET = ResourceBudget(wall_clock_seconds=1.0)
 _HOLDOUT_KEY = b"calibration-governance-holdout-key"
@@ -100,7 +105,7 @@ def _holdout() -> BlindHoldoutStore:
     return store
 
 
-_TRUST_POLICY_ID = "trust-policy:completed-trusted"
+_TRUST_POLICY_ID = "trust-policy:completed-only"  # the approved, resolvable policy (CP2 S4b)
 
 
 def _run(store: BlindHoldoutStore, *, honest, fn, fp, signer=None, make_sandbox=None,  # type: ignore[no-untyped-def]
@@ -112,7 +117,8 @@ def _run(store: BlindHoldoutStore, *, honest, fn, fp, signer=None, make_sandbox=
         trust_policy_id=trust_policy_id,
         visible_set=_VISIBLE, blind_holdout_store=store, holdout_key=_HOLDOUT_KEY,
         signer=SeedSigner(_SIGNER_SEED), signer_principal="cal-gov-1",
-        signer_approval=signer or _cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3, backend_guard=allow_any_backend)
+        signer_approval=signer or _cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3,
+        backend_guard=test_guard_policy)  # a DIGEST-BEARING guard: a digestless opt-out cannot mint v2 (S4b)
 
 
 # honest: reused across BOTH the visible AND the holdout lane (same instance, 12 trials). Each set is
@@ -277,7 +283,8 @@ class AcceptanceAnchorTests(unittest.TestCase):
                 fp_happy_detector_id="fp", resolve=alternating, trust_policy_id=_TRUST_POLICY_ID,
                 visible_set=_VISIBLE, blind_holdout_store=store, holdout_key=_HOLDOUT_KEY,
                 signer=SeedSigner(_SIGNER_SEED), signer_principal="cal-gov-1",
-                signer_approval=_cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3, backend_guard=allow_any_backend)
+                signer_approval=_cal_gov("cal-gov-1"), now=100.0, budget=_BUDGET, trials=3,
+                backend_guard=test_guard_policy)
 
     def test_same_module_different_entrypoint_is_a_distinct_identity(self) -> None:
         # P1-3 (neg 2): the entrypoint argv is part of the resolved profile, so a detector with the SAME
@@ -369,6 +376,59 @@ class OperationalSeparationTests(unittest.TestCase):
         params = inspect.signature(run_acceptance_anchor).parameters
         for k in ("holdout_key", "signer"):
             self.assertIs(params[k].default, inspect.Parameter.empty)
+
+
+class AcceptanceAdmissibilityTests(unittest.TestCase):
+    """CP2 S4b: verify_report proves AUTHENTICITY; is_acceptance_admissible proves it MEETS THE BAR. Each of
+    the four authentic-but-inadmissible classes PASSES verify_report and FAILS is_acceptance_admissible —
+    proving admissibility does work verification does not. Every variant is RE-SIGNED so it is authentic."""
+
+    def setUp(self) -> None:
+        self._base = _run(_holdout(), honest=_honest(),
+                          fn=_ScriptedDetector([_PASS] * 3 + [_PASS] * 3),
+                          fp=_ScriptedDetector([_FAIL] * 3 + [_FAIL] * 3))
+        self._ver = KeyVerifier(_SIGNER_PUB)
+
+    def _resign(self, **flip: object):  # type: ignore[no-untyped-def]
+        from dataclasses import replace
+        return _sign_report(replace(self._base, signature="", **flip), SeedSigner(_SIGNER_SEED))
+
+    def test_v2_accepted_report_is_admissible(self) -> None:
+        self.assertTrue(verify_report(self._base, verifier=self._ver))
+        self.assertEqual(self._base.schema_version, CALIBRATION_ENVELOPE_V2)
+        self.assertEqual(self._base.identity_contract_version, IDENTITY_CONTRACT_VERSION)
+        self.assertTrue(self._base.trust_policy_digest)          # MEASURED trust coordinate present
+        self.assertTrue(self._base.guard_policy_digest)          # MEASURED guard coordinate present
+        self.assertTrue(is_acceptance_admissible(self._base, current_icv=IDENTITY_CONTRACT_VERSION))
+
+    def test_legacy_v1_verifies_but_is_not_admissible(self) -> None:
+        legacy = self._resign(schema_version=CALIBRATION_ENVELOPE_V1)
+        self.assertTrue(verify_report(legacy, verifier=self._ver))   # authentic via the v1 rendering
+        self.assertFalse(is_acceptance_admissible(legacy, current_icv=IDENTITY_CONTRACT_VERSION))
+
+    def test_wrong_icv_verifies_but_is_not_admissible(self) -> None:
+        drifted = self._resign(identity_contract_version=IDENTITY_CONTRACT_VERSION + 1)
+        self.assertTrue(verify_report(drifted, verifier=self._ver))
+        self.assertFalse(is_acceptance_admissible(drifted, current_icv=IDENTITY_CONTRACT_VERSION))
+
+    def test_inconsistent_accepted_verifies_but_is_not_admissible(self) -> None:
+        # accepted=True while a sub-outcome is False — internally inconsistent (unearned acceptance).
+        inconsistent = self._resign(honest_passes=False)
+        self.assertTrue(inconsistent.accepted)
+        self.assertTrue(verify_report(inconsistent, verifier=self._ver))
+        self.assertFalse(is_acceptance_admissible(inconsistent, current_icv=IDENTITY_CONTRACT_VERSION))
+
+    def test_short_circuited_verifies_but_is_not_admissible(self) -> None:
+        # the subtle class: an outcome that looks complete but skipped checks — admissibility POSITIVELY
+        # requires the full evaluation ran (short_circuit False).
+        sc = self._resign(short_circuit=True)
+        self.assertTrue(verify_report(sc, verifier=self._ver))
+        self.assertFalse(is_acceptance_admissible(sc, current_icv=IDENTITY_CONTRACT_VERSION))
+
+    def test_missing_coordinate_digest_verifies_but_is_not_admissible(self) -> None:
+        blank = self._resign(trust_policy_digest="")
+        self.assertTrue(verify_report(blank, verifier=self._ver))
+        self.assertFalse(is_acceptance_admissible(blank, current_icv=IDENTITY_CONTRACT_VERSION))
 
 
 if __name__ == "__main__":

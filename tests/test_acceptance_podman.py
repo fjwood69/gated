@@ -24,7 +24,7 @@ from gate.acceptance import (
     verify_report,
 )
 from gate.authority import AuthorityDomain, GovernanceApproval
-from gate.backends import trusted_backend_guard, trusted_sandbox_factory
+from gate.backends import guarded_backend
 from gate.detector_registry import DetectorRegistry, profile_of
 from sandbox.oci import OCISandbox
 
@@ -122,12 +122,14 @@ class AcceptanceAnchorOnRealPodmanTests(unittest.TestCase):
         registry.register("honest", lambda: honest, accepted_profile_digest=profile_of("honest", honest).digest())
         registry.register("fn", lambda: fn, accepted_profile_digest=profile_of("fn", fn).digest())
         registry.register("fp", lambda: fp, accepted_profile_digest=profile_of("fp", fp).digest())
+        # §1.6 + CP2 S4b: the production composition root returns the AUDITED backend AND the DIGEST-BEARING
+        # guard policy (the bare trusted_backend_guard function carries no policy_digest, so it cannot mint v2).
+        make_sandbox, guard = guarded_backend("oci", IMAGE)
         report = run_acceptance_anchor(
-            # §1.6: the AUDITED backend built through the trusted factory (token-stamped) + the guard.
-            make_sandbox=trusted_sandbox_factory("oci", IMAGE), backend_guard=trusted_backend_guard,
+            make_sandbox=make_sandbox, backend_guard=guard,
             honest_detector_id="honest", fn_deficient_detector_id="fn", fp_happy_detector_id="fp",
             resolve=registry.resolve_bundle,
-            trust_policy_id="trust-policy:completed-trusted", visible_set=visible,
+            trust_policy_id="trust-policy:completed-only", visible_set=visible,
             blind_holdout_store=holdout, holdout_key=_HOLDOUT_KEY, signer=SeedSigner(_SIGNER_SEED),
             signer_principal="cal-gov-1", signer_approval=_cal_gov("cal-gov-1"),
             now=100.0, budget=_BUDGET, trials=2)
