@@ -17,6 +17,7 @@ from core.chain import chain_hash
 from gate.authority import GovernanceApproval
 from gate.policy_state import PolicyState
 from gate.policy_store import (
+    ChainIntegrityError,
     IllegalTransitionError,
     PrivilegedOperationError,
     PolicyStore,
@@ -62,6 +63,33 @@ def _reattest(s: PolicyStore, pid: str, *, ref: str, psv: str, det: str,
     return s.reattest(pid, grant=_GRANT, calibration_result_ref=ref, set_id=set_id,
                       pinned_set_version=psv, detector_identity=det, job_id=job, nonce=nonce,
                       expect_policy_head=s.policy_head(pid), expect_authorized_context=ctx, identity_contract_version=1)
+
+
+class CurrentAttestationSnapshotTests(unittest.TestCase):
+    """CP2 (board D2/C4): the single atomic (set_id, bound_head, subject, ICV) enforcement snapshot the
+    gatekeeper mints the AuthorizedRunPlan from — a superset of current_attestation (+ICV), read in ONE
+    chain-verified transaction."""
+
+    def test_enabled_snapshot_carries_set_head_subject_and_icv(self) -> None:
+        s = _store()
+        _enable(s, head="v1")
+        self.assertEqual(s.current_attestation_snapshot("p1"), ("X", "v1", "det-1", 1))
+        # the snapshot's (set, subject, ICV) is exactly what current_attestation returns + the ICV.
+        self.assertEqual(s.current_attestation("p1"), ("X", "v1", "det-1"))
+
+    def test_not_enabled_is_none(self) -> None:
+        s = _store()
+        s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="p1-1"))
+        self.assertIsNone(s.current_attestation_snapshot("p1"))          # CALIBRATING, not ENABLED
+        self.assertIsNone(s.current_attestation_snapshot("absent"))      # no policy at all
+
+    def test_broken_chain_fails_closed(self) -> None:
+        s = _store()
+        _enable(s, head="v1")
+        s._conn().execute("UPDATE tier_transition_chain SET detector_identity='TAMPERED' "
+                          "WHERE policy_id='p1' AND new_state='enabled'")
+        with self.assertRaises(ChainIntegrityError):
+            s.current_attestation_snapshot("p1")
 
 
 class ReAttestPrimitiveTests(unittest.TestCase):

@@ -289,8 +289,8 @@ class _LiveAdmissionProof:
     set_id: str
     oracle_head: str
     subject: str
-    plan: AuthorizedRunPlan   # the EXACT plan this proof was minted for (P1-B binding)
-    report: TrialReport       # the EXACT report this proof was minted for (P1-B binding)
+    plan: AuthorizedRunPlan   # the plan this proof was minted for — VALUE-exact (dataclass ==), not identity (P1-B)
+    report: TrialReport       # the report this proof was minted for — VALUE-exact (dataclass ==), not identity (P1-B)
     mint: InitVar[object] = None
 
     def __post_init__(self, mint: object) -> None:

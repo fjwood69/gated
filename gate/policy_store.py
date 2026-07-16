@@ -1303,6 +1303,51 @@ class PolicyStore:
             raise ChainIntegrityError("tier-transition chain failed verification — refusing to read")
         return self._current_authorized_context_unlocked(policy_id)
 
+    def current_attestation_snapshot(self, policy_id: str) -> tuple[str, str, str, int] | None:
+        """3.5 CP4 CP2 (board D2/C4): the SINGLE chain-verified enforcement snapshot the gatekeeper reads ONCE
+        to drive detector-subject comparison, oracle currency, AND the ``AuthorizedRunPlan`` mint —
+        ``(set_id, bound_oracle_head, subject, identity_contract_version)`` or None (not ENABLED / no matching
+        pass under the current contract). Superset of ``current_attestation`` (adds ICV) so mint-coherence
+        (target==authorized) is TRUE BY CONSTRUCTION: the plan's set/subject/ICV all come from this ONE row.
+
+        Board C4: chain verification + the row read + the pass check happen inside ONE SQLite read
+        transaction under the store lock (``verify_chain`` is lock-free, so no re-entrancy), so this is a
+        genuinely atomic snapshot — NOT a materialised view assembled from two reads (which would reintroduce
+        the read-between-reads race). Fails CLOSED on a broken chain."""
+        with self._lock:
+            conn = self._conn()
+            conn.execute("BEGIN")  # a consistent read snapshot (WAL): verify + read + pass-check see one view
+            try:
+                if not self.verify_chain():
+                    raise ChainIntegrityError(
+                        "tier-transition chain failed verification — refusing to read")
+                row = conn.execute(
+                    "SELECT new_state, calibration_result_ref, set_id, pinned_set_version, detector_identity,"
+                    " identity_contract_version FROM tier_transition_chain WHERE policy_id=? "
+                    "ORDER BY seq DESC LIMIT 1", (policy_id,)
+                ).fetchone()
+                if row is None or row["new_state"] != PolicyState.ENABLED.value:
+                    conn.execute("COMMIT")
+                    return None
+                # the ENABLED head must be under the CURRENT contract, and its pass must exact-match the
+                # hash-chained record's own coordinates (mirrors current_attestation exactly, +ICV returned).
+                if row["identity_contract_version"] != IDENTITY_CONTRACT_VERSION:
+                    conn.execute("COMMIT")
+                    return None
+                if not self._pass_exists_unlocked(
+                    str(row["calibration_result_ref"]), policy_id, str(row["set_id"]),
+                    str(row["pinned_set_version"]), str(row["detector_identity"]), IDENTITY_CONTRACT_VERSION,
+                ):
+                    conn.execute("COMMIT")
+                    return None
+                result = (str(row["set_id"]), str(row["pinned_set_version"]),
+                          str(row["detector_identity"]), int(row["identity_contract_version"]))
+                conn.execute("COMMIT")
+                return result
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     def pass_binding(
         self, calibration_result_ref: str, policy_id: str, pinned_set_version: str,
     ) -> tuple[str, str] | None:
