@@ -40,6 +40,17 @@ from typing import Mapping
 # the board's strawman; the board may retune the constant, but the CAP itself is non-negotiable.
 MAX_VALID_FOR_SECONDS = 3600.0
 
+# CP2 board S4a — schema versioning so the SIGNED payload can grow the 4-coordinate identity contract
+# (ICV) WITHOUT breaking legacy signatures. ``_payload`` renders per ``schema_version`` so a legacy v2
+# snapshot's MAC still verifies against its EXACT historical bytes (integrity-readable), while a vNext v3
+# snapshot signs the per-record ICV. Only a v3 record carrying the CURRENT ICV can MINT an AuthorizedRunPlan
+# (the gatekeeper's admissibility check) — a v2 record's sentinel ICV is not admissible for provisioning,
+# so an old receipt can never be mistaken for evidence produced under the current identity contract.
+SNAPSHOT_SCHEMA_V2 = 2          # legacy: no per-record ICV in the signed payload
+SNAPSHOT_SCHEMA_V3 = 3          # vNext: per-record ICV + top-level schema_version signed
+SNAPSHOT_SCHEMA_CURRENT = SNAPSHOT_SCHEMA_V3
+_LEGACY_ICV = -1               # sentinel: a record with no signed ICV (a v2 snapshot) — NOT admissible
+
 
 class SnapshotError(RuntimeError):
     """The snapshot could not be trusted — missing, HMAC-invalid, past its freshness horizon, or
@@ -64,6 +75,9 @@ class AttestationRecord:
     backend: str
     set_id: str = "default"
     oracle_head: str = ""
+    # CP2 S4a: the identity contract the ENABLED calibration was bound under. Signed in a v3 snapshot;
+    # a v2 (legacy) record loads with the ``_LEGACY_ICV`` sentinel and is NOT admissible for provisioning.
+    identity_contract_version: int = _LEGACY_ICV
 
 
 @dataclass(frozen=True)
@@ -76,10 +90,15 @@ class CalibrationSnapshot:
     issued_at: float
     valid_until: float
     mac: str
+    schema_version: int = SNAPSHOT_SCHEMA_V2  # default legacy so loading old data reproduces its bytes
 
     def _payload(self) -> dict[str, object]:
-        # Signed content — EXCLUDES ``mac``. Records rendered as sorted, fully-specified tuples so
-        # the signed bytes are stable and cross-language reproducible (NFR6 discipline).
+        # Signed content — EXCLUDES ``mac``. Records rendered as sorted, fully-specified maps so the signed
+        # bytes are stable and cross-language reproducible (NFR6). VERSION-BRANCHED (CP2 S4a): a v2 snapshot
+        # renders EXACTLY as it historically did (no schema_version, no per-record ICV) so its legacy MAC
+        # still verifies; a v3 snapshot signs the top-level schema_version + per-record ICV. The branch is
+        # what lets historical integrity verification and current admissibility coexist without a re-sign.
+        v3 = self.schema_version >= SNAPSHOT_SCHEMA_V3
         rendered = {
             pid: {
                 "policy_id": r.policy_id, "detector_identity": r.detector_identity,
@@ -87,10 +106,15 @@ class CalibrationSnapshot:
                 "fixture_set_version": r.fixture_set_version,
                 "tier_chain_head": r.tier_chain_head, "backend": r.backend,
                 "set_id": r.set_id, "oracle_head": r.oracle_head,
+                **({"identity_contract_version": r.identity_contract_version} if v3 else {}),
             }
             for pid, r in sorted(self.records.items())
         }
-        return {"records": rendered, "issued_at": self.issued_at, "valid_until": self.valid_until}
+        payload: dict[str, object] = {
+            "records": rendered, "issued_at": self.issued_at, "valid_until": self.valid_until}
+        if v3:
+            payload["schema_version"] = self.schema_version
+        return payload
 
 
 def _canonical(payload: Mapping[str, object]) -> str:
@@ -120,11 +144,20 @@ def issue_snapshot(
             f"freshness horizon {valid_for_seconds}s out of bounds (0, {MAX_VALID_FOR_SECONDS}] — "
             "a huge horizon would defeat fail-closed-on-outage"
         )
+    # CP2 S4a: new evidence is minted at the CURRENT schema (v3) and MUST carry a real ICV per record —
+    # no compatibility default. A legacy-sentinel ICV in a fresh mint would produce an un-provisionable
+    # snapshot; refuse it at the source (positive-shape: present means valid).
+    for pid, r in records.items():
+        if r.identity_contract_version == _LEGACY_ICV:
+            raise SnapshotError(
+                f"refusing to mint a v{SNAPSHOT_SCHEMA_CURRENT} snapshot with a legacy-sentinel ICV for "
+                f"{pid!r} — a current attestation record must carry its identity_contract_version")
     valid_until = now + valid_for_seconds
-    unsigned = CalibrationSnapshot(records=dict(records), issued_at=now, valid_until=valid_until, mac="")
+    unsigned = CalibrationSnapshot(records=dict(records), issued_at=now, valid_until=valid_until, mac="",
+                                   schema_version=SNAPSHOT_SCHEMA_CURRENT)
     return CalibrationSnapshot(
         records=dict(records), issued_at=now, valid_until=valid_until,
-        mac=_sign(unsigned._payload(), key),
+        mac=_sign(unsigned._payload(), key), schema_version=SNAPSHOT_SCHEMA_CURRENT,
     )
 
 
@@ -137,11 +170,14 @@ def prune_and_resign(
     this, a policy bound to ``drop_set_id`` is absent from the snapshot, so during a total outage it
     fails closed instead of stale-enforcing the pre-append head."""
     remaining = {pid: r for pid, r in snapshot.records.items() if r.set_id != drop_set_id}
+    # a revocation preserves the ORIGINAL schema_version (re-render under the same version so the re-signed
+    # bytes match how the surviving records were originally signed).
     unsigned = CalibrationSnapshot(records=dict(remaining), issued_at=snapshot.issued_at,
-                                   valid_until=snapshot.valid_until, mac="")
+                                   valid_until=snapshot.valid_until, mac="",
+                                   schema_version=snapshot.schema_version)
     return CalibrationSnapshot(
         records=dict(remaining), issued_at=snapshot.issued_at, valid_until=snapshot.valid_until,
-        mac=_sign(unsigned._payload(), key),
+        mac=_sign(unsigned._payload(), key), schema_version=snapshot.schema_version,
     )
 
 
@@ -171,7 +207,7 @@ def to_json(snapshot: CalibrationSnapshot) -> str:
     """Serialise a snapshot for on-disk persistence (the refresh job writes this atomically)."""
     import json
 
-    payload = snapshot._payload()
+    payload = snapshot._payload()  # already version-branched (v3 carries schema_version + per-record ICV)
     payload["mac"] = snapshot.mac
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -182,6 +218,11 @@ def from_json(data: str) -> CalibrationSnapshot:
     import json
 
     obj = json.loads(data)
+    # a legacy persisted snapshot has no ``schema_version`` (=> v2) and no per-record ICV (=> legacy
+    # sentinel); a v3 snapshot carries both. Reading with the sentinel default preserves the EXACT historical
+    # rendering, so ``verify_snapshot`` still validates the legacy MAC (historical integrity), while the
+    # sentinel ICV keeps the legacy record out of current provisioning (admissibility).
+    schema_version = int(obj.get("schema_version", SNAPSHOT_SCHEMA_V2))
     records = {
         pid: AttestationRecord(
             policy_id=r["policy_id"], detector_identity=r["detector_identity"],
@@ -189,11 +230,12 @@ def from_json(data: str) -> CalibrationSnapshot:
             fixture_set_version=r["fixture_set_version"], tier_chain_head=r["tier_chain_head"],
             backend=r["backend"], set_id=r.get("set_id", "default"),
             oracle_head=r.get("oracle_head", ""),
+            identity_contract_version=int(r.get("identity_contract_version", _LEGACY_ICV)),
         )
         for pid, r in obj["records"].items()
     }
     return CalibrationSnapshot(records=records, issued_at=obj["issued_at"],
-                              valid_until=obj["valid_until"], mac=obj["mac"])
+                              valid_until=obj["valid_until"], mac=obj["mac"], schema_version=schema_version)
 
 
 def attested_record(snapshot: CalibrationSnapshot, policy_id: str) -> AttestationRecord | None:
@@ -202,14 +244,27 @@ def attested_record(snapshot: CalibrationSnapshot, policy_id: str) -> Attestatio
     return snapshot.records.get(policy_id)
 
 
+def is_provisionable(record: AttestationRecord, *, current_icv: int) -> bool:
+    """CP2 S4a — ADMISSIBILITY, distinct from historical integrity (``verify_snapshot``). True iff the
+    record carries the CURRENT identity contract version (a v3 record under this build). A legacy v2 record
+    (sentinel ICV) is integrity-verifiable but NOT provisionable: it cannot mint an ``AuthorizedRunPlan``,
+    so an old receipt is never mistaken for evidence under the current 4-coordinate identity contract. The
+    current ICV is a PARAMETER (the caller supplies the process constant) — this module stays signing-pure."""
+    return record.identity_contract_version == current_icv
+
+
 __all__ = [
     "AttestationRecord",
     "CalibrationSnapshot",
     "SnapshotError",
+    "SNAPSHOT_SCHEMA_V2",
+    "SNAPSHOT_SCHEMA_V3",
+    "SNAPSHOT_SCHEMA_CURRENT",
     "issue_snapshot",
     "verify_snapshot",
     "assert_snapshot_integrity",
     "attested_record",
+    "is_provisionable",
     "to_json",
     "from_json",
     "prune_and_resign",

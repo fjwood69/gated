@@ -33,6 +33,7 @@ from engine.calibration import ResolvedDetector
 from gate.authority import GovernanceApproval
 from gate.calibration_store import AdmissionCapability, CalibrationStore, ChangeOp
 from gate.detector_registry import profile_of
+from gate.attestation import IDENTITY_CONTRACT_VERSION
 from gate.gatekeeper import ratify_enable, resolve_disposition, run_calibration
 from gate.preflight import ConfigurationError
 from gate.policy_state import Disposition, PolicyState
@@ -135,7 +136,7 @@ def _snap(pid: str, detector: str, *, set_id: str = "default", oracle_head: str 
     rec = AttestationRecord(
         policy_id=pid, detector_identity=detector, calibration_result_ref="cal-1",
         fixture_set_version="fx-head", tier_chain_head="tier-head", backend="podman",
-        set_id=set_id, oracle_head=oracle_head,
+        set_id=set_id, oracle_head=oracle_head, identity_contract_version=IDENTITY_CONTRACT_VERSION,
     )
     return issue_snapshot({pid: rec}, key=_KEY, now=1000.0, valid_for_seconds=300)
 

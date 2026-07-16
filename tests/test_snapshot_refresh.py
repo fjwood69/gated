@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from gate.attestation import IDENTITY_CONTRACT_VERSION
 from gate.snapshot import AttestationRecord, from_json, issue_snapshot, to_json, verify_snapshot
 from gate.snapshot_refresh import (
     RefreshContention,
@@ -26,7 +27,7 @@ def _rec(pid: str) -> AttestationRecord:
     return AttestationRecord(
         policy_id=pid, detector_identity="det-1", calibration_result_ref="cal-1",
         fixture_set_version="fx", tier_chain_head="th", backend="podman",
-        set_id="X", oracle_head="h1",
+        set_id="X", oracle_head="h1", identity_contract_version=IDENTITY_CONTRACT_VERSION,
     )
 
 
@@ -181,7 +182,7 @@ def _rec_set(pid: str, set_id: str, oracle_head: str) -> AttestationRecord:
     return AttestationRecord(
         policy_id=pid, detector_identity="det-1", calibration_result_ref="cal-1",
         fixture_set_version="fx", tier_chain_head="th", backend="podman",
-        set_id=set_id, oracle_head=oracle_head,
+        set_id=set_id, oracle_head=oracle_head, identity_contract_version=IDENTITY_CONTRACT_VERSION,
     )
 
 
