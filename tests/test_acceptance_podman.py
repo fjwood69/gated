@@ -20,9 +20,11 @@ from gate.signing import KeyVerifier, SeedSigner, public_key
 
 from gate.acceptance import (
     BlindHoldoutStore,
+    is_acceptance_admissible,
     run_acceptance_anchor,
     verify_report,
 )
+from gate.attestation import IDENTITY_CONTRACT_VERSION
 from gate.authority import AuthorityDomain, GovernanceApproval
 from gate.backends import guarded_backend
 from gate.detector_registry import DetectorRegistry, profile_of
@@ -146,6 +148,9 @@ class AcceptanceAnchorOnRealPodmanTests(unittest.TestCase):
         self.assertEqual(report.visible_coverage, 2)
         self.assertEqual(report.holdout_coverage, 2)
         self.assertTrue(verify_report(report, verifier=KeyVerifier(_SIGNER_PUB)))
+        # CP2 S4b: the authoritative end-to-end proof — a REAL anchor produces a v2 receipt whose four
+        # MEASURED coordinate digests are genuine sha256 (64-hex), so it is ADMISSIBLE (not just authentic).
+        self.assertTrue(is_acceptance_admissible(report, current_icv=IDENTITY_CONTRACT_VERSION))
         # the receipt binds a PINNED image digest (derived from the real sandbox), a disjoint holdout
         # (blind under the trusted-detector model), and the real sandbox hash — nothing is a caller string.
         self.assertEqual(report.image_ref, image_digest)

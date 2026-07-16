@@ -323,16 +323,28 @@ def is_acceptance_admissible(report: AcceptanceReport, *, current_icv: int) -> b
          execution) must be present + non-empty; a blank coordinate is not attestable to a single identity.
 
     Authenticity is the caller's precondition (verify the signature first); this is the meets-the-bar gate."""
-    if report.schema_version != CALIBRATION_ENVELOPE_V2 or report.identity_contract_version != current_icv:
+    # EXACT-int ICV (board refinement): ``type(...) is int`` rejects ``bool`` so a ``True`` cannot satisfy
+    # ``True == 1`` and provision under a degenerate contract.
+    if (report.schema_version != CALIBRATION_ENVELOPE_V2
+            or type(report.identity_contract_version) is not int or type(current_icv) is not int
+            or report.identity_contract_version != current_icv):
         return False
     if not report.accepted or not (report.honest_passes and report.refuses_on_fn
                                    and report.refuses_on_fp and report.generalises):
         return False
     if report.short_circuit:
         return False
+    # every measured coordinate must be a well-formed sha256 digest (64 lowercase hex) — not merely
+    # non-empty (board refinement: catch truncation / encoding errors / type coercion structurally, early).
     coords = (report.resolved_profile_digest, report.trust_policy_digest,
               report.guard_policy_digest, report.measured_execution_identity)
-    return all(isinstance(c, str) and c != "" for c in coords)
+    return all(_is_sha256_hex(c) for c in coords)
+
+
+def _is_sha256_hex(value: object) -> bool:
+    """True iff ``value`` is exactly a 64-character lowercase-hex string (a well-formed sha256 digest)."""
+    return (isinstance(value, str) and len(value) == 64
+            and all(c in "0123456789abcdef" for c in value))
 
 
 def _sign_report(unsigned: AcceptanceReport, signer: signing.Signer) -> AcceptanceReport:

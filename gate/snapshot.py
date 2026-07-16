@@ -218,22 +218,38 @@ def from_json(data: str) -> CalibrationSnapshot:
     import json
 
     obj = json.loads(data)
-    # a legacy persisted snapshot has no ``schema_version`` (=> v2) and no per-record ICV (=> legacy
-    # sentinel); a v3 snapshot carries both. Reading with the sentinel default preserves the EXACT historical
-    # rendering, so ``verify_snapshot`` still validates the legacy MAC (historical integrity), while the
-    # sentinel ICV keeps the legacy record out of current provisioning (admissibility).
+    # STRICT SCHEMA-AWARE PARSING (CP2 board P1). The ICV lives OUTSIDE the v2 MAC, so an
+    # ``identity_contract_version`` on a v2 record is UNSIGNED metadata — an attacker could inject the current
+    # ICV into an authentic v2 snapshot, leave its MAC intact, and forge current-contract authority. Defences:
+    #   (a) reject an UNKNOWN schema (closed set {v2, v3}) rather than treating any >= 3 as v3;
+    #   (b) a v2 record carrying an ``identity_contract_version`` is REFUSED — the field cannot exist under a
+    #       schema that predates the signed ICV; a legacy artifact never claims current authority;
+    #   (c) a v3 record MUST carry its signed ICV (no compat default).
     schema_version = int(obj.get("schema_version", SNAPSHOT_SCHEMA_V2))
-    records = {
-        pid: AttestationRecord(
+    if schema_version not in (SNAPSHOT_SCHEMA_V2, SNAPSHOT_SCHEMA_V3):
+        raise SnapshotError(
+            f"unknown snapshot schema_version {schema_version} — refusing (closed set: v2, v3)")
+    is_v3 = schema_version == SNAPSHOT_SCHEMA_V3
+    records: dict[str, AttestationRecord] = {}
+    for pid, r in obj["records"].items():
+        if is_v3:
+            if "identity_contract_version" not in r:
+                raise SnapshotError(
+                    f"v3 snapshot record {pid!r} is missing its SIGNED identity_contract_version")
+            icv = int(r["identity_contract_version"])
+        else:
+            if "identity_contract_version" in r:
+                raise SnapshotError(
+                    f"legacy v2 snapshot record {pid!r} carries an identity_contract_version — that field is "
+                    "OUTSIDE the v2 MAC (unsigned); refusing a legacy artifact that claims current authority")
+            icv = _LEGACY_ICV
+        records[pid] = AttestationRecord(
             policy_id=r["policy_id"], detector_identity=r["detector_identity"],
             calibration_result_ref=r["calibration_result_ref"],
             fixture_set_version=r["fixture_set_version"], tier_chain_head=r["tier_chain_head"],
             backend=r["backend"], set_id=r.get("set_id", "default"),
-            oracle_head=r.get("oracle_head", ""),
-            identity_contract_version=int(r.get("identity_contract_version", _LEGACY_ICV)),
+            oracle_head=r.get("oracle_head", ""), identity_contract_version=icv,
         )
-        for pid, r in obj["records"].items()
-    }
     return CalibrationSnapshot(records=records, issued_at=obj["issued_at"],
                               valid_until=obj["valid_until"], mac=obj["mac"], schema_version=schema_version)
 
@@ -244,13 +260,20 @@ def attested_record(snapshot: CalibrationSnapshot, policy_id: str) -> Attestatio
     return snapshot.records.get(policy_id)
 
 
-def is_provisionable(record: AttestationRecord, *, current_icv: int) -> bool:
-    """CP2 S4a — ADMISSIBILITY, distinct from historical integrity (``verify_snapshot``). True iff the
-    record carries the CURRENT identity contract version (a v3 record under this build). A legacy v2 record
-    (sentinel ICV) is integrity-verifiable but NOT provisionable: it cannot mint an ``AuthorizedRunPlan``,
-    so an old receipt is never mistaken for evidence under the current 4-coordinate identity contract. The
-    current ICV is a PARAMETER (the caller supplies the process constant) — this module stays signing-pure."""
-    return record.identity_contract_version == current_icv
+def is_provisionable(
+    snapshot: CalibrationSnapshot, record: AttestationRecord, *, current_icv: int
+) -> bool:
+    """CP2 S4a (+board P1 hardening) — ADMISSIBILITY, distinct from historical integrity
+    (``verify_snapshot``). SCHEMA-ENFORCED: the CONTAINING snapshot's schema must be EXACTLY the current
+    version — a legacy-schema snapshot is structurally unprovisionable REGARDLESS of any ICV a record claims
+    (the ICV is outside the v2 MAC, so a v2 record's ICV is untrusted; from_json already forces it out, and
+    this is the defence-in-depth check). Only THEN is the record's SIGNED ICV compared to the current
+    contract, with EXACT-int typing so a ``bool`` cannot satisfy it via ``True == 1``. The current ICV is a
+    PARAMETER (the caller supplies the process constant) — this module stays signing-pure."""
+    if snapshot.schema_version != SNAPSHOT_SCHEMA_CURRENT:
+        return False
+    icv = record.identity_contract_version
+    return type(icv) is int and type(current_icv) is int and icv == current_icv
 
 
 __all__ = [

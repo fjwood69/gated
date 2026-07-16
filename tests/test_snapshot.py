@@ -20,8 +20,10 @@ from gate.snapshot import (
     _sign,
     assert_snapshot_integrity,
     attested_record,
+    from_json,
     is_provisionable,
     issue_snapshot,
+    to_json,
     verify_snapshot,
 )
 
@@ -101,7 +103,7 @@ class SchemaVersioningTests(unittest.TestCase):
         rec = attested_record(snap, "p1")
         assert rec is not None
         self.assertEqual(rec.identity_contract_version, IDENTITY_CONTRACT_VERSION)
-        self.assertTrue(is_provisionable(rec, current_icv=IDENTITY_CONTRACT_VERSION))
+        self.assertTrue(is_provisionable(snap, rec, current_icv=IDENTITY_CONTRACT_VERSION))
 
     def test_legacy_v2_verifies_but_is_not_provisionable(self) -> None:
         legacy = self._legacy_v2()
@@ -110,7 +112,7 @@ class SchemaVersioningTests(unittest.TestCase):
         rec = attested_record(legacy, "p1")
         assert rec is not None
         self.assertEqual(rec.identity_contract_version, _LEGACY_ICV)
-        self.assertFalse(is_provisionable(rec, current_icv=IDENTITY_CONTRACT_VERSION))  # NOT admissible
+        self.assertFalse(is_provisionable(legacy, rec, current_icv=IDENTITY_CONTRACT_VERSION))  # v2 schema
 
     def test_mint_refuses_a_legacy_sentinel_record(self) -> None:
         # no compatibility default: fresh evidence MUST carry a real ICV.
@@ -119,6 +121,44 @@ class SchemaVersioningTests(unittest.TestCase):
             fixture_set_version="fx", tier_chain_head="th", backend="podman")
         with self.assertRaises(SnapshotError):
             issue_snapshot({"p1": legacy_rec}, key=_KEY, now=1000.0)
+
+    def test_injected_icv_into_authentic_v2_verifies_but_is_not_provisionable(self) -> None:
+        # BOARD P1: the downgrade bypass. Take an AUTHENTIC v2 snapshot, inject the CURRENT ICV into its
+        # record, LEAVE the MAC unchanged. The v2 MAC excludes the ICV, so verify_snapshot still passes
+        # (historical integrity is honest — the signed bytes did not change). But provisioning is
+        # SCHEMA-ENFORCED: a v2-schema snapshot is unprovisionable regardless of the injected ICV.
+        base = self._legacy_v2()
+        forged_rec = AttestationRecord(
+            policy_id="p1", detector_identity="det-1", calibration_result_ref="cal-1",
+            fixture_set_version="fx", tier_chain_head="th", backend="podman",
+            identity_contract_version=IDENTITY_CONTRACT_VERSION)  # injected current ICV
+        forged = CalibrationSnapshot(records={"p1": forged_rec}, issued_at=base.issued_at,
+                                     valid_until=base.valid_until, mac=base.mac,  # UNCHANGED MAC
+                                     schema_version=SNAPSHOT_SCHEMA_V2)
+        verify_snapshot(forged, key=_KEY, now=1100.0)        # historical integrity: PASSES (v2 excludes ICV)
+        self.assertFalse(is_provisionable(forged, forged_rec, current_icv=IDENTITY_CONTRACT_VERSION))
+
+    def test_from_json_rejects_injected_icv_on_a_v2_record(self) -> None:
+        # strict parsing: the ICV field cannot exist on a v2 record (it is outside the v2 MAC).
+        forged = ('{"records":{"p1":{"policy_id":"p1","detector_identity":"det-1",'
+                  '"calibration_result_ref":"cal-1","fixture_set_version":"fx","tier_chain_head":"th",'
+                  '"backend":"podman","set_id":"default","oracle_head":"","identity_contract_version":1}},'
+                  '"issued_at":1000.0,"valid_until":1300.0,"mac":"deadbeef"}')
+        with self.assertRaises(SnapshotError):
+            from_json(forged)
+
+    def test_from_json_rejects_unknown_schema(self) -> None:
+        blob = ('{"schema_version":99,"records":{},"issued_at":1000.0,"valid_until":1300.0,"mac":"x"}')
+        with self.assertRaises(SnapshotError):
+            from_json(blob)
+
+    def test_v3_roundtrips_through_json_and_stays_provisionable(self) -> None:
+        snap = issue_snapshot({"p1": _rec("p1")}, key=_KEY, now=1000.0)
+        loaded = from_json(to_json(snap))
+        verify_snapshot(loaded, key=_KEY, now=1100.0)
+        rec = attested_record(loaded, "p1")
+        assert rec is not None
+        self.assertTrue(is_provisionable(loaded, rec, current_icv=IDENTITY_CONTRACT_VERSION))
 
 
 if __name__ == "__main__":

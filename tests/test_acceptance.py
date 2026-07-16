@@ -383,10 +383,18 @@ class AcceptanceAdmissibilityTests(unittest.TestCase):
     the four authentic-but-inadmissible classes PASSES verify_report and FAILS is_acceptance_admissible —
     proving admissibility does work verification does not. Every variant is RE-SIGNED so it is authentic."""
 
+    # the TEST guard bears a SHORT label digest, not a sha256; give the base a well-formed 64-hex guard
+    # coordinate so the base is ADMISSIBLE and each negative isolates exactly one flaw. (The PRODUCTION guard
+    # digest IS sha256 — proven admissible end-to-end by the real-podman anchor test.)
+    _HEX64 = "ab" * 32
+
     def setUp(self) -> None:
-        self._base = _run(_holdout(), honest=_honest(),
-                          fn=_ScriptedDetector([_PASS] * 3 + [_PASS] * 3),
-                          fp=_ScriptedDetector([_FAIL] * 3 + [_FAIL] * 3))
+        from dataclasses import replace
+        raw = _run(_holdout(), honest=_honest(),
+                   fn=_ScriptedDetector([_PASS] * 3 + [_PASS] * 3),
+                   fp=_ScriptedDetector([_FAIL] * 3 + [_FAIL] * 3))
+        self._base = _sign_report(replace(raw, signature="", guard_policy_digest=self._HEX64),
+                                  SeedSigner(_SIGNER_SEED))
         self._ver = KeyVerifier(_SIGNER_PUB)
 
     def _resign(self, **flip: object):  # type: ignore[no-untyped-def]
@@ -429,6 +437,13 @@ class AcceptanceAdmissibilityTests(unittest.TestCase):
         blank = self._resign(trust_policy_digest="")
         self.assertTrue(verify_report(blank, verifier=self._ver))
         self.assertFalse(is_acceptance_admissible(blank, current_icv=IDENTITY_CONTRACT_VERSION))
+
+    def test_malformed_hex_coordinate_digest_verifies_but_is_not_admissible(self) -> None:
+        # board refinement: a present-but-not-64-hex digest (truncated / non-hex / coerced) is rejected
+        # structurally — "non-empty" is not enough.
+        malformed = self._resign(guard_policy_digest="not-a-valid-sha256-hex-digest")
+        self.assertTrue(verify_report(malformed, verifier=self._ver))
+        self.assertFalse(is_acceptance_admissible(malformed, current_icv=IDENTITY_CONTRACT_VERSION))
 
 
 if __name__ == "__main__":
