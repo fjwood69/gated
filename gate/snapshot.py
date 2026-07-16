@@ -98,8 +98,12 @@ class CalibrationSnapshot:
         # renders EXACTLY as it historically did (no schema_version, no per-record ICV) so its legacy MAC
         # still verifies; a v3 snapshot signs the top-level schema_version + per-record ICV. The branch is
         # what lets historical integrity verification and current admissibility coexist without a re-sign.
-        # CLOSED-schema rendering (board P2): branch on EXACT v2/v3 and raise on anything else — never treat
-        # an arbitrary ``>= 3`` as v3, so an unknown schema cannot be rendered (and thus cannot be signed).
+        # CLOSED-schema rendering (board P2): EXACT-int + branch on EXACT v2/v3 and raise on anything else —
+        # never treat an arbitrary ``>= 3`` (or a float ``3.0 == 3``) as v3, so an unknown/degenerate schema
+        # cannot be rendered (and thus cannot be signed).
+        if type(self.schema_version) is not int:
+            raise SnapshotError(
+                f"snapshot schema_version must be an int, got {type(self.schema_version).__name__}")
         if self.schema_version == SNAPSHOT_SCHEMA_V3:
             v3 = True
         elif self.schema_version == SNAPSHOT_SCHEMA_V2:
@@ -156,6 +160,10 @@ def issue_snapshot(
     # no compatibility default. A legacy-sentinel ICV in a fresh mint would produce an un-provisionable
     # snapshot; refuse it at the source (positive-shape: present means valid).
     for pid, r in records.items():
+        if pid != r.policy_id:
+            raise SnapshotError(
+                f"snapshot mapping key {pid!r} != record.policy_id {r.policy_id!r} — refusing (the key must "
+                "equal the record's own policy_id so a lookup cannot return a mislabelled record)")
         if type(r.identity_contract_version) is not int:
             raise SnapshotError(
                 f"record {pid!r} identity_contract_version must be an int, got "
@@ -250,6 +258,10 @@ def from_json(data: str) -> CalibrationSnapshot:
     is_v3 = schema_version == SNAPSHOT_SCHEMA_V3
     records: dict[str, AttestationRecord] = {}
     for pid, r in obj["records"].items():
+        if pid != r["policy_id"]:
+            raise SnapshotError(
+                f"snapshot mapping key {pid!r} != record.policy_id {r['policy_id']!r} — refusing (a lookup "
+                "must not be able to return a mislabelled record)")
         if is_v3:
             if "identity_contract_version" not in r:
                 raise SnapshotError(
@@ -292,7 +304,13 @@ def is_provisionable(
     this is the defence-in-depth check). Only THEN is the record's SIGNED ICV compared to the current
     contract, with EXACT-int typing so a ``bool`` cannot satisfy it via ``True == 1``. The current ICV is a
     PARAMETER (the caller supplies the process constant) — this module stays signing-pure."""
-    if snapshot.schema_version != SNAPSHOT_SCHEMA_CURRENT:
+    # EXACT-int schema (board): ``3.0 == 3`` would otherwise let a float schema pass the equality.
+    if type(snapshot.schema_version) is not int or snapshot.schema_version != SNAPSHOT_SCHEMA_CURRENT:
+        return False
+    # RECORD-TO-SNAPSHOT BINDING (board P1): the record must be the AUTHENTICATED one carried by this
+    # snapshot — a caller cannot pair a valid (even empty) v3 snapshot with an independently-constructed
+    # current-ICV record. Value-equality against the snapshot's own entry (records are frozen).
+    if snapshot.records.get(record.policy_id) != record:
         return False
     icv = record.identity_contract_version
     return type(icv) is int and type(current_icv) is int and icv == current_icv

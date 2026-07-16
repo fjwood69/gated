@@ -181,6 +181,43 @@ class SchemaVersioningTests(unittest.TestCase):
         with self.assertRaises(SnapshotError):
             bad._payload()
 
+    def test_foreign_record_not_bound_to_snapshot_is_unprovisionable(self) -> None:
+        # BOARD P1: a valid v3 snapshot containing det-A cannot provision an INDEPENDENTLY-constructed
+        # det-EVIL record (even with the current ICV) — the record must be the snapshot's AUTHENTICATED one.
+        snap = issue_snapshot({"pA": _rec("pA", "det-A")}, key=_KEY, now=1000.0)
+        evil_same_policy = AttestationRecord(
+            policy_id="pA", detector_identity="det-EVIL", calibration_result_ref="cal-1",
+            fixture_set_version="fx", tier_chain_head="th", backend="podman",
+            identity_contract_version=IDENTITY_CONTRACT_VERSION)
+        self.assertFalse(is_provisionable(snap, evil_same_policy, current_icv=IDENTITY_CONTRACT_VERSION))
+        evil_absent_policy = AttestationRecord(
+            policy_id="pEVIL", detector_identity="det-EVIL", calibration_result_ref="cal-1",
+            fixture_set_version="fx", tier_chain_head="th", backend="podman",
+            identity_contract_version=IDENTITY_CONTRACT_VERSION)
+        self.assertFalse(is_provisionable(snap, evil_absent_policy, current_icv=IDENTITY_CONTRACT_VERSION))
+        own = attested_record(snap, "pA")                    # the snapshot's OWN record IS provisionable
+        assert own is not None
+        self.assertTrue(is_provisionable(snap, own, current_icv=IDENTITY_CONTRACT_VERSION))
+
+    def test_provisionable_rejects_a_float_schema_version(self) -> None:
+        # exact-int: 3.0 == 3 must NOT let a float schema provision.
+        rec = _rec("p1")
+        snap = CalibrationSnapshot(records={"p1": rec}, issued_at=1.0, valid_until=2.0, mac="",
+                                   schema_version=float(SNAPSHOT_SCHEMA_V3))  # type: ignore[arg-type]
+        self.assertFalse(is_provisionable(snap, rec, current_icv=IDENTITY_CONTRACT_VERSION))
+
+    def test_issue_snapshot_rejects_a_mapping_key_mismatch(self) -> None:
+        with self.assertRaises(SnapshotError):
+            issue_snapshot({"pDIFFERENT": _rec("pA")}, key=_KEY, now=1000.0)  # key != record.policy_id
+
+    def test_from_json_rejects_a_mapping_key_mismatch(self) -> None:
+        blob = ('{"schema_version":3,"records":{"pKEY":{"policy_id":"pDIFFERENT","detector_identity":"d",'
+                '"calibration_result_ref":"c","fixture_set_version":"f","tier_chain_head":"t",'
+                '"backend":"podman","set_id":"X","oracle_head":"h","identity_contract_version":1}},'
+                '"issued_at":1.0,"valid_until":2.0,"mac":"x"}')
+        with self.assertRaises(SnapshotError):
+            from_json(blob)
+
     def test_v3_roundtrips_through_json_and_stays_provisionable(self) -> None:
         snap = issue_snapshot({"p1": _rec("p1")}, key=_KEY, now=1000.0)
         loaded = from_json(to_json(snap))
