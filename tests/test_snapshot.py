@@ -152,6 +152,35 @@ class SchemaVersioningTests(unittest.TestCase):
         with self.assertRaises(SnapshotError):
             from_json(blob)
 
+    def test_from_json_does_not_coerce_signed_discriminators(self) -> None:
+        # board P2: a JSON true / 1.9 / "1" must NOT be coerced to integer 1 before the exact-int check.
+        for sv in ("true", "1.9", '"2"'):
+            with self.assertRaises(SnapshotError):
+                from_json('{"schema_version":%s,"records":{},"issued_at":1.0,"valid_until":2.0,"mac":"x"}' % sv)
+        # a v3 record whose ICV is a JSON bool/float/string is refused (not coerced).
+        for icv in ("true", "1.9", '"1"'):
+            blob = ('{"schema_version":3,"records":{"p1":{"policy_id":"p1","detector_identity":"d",'
+                    '"calibration_result_ref":"c","fixture_set_version":"f","tier_chain_head":"t",'
+                    '"backend":"podman","set_id":"X","oracle_head":"h","identity_contract_version":%s}},'
+                    '"issued_at":1.0,"valid_until":2.0,"mac":"x"}') % icv
+            with self.assertRaises(SnapshotError):
+                from_json(blob)
+
+    def test_issue_snapshot_rejects_a_non_int_icv(self) -> None:
+        rec = AttestationRecord(
+            policy_id="p1", detector_identity="det-1", calibration_result_ref="cal-1",
+            fixture_set_version="fx", tier_chain_head="th", backend="podman",
+            identity_contract_version=True)  # a bool is not an int identity contract
+        with self.assertRaises(SnapshotError):
+            issue_snapshot({"p1": rec}, key=_KEY, now=1000.0)
+
+    def test_payload_refuses_to_render_an_unknown_schema(self) -> None:
+        rec = _rec("p1")
+        bad = CalibrationSnapshot(records={"p1": rec}, issued_at=1.0, valid_until=2.0, mac="",
+                                  schema_version=99)
+        with self.assertRaises(SnapshotError):
+            bad._payload()
+
     def test_v3_roundtrips_through_json_and_stays_provisionable(self) -> None:
         snap = issue_snapshot({"p1": _rec("p1")}, key=_KEY, now=1000.0)
         loaded = from_json(to_json(snap))

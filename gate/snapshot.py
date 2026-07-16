@@ -98,7 +98,15 @@ class CalibrationSnapshot:
         # renders EXACTLY as it historically did (no schema_version, no per-record ICV) so its legacy MAC
         # still verifies; a v3 snapshot signs the top-level schema_version + per-record ICV. The branch is
         # what lets historical integrity verification and current admissibility coexist without a re-sign.
-        v3 = self.schema_version >= SNAPSHOT_SCHEMA_V3
+        # CLOSED-schema rendering (board P2): branch on EXACT v2/v3 and raise on anything else — never treat
+        # an arbitrary ``>= 3`` as v3, so an unknown schema cannot be rendered (and thus cannot be signed).
+        if self.schema_version == SNAPSHOT_SCHEMA_V3:
+            v3 = True
+        elif self.schema_version == SNAPSHOT_SCHEMA_V2:
+            v3 = False
+        else:
+            raise SnapshotError(
+                f"cannot render an unknown snapshot schema_version {self.schema_version!r} (closed set: v2, v3)")
         rendered = {
             pid: {
                 "policy_id": r.policy_id, "detector_identity": r.detector_identity,
@@ -148,6 +156,10 @@ def issue_snapshot(
     # no compatibility default. A legacy-sentinel ICV in a fresh mint would produce an un-provisionable
     # snapshot; refuse it at the source (positive-shape: present means valid).
     for pid, r in records.items():
+        if type(r.identity_contract_version) is not int:
+            raise SnapshotError(
+                f"record {pid!r} identity_contract_version must be an int, got "
+                f"{type(r.identity_contract_version).__name__} — refusing (no coerced/degenerate ICV)")
         if r.identity_contract_version == _LEGACY_ICV:
             raise SnapshotError(
                 f"refusing to mint a v{SNAPSHOT_SCHEMA_CURRENT} snapshot with a legacy-sentinel ICV for "
@@ -225,7 +237,13 @@ def from_json(data: str) -> CalibrationSnapshot:
     #   (b) a v2 record carrying an ``identity_contract_version`` is REFUSED — the field cannot exist under a
     #       schema that predates the signed ICV; a legacy artifact never claims current authority;
     #   (c) a v3 record MUST carry its signed ICV (no compat default).
-    schema_version = int(obj.get("schema_version", SNAPSHOT_SCHEMA_V2))
+    # SIGNED DISCRIMINATORS ARE NOT COERCED (board P2): a JSON ``true`` / ``1.9`` / ``"1"`` must NOT become
+    # integer 1 before the exact-int check — that would launder a type-confused value past the MAC-shape
+    # discipline. Require the value to already BE an int (``type() is int`` also rejects ``bool``).
+    schema_version = obj.get("schema_version", SNAPSHOT_SCHEMA_V2)
+    if type(schema_version) is not int:
+        raise SnapshotError(
+            f"snapshot schema_version must be a JSON integer, got {type(schema_version).__name__} — refusing")
     if schema_version not in (SNAPSHOT_SCHEMA_V2, SNAPSHOT_SCHEMA_V3):
         raise SnapshotError(
             f"unknown snapshot schema_version {schema_version} — refusing (closed set: v2, v3)")
@@ -236,7 +254,11 @@ def from_json(data: str) -> CalibrationSnapshot:
             if "identity_contract_version" not in r:
                 raise SnapshotError(
                     f"v3 snapshot record {pid!r} is missing its SIGNED identity_contract_version")
-            icv = int(r["identity_contract_version"])
+            icv = r["identity_contract_version"]
+            if type(icv) is not int:
+                raise SnapshotError(
+                    f"v3 snapshot record {pid!r} identity_contract_version must be a JSON integer, got "
+                    f"{type(icv).__name__} — refusing (no coercion of a signed discriminator)")
         else:
             if "identity_contract_version" in r:
                 raise SnapshotError(
