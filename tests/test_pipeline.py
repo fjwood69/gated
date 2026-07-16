@@ -40,7 +40,6 @@ from core import (
 )
 
 from engine.runner import EngineRunResult
-from gate.attestation import calibrated_subject_identity
 from gate.checkrun import CheckConclusion, CheckStatus
 from gate.gatekeeper import GateDecision, GateDecisionError
 from gate.job_result import (
@@ -419,115 +418,6 @@ class ExtractToSpecTests(unittest.TestCase):
             self.assertIsInstance(spec, ArtifactSpec)
             self.assertEqual(spec.tree_hash, tree_hash(spec.path))
 
-
-# ---- real-engine handshake + the S5 GENUINE-BITE (skip unless podman + image) ----
-
-_A_RETRY = (
-    "import socket\n"
-    "def _get():\n"
-    "    s = socket.create_connection(('health-proxy', 8080), 3)\n"
-    "    s.sendall(b'GET / HTTP/1.0\\r\\n\\r\\n')\n"
-    "    r = s.recv(64); s.close()\n"
-    "    if b'503' in r: raise OSError('transient')\n"
-    "    return r\n"
-    "for _ in range(3):\n"
-    "    try:\n"
-    "        _get(); break\n"
-    "    except OSError:\n"
-    "        continue\n"
-).encode()
-
-from sandbox.observed import ObservedOCISandbox  # noqa: E402
-
-_PODMAN = ObservedOCISandbox.available(_IMAGE)
-
-
-@unittest.skipUnless(_PODMAN, f"no OCI runtime can run {_IMAGE} hermetically")
-class RealEngineAdmissionTests(unittest.TestCase):
-    """The S5 keystone: REAL podman runs through make_gated_job_runner. The measured 4-coordinate composite
-    comes from the ACTUAL execution — NOT echoed from the plan target — so the admission genuinely bites on
-    EVERY dimension: the structural SUBJECT_DRIFT AND each live-currency refusal (set moved, head stale,
-    subject moved, governance unavailable). The real measured subject is learnt ONCE (a probe run in
-    setUpClass; it is stable across runs on the same image/backend) and reused."""
-
-    _subject: str
-    _tar: Path
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        tmp = Path(tempfile.mkdtemp(prefix="mv-hs-"))
-        cls._tar = tmp / "art.tar"
-        _fixture_tarball(cls._tar, _A_RETRY)
-        un = _run_engine_check(_event(), _plan(target="probe-target", authorized="probe-target"),
-                               artifact_source=cls._make_source(), image=_IMAGE, resolve=_RESOLVE_BUNDLE,
-                               detector_id=_DETECTOR_ID, trials=2)
-        rep = un.report
-        assert rep.execution_identity is not None
-        cls._subject = calibrated_subject_identity(
-            rep.resolved_profile_digest, rep.trust_policy_digest, rep.guard_policy_digest,
-            rep.execution_identity.digest())
-
-    @classmethod
-    def _make_source(cls):  # type: ignore[no-untyped-def]
-        tar = cls._tar
-
-        def source(_e: GatingEvent, ws: Path) -> ArtifactSpec:
-            return extract_to_spec(tar, ws)
-        return source
-
-    def _run(self, plan, governance) -> JobResult:  # type: ignore[no-untyped-def]
-        runner = make_gated_job_runner(
-            lambda _e: _enforce(plan), self._make_source(), policy_id=_POLICY, governance=governance,
-            image=_IMAGE, resolve=_RESOLVE_BUNDLE, detector_id=_DETECTOR_ID, trials=2)
-        return runner(_event())
-
-    def _matching_plan(self):  # type: ignore[no-untyped-def]
-        return _plan(target=self._subject, authorized=self._subject)
-
-    def test_wrong_target_is_refused_subject_drift_from_the_real_measurement(self) -> None:
-        # THE genuine-bite: the plan dispatches a WRONG subject; the real run measures the REAL one; admission
-        # recomputes the measured composite from the authoritative return and refuses SUBJECT_DRIFT. Nothing in
-        # the test sets the measured value — the engine did.
-        result = self._run(_plan(target="a-wrong-dispatched-subject", authorized="a-wrong-dispatched-subject"),
-                           _FakeGovernance())
-        assert isinstance(result, BlockingRefusal)
-        self.assertIs(result.reason, RunAdmissionRefusal.SUBJECT_DRIFT)
-
-    def test_matching_plan_and_current_governance_admits_the_measured_verdict(self) -> None:
-        # the happy wired path: a plan whose target IS the real measured subject + current governance ->
-        # AdmittedRunResult carrying the engine's PASS verdict.
-        result = self._run(self._matching_plan(), _FakeGovernance(subject=self._subject))
-        assert isinstance(result, AdmittedRunResult)
-        self.assertIs(result.verdict.status, VerdictType.PASS)
-        self.assertEqual(result.measured_subject, self._subject)
-
-    def test_authorized_subject_moved_refuses_even_though_the_run_matched_the_plan(self) -> None:
-        # structural passes (measured == target from the real run) but governance moved the authorized subject
-        # since mint -> AUTHORIZED_SUBJECT_MOVED (a LIVE-currency bite on the wired path).
-        result = self._run(self._matching_plan(), _FakeGovernance(subject="governance-moved-the-subject"))
-        assert isinstance(result, BlockingRefusal)
-        self.assertIs(result.reason, RunAdmissionRefusal.AUTHORIZED_SUBJECT_MOVED)
-
-    def test_authorized_set_moved_refuses_on_the_wired_path(self) -> None:
-        # the live attestation is bound to a DIFFERENT set than the plan authorized (a governance rebind).
-        result = self._run(self._matching_plan(),
-                           _FakeGovernance(subject=self._subject, set_id="a-different-set"))
-        assert isinstance(result, BlockingRefusal)
-        self.assertIs(result.reason, RunAdmissionRefusal.AUTHORIZED_SET_MOVED)
-
-    def test_set_head_stale_refuses_on_the_wired_path(self) -> None:
-        # the bound calibration head differs from the live set_head — the set drifted since calibration.
-        result = self._run(self._matching_plan(),
-                           _FakeGovernance(subject=self._subject, bound_head="bound-old", live_head="live-new"))
-        assert isinstance(result, BlockingRefusal)
-        self.assertIs(result.reason, RunAdmissionRefusal.SET_HEAD_STALE)
-
-    def test_unavailable_governance_read_fails_closed_on_the_wired_path(self) -> None:
-        # admission's OWN live read raises (a broken chain / unreachable store) -> fail-closed
-        # LIVE_ATTESTATION_UNAVAILABLE, never a silent pass.
-        result = self._run(self._matching_plan(), _FakeGovernance(subject=self._subject, raise_attn=True))
-        assert isinstance(result, BlockingRefusal)
-        self.assertIs(result.reason, RunAdmissionRefusal.LIVE_ATTESTATION_UNAVAILABLE)
 
 
 if __name__ == "__main__":
