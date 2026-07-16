@@ -73,6 +73,13 @@ class InfrastructureFailure:
     reason: InfraFailureReason  # the CLOSED cause (the only thing published); NEVER a free string
     detail: str                 # raw diagnostic (exception text etc.) — INTERNAL LOGS ONLY, never published
 
+    def __post_init__(self) -> None:
+        # board hardening: the reason MUST be the closed enum (a stray string would slip a free token — and
+        # potentially raw/injected text — into the published summary).
+        if type(self.reason) is not InfraFailureReason:
+            raise TypeError(
+                f"InfrastructureFailure.reason must be an InfraFailureReason, got {type(self.reason).__name__}")
+
 
 # The closed publication union. A bare ``Verdict`` / ``EngineRunResult`` is deliberately NOT a member — the
 # Executor runtime-rejects anything else (see ``account``).
@@ -102,6 +109,9 @@ class PersistedOutcome:
         # (Only PERSISTED historical VerdictRows may lack a gate outcome; a minted PersistedOutcome never can.)
         if self.status not in ("done", "error"):
             raise ValueError(f"status must be done|error, got {self.status!r}")
+        if self.gate_outcome is not None and type(self.gate_outcome) is not GateOutcome:
+            raise TypeError(
+                f"gate_outcome must be a GateOutcome, got {type(self.gate_outcome).__name__}")
         if self.status == "error":
             if self.gate_outcome is not None or self.verdict is not None:
                 raise ValueError("an infra/error row carries NEITHER a gate outcome NOR a verdict")
