@@ -41,6 +41,7 @@ from typing import Callable, Sequence
 
 from core.chain import GENESIS_HASH, chain_hash, content_digest
 
+from .job_result import GateOutcome
 from .queue import OverrideCaptureEvent
 
 _log = logging.getLogger("gated.gate.ledger")
@@ -57,7 +58,8 @@ class UnverifiableReason(Enum):
     NEVER_EVALUATED = "NEVER_EVALUATED"          # no verdict row exists for the SHA
     EVALUATION_IN_FLIGHT = "EVALUATION_IN_FLIGHT"  # a check was still running at merge
     INFRA_ERROR = "INFRA_ERROR"                  # the delivery errored (infra), not a verdict
-    AMBIGUOUS = "AMBIGUOUS"                       # contradictory terminal verdicts for the SHA
+    AMBIGUOUS = "AMBIGUOUS"                       # contradictory terminal outcomes for the SHA
+    INDETERMINATE_GATE = "INDETERMINATE_GATE"    # a done row with neither a verdict nor a known gate outcome
 
 
 class OutcomeKind(Enum):
@@ -77,6 +79,7 @@ class VerdictRow:
     verdict: str | None
     reason: str | None
     updated_at: float
+    gate_outcome: str | None = None   # CP2 closure 1: the persisted GateOutcome value (independent of verdict)
 
 
 @dataclass(frozen=True)
@@ -90,17 +93,35 @@ class MergeOutcome:
     sub_reason: UnverifiableReason | None = None
 
 
+def _row_class(row: VerdictRow) -> str:
+    """CP2 closure 1: classify ONE ``done`` row as ``allowing`` / ``blocking`` / ``indeterminate`` from the
+    engine verdict AND the persisted gate outcome (independent of the verdict — a BLOCKING governance non-run
+    has NO verdict yet must still count as blocking). A ``done`` row that carries NEITHER a verdict NOR a
+    known gate outcome (a historical pre-CP2 row, or an unaccounted write) is INDETERMINATE — never silently
+    read as clean."""
+    if row.verdict == "PASS":
+        return "allowing"
+    if row.verdict is not None:            # FAIL / ERROR — a recorded non-PASS verdict
+        return "blocking"
+    if row.gate_outcome == GateOutcome.BLOCK_GATE.value:
+        return "blocking"                  # a blocking non-run gate (merge-past -> override) — no verdict
+    if row.gate_outcome == GateOutcome.NEUTRAL_GATE.value:
+        return "allowing"                  # a non-blocking neutral gate
+    return "indeterminate"                 # verdict None + gate None/unknown
+
+
 def classify_merge(rows: Sequence[VerdictRow]) -> MergeOutcome:
     """PURE: map the 2.3-store rows for a merged SHA to an audit outcome. No I/O.
 
-    Precedence (audit-conservative):
-      1. any delivery still ``processing`` -> UNVERIFIABLE/EVALUATION_IN_FLIGHT. A check was
-         in flight at merge; we do NOT silently take an older ``done`` verdict (F2 staleness).
-      2. ``done`` rows present:
-           - a mix of PASS and non-PASS  -> UNVERIFIABLE/AMBIGUOUS (the gate's record for the
-             SHA is contradictory; overclaiming either way would mislead the auditor);
-           - all non-PASS (FAIL/ERROR)   -> HUMAN_OVERRIDE (the latest non-PASS verdict/reason);
-           - all PASS                    -> NO_OVERRIDE (record nothing, D-Q1).
+    Precedence (audit-conservative, CP2 closure 1 — classify the GATE OUTCOME, not just the engine verdict):
+      1. any delivery still ``processing`` -> UNVERIFIABLE/EVALUATION_IN_FLIGHT (F2 staleness).
+      2. ``done`` rows present, each classed allowing / blocking / indeterminate from verdict + gate outcome:
+           - any INDETERMINATE (a done row with neither a verdict nor a known gate outcome, e.g. a historical
+             row) -> UNVERIFIABLE/INDETERMINATE_GATE (never a clean success);
+           - mixed allowing + blocking     -> UNVERIFIABLE/AMBIGUOUS;
+           - blocking-only                 -> HUMAN_OVERRIDE (latest blocking row; a blocking NON-RUN carries
+             verdict=None + its stable gate-outcome reason, rendered "gate outcome was ...");
+           - allowing-only                 -> NO_OVERRIDE (record nothing, D-Q1).
       3. no ``done`` rows but ``error`` rows -> UNVERIFIABLE/INFRA_ERROR (F3: infra, not verdict).
       4. no rows at all                      -> UNVERIFIABLE/NEVER_EVALUATED.
     """
@@ -109,12 +130,17 @@ def classify_merge(rows: Sequence[VerdictRow]) -> MergeOutcome:
 
     done = [r for r in rows if r.status == "done"]
     if done:
-        passes = [r for r in done if r.verdict == "PASS"]
-        non_pass = [r for r in done if r.verdict is not None and r.verdict != "PASS"]
-        if passes and non_pass:
+        classes = {r: _row_class(r) for r in done}
+        if any(c == "indeterminate" for c in classes.values()):
+            return MergeOutcome(OutcomeKind.UNVERIFIABLE, sub_reason=UnverifiableReason.INDETERMINATE_GATE)
+        allowing = any(c == "allowing" for c in classes.values())
+        blocking = [r for r, c in classes.items() if c == "blocking"]
+        if allowing and blocking:
             return MergeOutcome(OutcomeKind.UNVERIFIABLE, sub_reason=UnverifiableReason.AMBIGUOUS)
-        if non_pass:
-            latest = max(non_pass, key=lambda r: r.updated_at)
+        if blocking:
+            # the latest blocking row: a verdict-bearing block carries its verdict/reason; a blocking non-run
+            # carries verdict=None + its stable gate-outcome reason (no hash-bound ledger field — reuse fields).
+            latest = max(blocking, key=lambda r: r.updated_at)
             return MergeOutcome(OutcomeKind.HUMAN_OVERRIDE, verdict=latest.verdict, reason=latest.reason)
         return MergeOutcome(OutcomeKind.NO_OVERRIDE)
 

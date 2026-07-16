@@ -36,8 +36,9 @@ _INSTALL_OK = 111
 _SECRET = b"shhh-c3"
 
 
-def _row(status: str, verdict: str | None = None, reason: str | None = None, t: float = 1.0) -> VerdictRow:
-    return VerdictRow(status=status, verdict=verdict, reason=reason, updated_at=t)
+def _row(status: str, verdict: str | None = None, reason: str | None = None, t: float = 1.0,
+         gate_outcome: str | None = None) -> VerdictRow:
+    return VerdictRow(status=status, verdict=verdict, reason=reason, updated_at=t, gate_outcome=gate_outcome)
 
 
 def _ledger() -> OverrideLedger:
@@ -86,6 +87,30 @@ class ClassifyMergeTests(unittest.TestCase):
 
     def test_contradictory_terminals_are_ambiguous(self) -> None:
         o = classify_merge([_row("done", "PASS", t=1.0), _row("done", "FAIL", "EGRESS_ONE", t=2.0)])
+        self.assertIs(o.sub_reason, UnverifiableReason.AMBIGUOUS)
+
+    def test_block_gate_merged_past_is_human_override(self) -> None:
+        # CP2 closure 1: a blocking NON-RUN gate (verdict=None) merged past IS a human override — not
+        # NO_OVERRIDE. The gate outcome is classified independently of any engine verdict.
+        o = classify_merge([_row("done", verdict=None, reason="block_action_required",
+                                 gate_outcome="block_gate")])
+        self.assertIs(o.kind, OutcomeKind.HUMAN_OVERRIDE)
+        self.assertIsNone(o.verdict)                         # no fabricated engine verdict
+        self.assertEqual(o.reason, "block_action_required")  # the stable gate-outcome reason
+
+    def test_neutral_gate_merged_past_is_no_override(self) -> None:
+        o = classify_merge([_row("done", verdict=None, reason="skip_neutral", gate_outcome="neutral_gate")])
+        self.assertIs(o.kind, OutcomeKind.NO_OVERRIDE)
+
+    def test_done_with_no_verdict_and_no_gate_is_indeterminate(self) -> None:
+        # a historical (pre-CP2) done row, or an unaccounted write: NEVER a clean success.
+        o = classify_merge([_row("done", verdict=None, gate_outcome=None)])
+        self.assertIs(o.kind, OutcomeKind.UNVERIFIABLE)
+        self.assertIs(o.sub_reason, UnverifiableReason.INDETERMINATE_GATE)
+
+    def test_neutral_gate_plus_block_gate_is_ambiguous(self) -> None:
+        o = classify_merge([_row("done", gate_outcome="neutral_gate", t=1.0),
+                            _row("done", gate_outcome="block_gate", t=2.0)])
         self.assertIs(o.sub_reason, UnverifiableReason.AMBIGUOUS)
 
     def test_latest_non_pass_reason_wins(self) -> None:
