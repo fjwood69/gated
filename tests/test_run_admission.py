@@ -91,8 +91,11 @@ def _admit(plan: AuthorizedRunPlan, report: TrialReport,
 
 
 def _proof(*, policy_id: str = "p1", set_id: str = _SET, head: str = _HEAD,
-           subject: str = _SUBJECT) -> _LiveAdmissionProof:
-    return _mint_live_admission_proof(policy_id=policy_id, set_id=set_id, oracle_head=head, subject=subject)
+           subject: str = _SUBJECT, plan: AuthorizedRunPlan | None = None,
+           report: TrialReport | None = None) -> _LiveAdmissionProof:
+    return _mint_live_admission_proof(
+        policy_id=policy_id, set_id=set_id, oracle_head=head, subject=subject,
+        plan=plan if plan is not None else _plan(), report=report if report is not None else _report())
 
 
 class HappyPathTests(unittest.TestCase):
@@ -252,7 +255,8 @@ class ProofGatedConstructionTests(unittest.TestCase):
     def test_proof_cannot_be_constructed_without_the_mint_sentinel(self) -> None:
         # a caller cannot fabricate a proof — the constructor refuses any key but the module-private mint.
         with self.assertRaises(RunAdmissionError):
-            _LiveAdmissionProof(policy_id="p1", set_id=_SET, oracle_head=_HEAD, subject=_SUBJECT)
+            _LiveAdmissionProof(policy_id="p1", set_id=_SET, oracle_head=_HEAD, subject=_SUBJECT,
+                                plan=_plan(), report=_report())
 
     def test_admitted_metadata_is_derived_from_the_proof(self) -> None:
         # the scoped metadata comes off the proof, not caller-supplied fields.
@@ -282,6 +286,27 @@ class ProofGatedConstructionTests(unittest.TestCase):
                                  authorized_context=(_SET, _SUBJECT, IDENTITY_CONTRACT_VERSION + 1))
         with self.assertRaises(RunAdmissionError):
             AdmittedRunResult(plan=plan, report=_report(), _proof=_proof())
+
+    def test_proof_bound_to_a_different_plan_raises(self) -> None:
+        # P1-B: a legitimately-minted proof (for plan_a authorizing set-A) cannot be RE-PAIRED with a
+        # DIFFERENT plan (plan_b authorizing set-B) — both pass the pure structural re-run (same subject), so
+        # only the plan-binding catches the swap. This is the "different plan, same policy/subject, different
+        # authorized set" reuse vector.
+        plan_a = _plan(set_id="set-A")
+        plan_b = _plan(set_id="set-B")
+        proof_a = _proof(set_id="set-A", plan=plan_a, report=_report())
+        with self.assertRaises(RunAdmissionError):
+            AdmittedRunResult(plan=plan_b, report=_report(), _proof=proof_a)
+
+    def test_proof_bound_to_a_different_report_raises(self) -> None:
+        # P1-B: the "same subject, different verdict" reuse vector — report_b differs from the bound report
+        # ONLY in aggregate verdict (identical coordinates -> identical recomputed subject), so it passes the
+        # structural re-run; only the report-binding catches that the proof was minted for a different run.
+        report_a = _report(aggregate=_PASS)
+        report_b = _report(aggregate=_FAIL)
+        proof_a = _proof(plan=_plan(), report=report_a)
+        with self.assertRaises(RunAdmissionError):
+            AdmittedRunResult(plan=_plan(), report=report_b, _proof=proof_a)
 
 
 class TypestateTests(unittest.TestCase):

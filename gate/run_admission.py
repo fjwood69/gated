@@ -197,10 +197,18 @@ class BlockingRefusal:
     """A run result REFUSED admission. It is not a silent drop: it carries a fail-closed blocking verdict
     (``Verdict(ERROR, RUN_UNADMITTED)`` → action_required on the Check Run), so the merge is BLOCKED, never
     fallen open to neutral. ``reason`` records the specific admission layer that refused (forensics); the
-    published verdict is uniformly ERROR regardless of layer (the layer is not leaked to the merge UI)."""
+    published verdict is uniformly ERROR regardless of layer (the layer is not leaked to the merge UI).
+
+    ``sub_reason`` (CP2 board C3) is OPERATIONAL LEGIBILITY only — not a safety distinction (every refusal
+    blocks identically). It disambiguates the coarse ``LIVE_ATTESTATION_UNAVAILABLE`` / ``ORACLE_UNAVAILABLE``
+    layers so an operator can tell a store outage (``store_unreachable``) from an absent attestation
+    (``attestation_absent`` — the policy is not ENABLED or its contract drifted; the finer
+    ``policy_not_enabled`` vs ``icv_mismatch`` split is supplied by the production governance view). Empty for
+    the structural layers, which are already precise via ``reason``."""
 
     reason: RunAdmissionRefusal
     detail: str
+    sub_reason: str = ""
 
     @property
     def verdict(self) -> Verdict:
@@ -264,10 +272,13 @@ _PROOF_MINT = object()  # module-private mint sentinel — the proof constructor
 class _LiveAdmissionProof:
     """RESULT-BOUND proof that ``admit_run_result`` ran the LIVE governance-currency checks FOR THIS RUN.
     NOT a reusable singleton: a FRESH instance is minted (by ``_mint_live_admission_proof``) only AFTER the
-    live checks pass, carrying the exact live-read RESULT — ``(policy_id, set_id, oracle_head, subject)``.
-    ``AdmittedRunResult`` DERIVES its public metadata from this proof (never from caller-supplied fields) and
-    verifies the proof coheres with the run (same policy; subject == the report-recomputed subject), so a
-    proof minted for one run cannot admit a different one, and a caller cannot fabricate admission metadata.
+    live checks pass, carrying the exact live-read metadata — ``(policy_id, set_id, oracle_head, subject)`` —
+    AND the EXACT FROZEN ``plan`` + ``report`` it was minted for (CP2 board P1-B). ``AdmittedRunResult``
+    DERIVES its public metadata from this proof (never from caller-supplied fields) and verifies the proof
+    coheres with the run — same policy, subject == the report-recomputed subject, AND ``proof.plan == plan``
+    and ``proof.report == report`` — so a legitimately-minted proof cannot be RE-USED to admit a DIFFERENT
+    run: a different report (same subject, different verdict) or a different plan (same policy/subject,
+    different authorized set) both change the bound object and fail construction.
 
     Its constructor refuses any key but the module-private ``_PROOF_MINT`` sentinel, so a caller outside this
     module cannot construct one. In-process call-path convention (the structural no-bypass test asserts
@@ -278,6 +289,8 @@ class _LiveAdmissionProof:
     set_id: str
     oracle_head: str
     subject: str
+    plan: AuthorizedRunPlan   # the EXACT plan this proof was minted for (P1-B binding)
+    report: TrialReport       # the EXACT report this proof was minted for (P1-B binding)
     mint: InitVar[object] = None
 
     def __post_init__(self, mint: object) -> None:
@@ -289,11 +302,14 @@ class _LiveAdmissionProof:
 
 def _mint_live_admission_proof(
     *, policy_id: str, set_id: str, oracle_head: str, subject: str,
+    plan: AuthorizedRunPlan, report: TrialReport,
 ) -> _LiveAdmissionProof:
     """The SOLE mint of a live-admission proof — called ONLY by ``admit_run_result`` (structural no-bypass
-    test), only AFTER every live governance-currency check has passed, binding the live-read result."""
+    test), only AFTER every live governance-currency check has passed, binding the live-read result AND the
+    exact plan + report it admitted (P1-B: the proof cannot be re-paired with a different run)."""
     return _LiveAdmissionProof(
-        policy_id=policy_id, set_id=set_id, oracle_head=oracle_head, subject=subject, mint=_PROOF_MINT)
+        policy_id=policy_id, set_id=set_id, oracle_head=oracle_head, subject=subject,
+        plan=plan, report=report, mint=_PROOF_MINT)
 
 
 @dataclass(frozen=True)
@@ -329,8 +345,11 @@ class AdmittedRunResult:
             raise RunAdmissionError(
                 f"AdmittedRunResult failed structural re-validation ({outcome.reason.value}): "
                 f"{outcome.detail} — construct it via admit_run_result")
-        # ... then bind the RESULT proof to THIS run: same policy, and the admitted subject IS the
-        # report-recomputed subject. A stale/foreign proof (minted for another run) cannot admit this one.
+        # ... then bind the RESULT proof to THIS run: same policy, the admitted subject IS the
+        # report-recomputed subject, AND (P1-B) the proof is bound to the EXACT plan + report — a
+        # legitimately-minted proof cannot be re-paired with a different run (a different report with the
+        # same subject but a different verdict, or a different plan with the same policy/subject but a
+        # different authorized set, both change the bound object and are refused here).
         if self._proof.policy_id != self.plan.policy_id:
             raise RunAdmissionError(
                 f"live-admission proof policy_id {self._proof.policy_id!r} != plan.policy_id "
@@ -339,6 +358,21 @@ class AdmittedRunResult:
             raise RunAdmissionError(
                 "live-admission proof subject != the subject recomputed from the report — the proof was "
                 "minted for a different run (construct it via admit_run_result)")
+        if self._proof.plan != self.plan:
+            raise RunAdmissionError(
+                "live-admission proof is bound to a DIFFERENT plan than this result — the proof was minted "
+                "for another run (construct it via admit_run_result)")
+        if self._proof.report != self.report:
+            raise RunAdmissionError(
+                "live-admission proof is bound to a DIFFERENT report than this result — the proof was minted "
+                "for another run (construct it via admit_run_result)")
+        # the live-read set the proof carries MUST be the plan's authorized set (admit_run_result proved
+        # plan.authorized_set == live_set_id before minting; assert it so a direct construction cannot pair a
+        # proof from set A with a plan authorizing set B).
+        if self._proof.set_id != self.plan.authorized_set:
+            raise RunAdmissionError(
+                f"live-admission proof set_id {self._proof.set_id!r} != plan.authorized_set "
+                f"{self.plan.authorized_set!r} — the proof was minted against a different set")
 
     @property
     def measured_subject(self) -> str:
@@ -393,11 +427,13 @@ def admit_run_result(
     except Exception as exc:  # a broken chain / unreachable store — never a silent pass
         return BlockingRefusal(
             RunAdmissionRefusal.LIVE_ATTESTATION_UNAVAILABLE,
-            f"live attestation read failed for {plan.policy_id!r} ({type(exc).__name__}) — fail-closed")
+            f"live attestation read failed for {plan.policy_id!r} ({type(exc).__name__}) — fail-closed",
+            sub_reason="store_unreachable")
     if attestation is None:
         return BlockingRefusal(
             RunAdmissionRefusal.LIVE_ATTESTATION_UNAVAILABLE,
-            f"{plan.policy_id!r} has no current ENABLED attestation — not admissible (fail-closed)")
+            f"{plan.policy_id!r} has no current ENABLED attestation — not admissible (fail-closed)",
+            sub_reason="attestation_absent")
     live_set_id, bound_head, live_subject = attestation
 
     # set continuity FIRST — BEFORE the oracle query — so a moved set + an unavailable oracle is classified
@@ -414,11 +450,13 @@ def admit_run_result(
     except Exception as exc:
         return BlockingRefusal(
             RunAdmissionRefusal.ORACLE_UNAVAILABLE,
-            f"live set_head read failed for {live_set_id!r} ({type(exc).__name__}) — fail-closed")
+            f"live set_head read failed for {live_set_id!r} ({type(exc).__name__}) — fail-closed",
+            sub_reason="store_unreachable")
     if live_head is None:
         return BlockingRefusal(
             RunAdmissionRefusal.ORACLE_UNAVAILABLE,
-            f"cannot resolve the live set_head for {live_set_id!r} — fail-closed")
+            f"cannot resolve the live set_head for {live_set_id!r} — fail-closed",
+            sub_reason="unresolved")
     # set-head currency: the bound calibration head must still be the live set head (else the set drifted
     # since calibration while the policy stayed ENABLED — the D1 hole).
     if bound_head != live_head:
@@ -434,10 +472,11 @@ def admit_run_result(
             f"dispatched target {plan.target_subject[:12]}.. != the live-authorized subject "
             f"{live_subject[:12]}.. — governance moved the authorized subject since the plan was minted")
 
-    # every live check passed — mint a FRESH result-bound proof carrying the live-read values, and derive
-    # the admitted metadata from it (no caller-supplied metadata to forge).
+    # every live check passed — mint a FRESH result-bound proof carrying the live-read values AND bound to
+    # the exact plan + report (P1-B), and derive the admitted metadata from it (no caller-supplied metadata).
     proof = _mint_live_admission_proof(
-        policy_id=plan.policy_id, set_id=live_set_id, oracle_head=live_head, subject=live_subject)
+        policy_id=plan.policy_id, set_id=live_set_id, oracle_head=live_head, subject=live_subject,
+        plan=plan, report=unadmitted.report)
     return AdmittedRunResult(plan=plan, report=unadmitted.report, _proof=proof)
 
 
