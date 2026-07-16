@@ -13,10 +13,14 @@ import threading
 import unittest
 from pathlib import Path
 
-from core import VerdictType
+from core import Reason, Verdict, VerdictType
 from gate.executor import Executor, LifecycleEvent, Transition, Watchdog
+from gate.job_result import InfraFailureReason, InfrastructureFailure, JobResult, NonRunDecision
+from gate.policy_state import Disposition
 from gate.queue import GatingEvent, SinkFull
+from gate.run_admission import AdmittedRunResult
 from gate.store import GatingStore, StoreBackedGatingSink
+from tests.test_run_admission import _FakeGovernance, _admit, _plan, _report
 
 
 class _Clock:
@@ -131,7 +135,7 @@ class StoreTests(unittest.TestCase):
         sha = "1" * 40
         self.store.enqueue(_event("d2", sha=sha))
         self.store.claim_next()
-        self.store.finalize("d2", "done", verdict="PASS", reason="UNANIMOUS_PASS")  # no gate_outcome
+        self.store.finalize("d2", "done", verdict="pass", reason="UNANIMOUS_PASS")  # no gate_outcome
         self.assertIsNone(self.store.verdicts_for_sha(sha)[0][4])
 
     def test_same_sha_claimable_after_prior_errored(self) -> None:
@@ -182,11 +186,14 @@ class StoreTests(unittest.TestCase):
 
 
 class _RecordingUpdater:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, VerdictType]] = []
+    """CP2 S5: the updater now receives a TYPED JobResult. Records (delivery_id, result) so tests can
+    assert BOTH what was published AND (via the store) what was persisted."""
 
-    def __call__(self, event: GatingEvent, verdict) -> None:  # type: ignore[no-untyped-def]
-        self.calls.append((event.delivery_id, verdict.status))
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, JobResult]] = []
+
+    def __call__(self, event: GatingEvent, result: JobResult) -> None:
+        self.calls.append((event.delivery_id, result))
 
 
 class _RecordingLifecycle:
@@ -195,6 +202,12 @@ class _RecordingLifecycle:
 
     def record(self, event: LifecycleEvent) -> None:
         self.events.append(event)
+
+
+def _admitted_pass() -> AdmittedRunResult:
+    res = _admit(_plan(), _report(), _FakeGovernance())
+    assert isinstance(res, AdmittedRunResult)
+    return res
 
 
 class ExecutorTests(unittest.TestCase):
@@ -206,52 +219,139 @@ class ExecutorTests(unittest.TestCase):
     def _transitions(self, delivery_id: str) -> list[Transition]:
         return [e.transition for e in self.life.events if e.delivery_id == delivery_id]
 
-    def test_happy_path_posts_verdict(self) -> None:
-        ex = Executor(self.store, lambda e: _pass(), self.updater, lifecycle=self.life)
+    def _row(self, sha: str):  # type: ignore[no-untyped-def]
+        rows = self.store.verdicts_for_sha(sha)
+        assert len(rows) == 1
+        return rows[0]  # (status, verdict, reason, updated_at, gate_outcome)
+
+    def test_admitted_run_posts_verdict_and_run_gate_outcome(self) -> None:
+        ex = Executor(self.store, lambda e: _admitted_pass(), self.updater, lifecycle=self.life)
         self.store.enqueue(_event("d1"))
         self.store.claim_next()
         ex.process_claimed(_event("d1"))
-        self.assertEqual(self.updater.calls, [("d1", VerdictType.PASS)])
-        self.assertEqual(self.store.status_of("d1"), "done")
+        self.assertEqual(len(self.updater.calls), 1)
+        self.assertIsInstance(self.updater.calls[0][1], AdmittedRunResult)
+        status, verdict, _reason, _u, gate_outcome = self._row("a" * 40)
+        # the executor persists the enum VALUE (VerdictType.PASS.value == "pass"), the persisted WIRE form the
+        # override classifier now matches (S5 fix, board-ruled: classify against 'pass'/'fail'/'error', not
+        # uppercase). The end-to-end classification is proven in ClassifierEndToEndTests below.
+        self.assertEqual((status, verdict, gate_outcome), ("done", "pass", "run_verdict"))
         self.assertIn(Transition.COMPLETED, self._transitions("d1"))
 
-    def test_job_crash_becomes_error(self) -> None:
-        def boom(_: GatingEvent):  # type: ignore[no-untyped-def]
+    def test_non_run_block_persists_gate_outcome_no_verdict(self) -> None:
+        # a governance non-run routes through account() -> a done row with gate_outcome='block_gate' + NO
+        # verdict (closure 1), published as a NonRunDecision.
+        runner = lambda e: NonRunDecision(Disposition.BLOCK_ACTION_REQUIRED, "degraded")  # noqa: E731
+        ex = Executor(self.store, runner, self.updater, lifecycle=self.life)
+        self.store.enqueue(_event("d1"))
+        self.store.claim_next()
+        ex.process_claimed(_event("d1"))
+        status, verdict, _reason, _u, gate_outcome = self._row("a" * 40)
+        self.assertEqual((status, verdict, gate_outcome), ("done", None, "block_gate"))
+        self.assertIsInstance(self.updater.calls[0][1], NonRunDecision)
+
+    def test_worker_exception_is_worker_fault(self) -> None:
+        def boom(_: GatingEvent) -> JobResult:
             raise RuntimeError("engine died")
 
         ex = Executor(self.store, boom, self.updater, lifecycle=self.life)
         self.store.enqueue(_event("d1"))
         self.store.claim_next()
         ex.process_claimed(_event("d1"))
-        self.assertEqual(self.updater.calls, [("d1", VerdictType.ERROR)])
-        self.assertEqual(self.store.status_of("d1"), "error")
+        status, verdict, reason, _u, gate_outcome = self._row("a" * 40)
+        self.assertEqual((status, verdict, gate_outcome, reason),
+                         ("error", None, None, "worker_fault"))
+        published = self.updater.calls[0][1]
+        self.assertIsInstance(published, InfrastructureFailure)
+        assert isinstance(published, InfrastructureFailure)
+        self.assertIs(published.reason, InfraFailureReason.WORKER_FAULT)
         self.assertIn(Transition.ERRORED, self._transitions("d1"))
 
-    def test_post_once_worker_loses_to_watchdog(self) -> None:
-        ex = Executor(self.store, lambda e: _pass(), self.updater, lifecycle=self.life)
+    def test_non_jobresult_return_is_unaccounted_result_not_worker_fault(self) -> None:
+        # board C2: a runner that RETURNS a non-JobResult (a bare Verdict) is UNACCOUNTED_RESULT, DISTINCT
+        # from a worker exception (WORKER_FAULT). account() rejects it OUTSIDE the runner try.
+        runner = lambda e: Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)  # noqa: E731 -- NOT a JobResult
+        ex = Executor(self.store, runner, self.updater, lifecycle=self.life)  # type: ignore[arg-type]
+        self.store.enqueue(_event("d1"))
+        self.store.claim_next()
+        ex.process_claimed(_event("d1"))
+        _status, _v, reason, _u, _g = self._row("a" * 40)
+        self.assertEqual(reason, "unaccounted_result")
+        published = self.updater.calls[0][1]
+        assert isinstance(published, InfrastructureFailure)
+        self.assertIs(published.reason, InfraFailureReason.UNACCOUNTED_RESULT)
+
+    def test_watchdog_force_is_infrastructure_failure(self) -> None:
         wd = Watchdog(self.store, self.updater, timeout_seconds=900, lifecycle=self.life)
         self.store.enqueue(_event("d1"))
         self.store.claim_next()
         self.clk.t += 1000
-        self.assertEqual(wd.sweep_once(), 1)          # watchdog force-ERRORs it first
+        self.assertEqual(wd.sweep_once(), 1)
+        status, verdict, reason, _u, gate_outcome = self._row("a" * 40)
+        self.assertEqual((status, verdict, gate_outcome, reason),
+                         ("error", None, None, "watchdog_timeout"))
+        published = self.updater.calls[0][1]
+        assert isinstance(published, InfrastructureFailure)
+        self.assertIs(published.reason, InfraFailureReason.WATCHDOG_TIMEOUT)
+        self.assertIn(Transition.WATCHDOG_FORCED, self._transitions("d1"))
+
+    def test_post_once_worker_loses_to_watchdog(self) -> None:
+        ex = Executor(self.store, lambda e: _admitted_pass(), self.updater, lifecycle=self.life)
+        wd = Watchdog(self.store, self.updater, timeout_seconds=900, lifecycle=self.life)
+        self.store.enqueue(_event("d1"))
+        self.store.claim_next()
+        self.clk.t += 1000
+        self.assertEqual(wd.sweep_once(), 1)          # watchdog force-errors it first
         ex.process_claimed(_event("d1"))              # wedged worker un-wedges, too late
-        # exactly ONE terminal post (the watchdog's ERROR); the worker was skipped
-        self.assertEqual(self.updater.calls, [("d1", VerdictType.ERROR)])
+        # exactly ONE terminal post (the watchdog's InfrastructureFailure); the worker was skipped
+        self.assertEqual(len(self.updater.calls), 1)
+        self.assertIsInstance(self.updater.calls[0][1], InfrastructureFailure)
         self.assertIn(Transition.POST_SKIPPED, self._transitions("d1"))
 
     def test_shutdown_stops_claiming(self) -> None:
-        ex = Executor(self.store, lambda e: _pass(), self.updater, lifecycle=self.life)
+        ex = Executor(self.store, lambda e: _admitted_pass(), self.updater, lifecycle=self.life)
         self.store.enqueue(_event("d1"))
         ex.request_shutdown()
         self.assertEqual(ex.drain(), 0)  # graceful shutdown: claim nothing new
         self.assertEqual(self.store.status_of("d1"), "queued")  # left for after restart
 
     def test_drain_processes_all_distinct(self) -> None:
-        ex = Executor(self.store, lambda e: _pass(), self.updater, max_workers=2, lifecycle=self.life)
+        ex = Executor(self.store, lambda e: _admitted_pass(), self.updater, max_workers=2, lifecycle=self.life)
         for i in range(5):
             self.store.enqueue(_event(f"d{i}", sha=f"{i:040d}"))
         self.assertEqual(ex.drain(), 5)
         self.assertEqual(len(self.updater.calls), 5)
+
+
+class ClassifierEndToEndTests(unittest.TestCase):
+    """dissent P1b/P1c: the REAL executor -> store -> override classifier WIRE path, proven with the actual
+    persisted values (VerdictType.value == 'pass'), NOT fictional uppercase literals. The executor persists
+    'pass'; the classifier must read that as ALLOWING (a clean merge -> NO_OVERRIDE), and a coexisting infra
+    'error' row must surface as INFRA_ERROR (the C5 "infra cannot disappear" masking fix, for real data)."""
+
+    def _persisted_rows(self):  # type: ignore[no-untyped-def]
+        from gate.ledger import VerdictRow
+        store, _clk, _ = _store()
+        ex = Executor(store, lambda e: _admitted_pass(), _RecordingUpdater())
+        store.enqueue(_event("d1"))
+        store.claim_next()
+        ex.process_claimed(_event("d1"))
+        return [VerdictRow(status=s, verdict=v, reason=r, updated_at=u, gate_outcome=g)
+                for (s, v, r, u, g) in store.verdicts_for_sha("a" * 40)]
+
+    def test_executor_persisted_pass_classifies_as_no_override(self) -> None:
+        from gate.ledger import OutcomeKind, classify_merge
+        rows = self._persisted_rows()
+        self.assertEqual(rows[0].verdict, "pass")                          # the persisted WIRE value
+        self.assertIs(classify_merge(rows).kind, OutcomeKind.NO_OVERRIDE)  # allowing -> no spurious override
+
+    def test_executor_persisted_pass_plus_infra_error_is_infra_error(self) -> None:
+        from gate.ledger import OutcomeKind, UnverifiableReason, VerdictRow, classify_merge
+        rows = self._persisted_rows()
+        rows.append(VerdictRow(status="error", verdict=None, reason="watchdog_timeout", updated_at=99.0))
+        out = classify_merge(rows)
+        self.assertIs(out.kind, OutcomeKind.UNVERIFIABLE)
+        self.assertIs(out.sub_reason, UnverifiableReason.INFRA_ERROR)      # C5 masking fix, real wire values
 
 
 class BackpressureTests(unittest.TestCase):
@@ -262,12 +362,6 @@ class BackpressureTests(unittest.TestCase):
         sink.enqueue(_event("d2", sha="2" * 40))
         with self.assertRaises(SinkFull):
             sink.enqueue(_event("d3", sha="3" * 40))
-
-
-def _pass():  # type: ignore[no-untyped-def]
-    from core import Reason, Verdict
-
-    return Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
 
 
 if __name__ == "__main__":

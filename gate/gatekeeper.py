@@ -111,16 +111,23 @@ def _unattestable(reason: str) -> GateDecision:
 def resolve_disposition(
     policy_id: str,
     *,
-    expected_detector_identity: str,
     store: PolicyStore,
     snapshot: CalibrationSnapshot | None,
     snapshot_key: bytes,
     now: float,
     oracle_head_for: Callable[[str], str | None],
 ) -> GateDecision:
-    """Decide the dispatcher's action for ``policy_id``. Order: live store -> identity-bound signed
-    snapshot -> fail-closed UNATTESTABLE. A tampered chain blocks immediately (never falls back — a
-    tamper is worse than an outage). ``expected_detector_identity`` is the detector about to run.
+    """Decide the dispatcher's action for ``policy_id``. Order: live store -> signed snapshot ->
+    fail-closed UNATTESTABLE. A tampered chain blocks immediately (never falls back — a tamper is
+    worse than an outage).
+
+    CP2 S5 (identity treatment): the pre-run DECLARED-detector-identity comparison is REMOVED. The
+    4-coordinate runtime subject is UNMEASURABLE before the run, so a pre-run ``expected_detector_identity``
+    could only be a declared (spoofable) or tautological operand. The plan's ``target_subject`` is minted
+    from the live/snapshot attestation, and the AUTHORITY that the run actually executed that identity is
+    the POST-run ``SUBJECT_DRIFT`` check in ``admit_run_result`` (measured composite, from the authoritative
+    engine return, == the dispatched target). The boot-time detector-registry PROFILE validation
+    (``assert_detector_registered``) is unchanged and orthogonal.
 
     close-3: a live ENABLED policy is enforced ONLY if its calibration's bound set-head still equals
     the CURRENT set-head (``oracle_head_for(set_id)``). A fixture append to that set moves the head,
@@ -135,8 +142,7 @@ def resolve_disposition(
         )
     except _UNREACHABLE:
         return _from_snapshot(
-            policy_id, expected_detector_identity=expected_detector_identity,
-            snapshot=snapshot, key=snapshot_key, now=now, oracle_head_for=oracle_head_for,
+            policy_id, snapshot=snapshot, key=snapshot_key, now=now, oracle_head_for=oracle_head_for,
         )
 
     if state is None:
@@ -146,7 +152,6 @@ def resolve_disposition(
     if state is PolicyState.ENABLED:
         return _enforce_if_oracle_current(
             policy_id, store=store, oracle_head_for=oracle_head_for,
-            expected_detector_identity=expected_detector_identity,
         )
     return GateDecision(disposition_for(state), state, f"live state {state.value}", "live")
 
@@ -156,28 +161,22 @@ def _enforce_if_oracle_current(
     *,
     store: PolicyStore,
     oracle_head_for: Callable[[str], str | None],
-    expected_detector_identity: str,
 ) -> GateDecision:
-    """A live ENABLED policy enforces only if BOTH bindings still hold: (a) its calibration's bound
-    set-head equals the current set-head (scoped oracle invalidation — an append to the policy's set
-    moves the head -> UNATTESTABLE; close-3); AND (b) the detector about to run has the SAME 4-tuple
-    identity the calibration was bound to (close-2 — a build / host-closure / image / eval drift
-    yields a new identity, and enforcing a stale calibration for a drifted detector is the very
-    transitive-spoof the identity binding exists to refuse). The identity check is symmetric with the
-    signed-snapshot fallback (``_from_snapshot``); without it, the identity invariant held only during
-    a store outage and fell open on the primary path."""
+    """A live ENABLED policy enforces only if its calibration's bound set-head equals the current
+    set-head (scoped oracle invalidation — an append to the policy's set moves the head ->
+    UNATTESTABLE; close-3).
+
+    CP2 S5: the pre-run DECLARED-detector-identity comparison is REMOVED (see ``resolve_disposition``).
+    The run's actual 4-coordinate identity is unknowable until it runs; a build / host-closure / image /
+    eval drift is caught POST-run by ``admit_run_result``'s ``SUBJECT_DRIFT`` (the measured composite,
+    off the authoritative engine return, must equal the dispatched target the plan minted from THIS
+    attestation) — not by a spoofable pre-run declaration."""
     # CP2: read the SINGLE chain-verified snapshot ``(set_id, bound_head, subject, ICV)`` — the same row the
-    # AuthorizedRunPlan mints from, so the identity/oracle checks and the mint share ONE governance view.
+    # AuthorizedRunPlan mints from, so the oracle check and the mint share ONE governance view.
     snap = store.current_attestation_snapshot(policy_id)
     if snap is None:
         return _unattestable("ENABLED policy has no calibration attestation to check the oracle head")
     set_id, bound_head, bound_identity, icv = snap
-    if bound_identity != expected_detector_identity:
-        return _unattestable(
-            f"live ENABLED calibration attests detector {bound_identity!r} but "
-            f"{expected_detector_identity!r} is about to run — the detector drifted since "
-            "calibration; refusing to enforce an un-calibrated detector"
-        )
     current_head = oracle_head_for(set_id)
     if current_head is None:
         return _unattestable(f"unknown calibration set membership for {set_id!r} — failing closed")
@@ -198,15 +197,19 @@ def _enforce_if_oracle_current(
 def _from_snapshot(
     policy_id: str,
     *,
-    expected_detector_identity: str,
     snapshot: CalibrationSnapshot | None,
     key: bytes,
     now: float,
     oracle_head_for: Callable[[str], str | None],
 ) -> GateDecision:
-    """Store unreachable -> consult the signed snapshot. Fresh + HMAC-valid + IDENTITY-MATCHING +
-    ORACLE-CURRENT -> enforce. Missing / tampered / stale snapshot, a detector-identity mismatch, a
-    policy ABSENT from an otherwise-valid snapshot, OR (close-4) an oracle-head DRIFT -> UNATTESTABLE.
+    """Store unreachable -> consult the signed snapshot. Fresh + HMAC-valid + PROVISIONABLE +
+    ORACLE-CURRENT -> enforce. Missing / tampered / stale snapshot, a policy ABSENT from an
+    otherwise-valid snapshot, a non-provisionable record, OR (close-4) an oracle-head DRIFT ->
+    UNATTESTABLE.
+
+    CP2 S5: the pre-run DECLARED-detector-identity comparison is REMOVED here too (symmetric with the
+    live path). The plan's ``target_subject`` is minted from the snapshot record; the run's actual
+    identity is validated POST-run by ``admit_run_result``'s ``SUBJECT_DRIFT``.
 
     close-4 oracle-freshness: the tier store being unreachable does NOT mean the CALIBRATION store
     is — if it is reachable, the fallback compares the snapshot's attested ``oracle_head`` for the
@@ -226,12 +229,6 @@ def _from_snapshot(
         return _unattestable(
             "store unreachable; policy absent from snapshot — cannot distinguish not-enabled from "
             "an incomplete mint, failing closed"
-        )
-    if record.detector_identity != expected_detector_identity:
-        return _unattestable(
-            f"store unreachable; snapshot attests detector {record.detector_identity!r} but "
-            f"{expected_detector_identity!r} is about to run — refusing to enforce an "
-            "un-calibrated detector"
         )
     # close-4: oracle-head drift on the fallback path (calibration store still reachable).
     current_head = oracle_head_for(record.set_id)

@@ -28,16 +28,13 @@ from typing import Callable
 from core import (
     ArtifactHashMismatchError,
     ArtifactSpec,
-    Reason,
     ResourceBudget,
-    Verdict,
-    VerdictType,
 )
 from engine.calibration import BundleResolver, DetectorResolver
 from engine.retry import RetryCheck
-from engine.runner import EngineRunResult, TrialReport, TrialReportSink, run_check
+from engine.runner import TrialReport, TrialReportSink, run_check
 
-from .artifact import build_artifact_spec, extraction_workspace, safe_extract_tarball
+from .artifact import SafeExtractError, build_artifact_spec, extraction_workspace, safe_extract_tarball
 from .backends import guarded_backend
 from .trust_policy import resolve_trust_policy
 from .detector_registry import (
@@ -47,17 +44,28 @@ from .detector_registry import (
 )
 from .preflight import ConfigurationError
 from .checkrun import (
-    CheckConclusion,
-    CheckOutput,
     CheckRunLifecycle,
-    CheckStatus,
     GitHubCheckClient,
-    upsert_check_run,
 )
 from .executor import CheckUpdater, JobRunner
-from .gatekeeper import GateDecision
-from .policy_state import Disposition, nonrun_conclusion_for
+from .gatekeeper import GateDecision, GateDecisionError
+from .job_result import (
+    InfraFailureReason,
+    InfrastructureFailure,
+    JobResult,
+    NonRunDecision,
+    account,
+)
+from .policy_state import Disposition
 from .queue import GatingEvent
+from .run_admission import (
+    AdmissionGovernanceView,
+    AdmittedRunResult,
+    AuthorizedRunPlan,
+    BlockingRefusal,
+    UnadmittedRunResult,
+    admit_run_result,
+)
 from .summary import render_check_summary
 
 # Engine wall-clock << the 2.3 Watchdog (900s) so the engine's own ERROR wins cleanly.
@@ -138,9 +146,11 @@ def assert_detector_registered(resolve: DetectorResolver, detector_id: str) -> N
         ) from exc
 
 
-def run_engine_check(
-    artifact: ArtifactSpec,
+def _run_engine_check(
+    event: GatingEvent,
+    plan: AuthorizedRunPlan,
     *,
+    artifact_source: ArtifactSource,
     image: str,
     resolve: BundleResolver,
     detector_id: str,
@@ -148,42 +158,52 @@ def run_engine_check(
     budget: ResourceBudget = DEFAULT_ENGINE_BUDGET,
     first_fail: bool = True,
     report_sink: TrialReportSink | None = None,
-) -> EngineRunResult:
-    """Run the REAL hermetic engine (ObservedOCISandbox + multi-trial) and return the AUTHORITATIVE
-    ``EngineRunResult`` (S3-completion) — the immutable ``TrialReport`` DIRECTLY, with the verdict as its
-    derived property. The live enforcement/admission path consumes this return, never a mutable sink.
+) -> UnadmittedRunResult:
+    """Run the REAL hermetic engine (ObservedOCISandbox + multi-trial) under the REQUIRED pre-run ``plan``
+    and pair the AUTHORITATIVE ``EngineRunResult`` with it into an ``UnadmittedRunResult`` — the sole input
+    to ``admit_run_result``. PRIVATE (CP2 S5): the engine cannot be run without a plan, so every enforcement
+    run is admission-gated by construction. The measured 4-coordinate subject travels ON the authoritative
+    return; admission recomputes it and requires it to equal ``plan.target_subject`` (post-run SUBJECT_DRIFT).
 
-    3.5-close #1.3: the detector is resolved through the SAME trusted registry calibration uses
-    (enforced == accepted). The registry refuses an unregistered id or a detector whose content-address
-    DRIFTED from the accepted one, so the live gate cannot enforce an unauthorized / rolled-back detector.
-    (Single accepted detector; per-policy detector SELECTION + full anti-rollback is a named-next
-    increment — see ARCHITECTURE.md.) A resolution failure raises ``DetectorResolutionError``, caught by
-    the job-runner and mapped to a blocking ERROR (never run an unverified detector). The sandbox verifies
-    the SHA-bind; a mismatch raises + propagates. ``first_fail`` short-circuits the FAIL path (C1)."""
-    # v5 P1a: resolve the ATOMIC bundle and execute its FROZEN command — the LIVE enforcement path must
-    # run exactly the entrypoint the accepted profile bound, never a fresh detector.entrypoint() a stateful
-    # detector could answer differently. (Was: resolve() + run_check without command -> re-called entrypoint.)
-    bundle = resolve(detector_id)  # trusted registry: unregistered / drifted -> raises -> ERROR
-    detector = bundle.assertion
-    # S3-completion (live 4-tuple): build the AUDITED, token-stamped factory + the reference guard from the
-    # closed composition root, with the runtime PINNED to "podman" (no detection probe, behaviour preserved),
-    # and apply the reference observation-trust policy. The runner INVOKES the guard on every token-stamped
-    # sandbox and derives the guard/trust digests OFF the applied objects — so the live authoritative report
-    # carries all FOUR measured coordinates (profile / trust / guard / execution), not two.
-    make_sandbox, backend_guard = guarded_backend("observed", image, runtime="podman")
-    trust_policy = resolve_trust_policy(_REFERENCE_TRUST_POLICY)
+    Fetch+extract inside a RAII workspace (purged on every exit path) while the sandbox mounts the artifact.
+    3.5-close #1.3: the detector is resolved through the SAME trusted registry calibration uses (enforced ==
+    accepted); an unregistered / content-address-DRIFTED detector raises ``DetectorResolutionError``, which
+    the caller maps to a blocking infra failure (never runs an unverified detector). The sandbox re-verifies
+    the artifact SHA-bind; a mismatch raises ``ArtifactHashMismatchError`` (possible TOCTOU) and propagates.
+    ``first_fail`` short-circuits the FAIL path (C1)."""
+    with extraction_workspace() as ws:
+        artifact = artifact_source(event, ws)
+        # v5 P1a: resolve the ATOMIC bundle and execute its FROZEN command — the LIVE enforcement path must
+        # run exactly the entrypoint the accepted profile bound, never a fresh detector.entrypoint() a stateful
+        # detector could answer differently.
+        bundle = resolve(detector_id)  # trusted registry: unregistered / drifted -> raises -> infra block
+        detector = bundle.assertion
+        # S3-completion (live 4-tuple): the AUDITED, token-stamped factory + reference guard from the closed
+        # composition root, runtime PINNED to "podman", + the reference observation-trust policy. The runner
+        # invokes the guard on every token-stamped sandbox and derives the guard/trust digests OFF the applied
+        # objects, so the authoritative report carries all FOUR measured coordinates (profile/trust/guard/exec).
+        make_sandbox, backend_guard = guarded_backend("observed", image, runtime="podman")
+        trust_policy = resolve_trust_policy(_REFERENCE_TRUST_POLICY)
+        result = run_check(
+            make_sandbox, detector, artifact, budget,
+            trials=trials, first_fail=first_fail, report_sink=report_sink, detector_id=detector_id,
+            command=bundle.command, resolved_profile_digest=bundle.profile_digest,
+            trust_policy=trust_policy, backend_guard=backend_guard,
+        )
+    return UnadmittedRunResult(plan=plan, result=result)
 
-    return run_check(
-        make_sandbox, detector, artifact, budget,
-        trials=trials, first_fail=first_fail, report_sink=report_sink, detector_id=detector_id,
-        command=bundle.command, resolved_profile_digest=bundle.profile_digest,
-        trust_policy=trust_policy, backend_guard=backend_guard,
-    )
+
+# resolve_decision(event) -> GateDecision: the injected tier read (live_app closes it over the configured
+# policy_id + PolicyStore + snapshot + oracle_head_for). Keeps pipeline free of the policy-store import.
+DecisionResolver = Callable[[GatingEvent], GateDecision]
 
 
-def make_job_runner(
+def make_gated_job_runner(
+    resolve_decision: DecisionResolver,
     artifact_source: ArtifactSource,
     *,
+    policy_id: str,
+    governance: AdmissionGovernanceView,
     image: str,
     resolve: BundleResolver,
     detector_id: str,
@@ -192,32 +212,68 @@ def make_job_runner(
     first_fail: bool = True,
     report_sink: TrialReportSink | None = None,
 ) -> JobRunner:
-    """Build the executor's ``job_runner``: fetch+extract inside a RAII workspace, then
-    run the real engine. The workspace wraps the run so the artifact is on disk while the
-    sandbox mounts it, and is purged on every exit path. ``report_sink`` carries the C1
-    trial-report audit up to the gate. 3.5-close #1.3: the detector is resolved by NAME through the
-    trusted registry (enforced == accepted); a resolution failure blocks (ERROR), never runs."""
+    """Build the executor's ``job_runner`` — the FULL tier-decision + engine + run-admission path, returning
+    a TYPED ``JobResult`` (CP2 S5; de-vestigialises ``dispatch_gated``). Per delivery:
 
-    def run(event: GatingEvent) -> Verdict:
-        with extraction_workspace() as ws:
-            artifact = artifact_source(event, ws)
-            try:
-                # S3-completion: consume run_engine_check's AUTHORITATIVE EngineRunResult return; the verdict
-                # is its derived property. (The full admission typestate — UnadmittedRunResult ->
-                # admit_run_result -> AdmittedRunResult|BlockingRefusal — is the CP2 wiring increment.)
-                return run_engine_check(
-                    artifact, image=image, resolve=resolve, detector_id=detector_id, trials=trials,
-                    budget=budget, first_fail=first_fail, report_sink=report_sink,
-                ).verdict
-            except ArtifactHashMismatchError:
-                # NOT a generic infra ERROR: the SHA-bind caught the mounted tree
-                # differing from its verified hash — a possible TOCTOU tamper. Blocks
-                # (ERROR -> action_required) AND surfaces as a distinct security event.
-                return Verdict(VerdictType.ERROR, Reason.ARTIFACT_INTEGRITY_MISMATCH)
-            except DetectorResolutionError:
-                # 3.5-close #1.3: the enforced detector is unregistered or has DRIFTED from the accepted
-                # identity -> refuse to run it (block), never enforce an unauthorized / rolled-back detector.
-                return Verdict(VerdictType.ERROR, Reason.DETECTOR_UNRESOLVED)
+      1. ``resolve_decision(event)`` -> ``GateDecision``. A non-``RUN_ENFORCING`` disposition returns a
+         ``NonRunDecision`` (SKIP_NEUTRAL -> neutral; BLOCK_ACTION_REQUIRED -> blocking) and NEVER touches
+         the engine (a degraded/unattestable policy blocks without a silent fall-open to neutral).
+      2. DISPATCH-TIME INVARIANT RECHECK (board D5, the first plan consumer; the plan is NOT unforgeable):
+         re-assert RUN_ENFORCING <=> ``plan is not None`` (defence-in-depth vs a future refactor) AND bind
+         ``plan.policy_id == policy_id`` — a mis-routed / absent plan reaching the engine raises
+         ``GateDecisionError`` (the executor maps it to a blocking WORKER_FAULT). NOT a live-currency recheck
+         — that is ``admit_run_result``'s job (governance may legitimately have moved since mint).
+      3. run the engine under the plan (``_run_engine_check``) and ADMIT the result
+         (``admit_run_result``) -> ``AdmittedRunResult`` (post the measured verdict) | ``BlockingRefusal``
+         (fail-closed block). A ``DetectorResolutionError`` / ``ArtifactHashMismatchError`` from the run is a
+         typed ``InfrastructureFailure`` (blocking), never an unverified pass."""
+
+    def run(event: GatingEvent) -> JobResult:
+        decision = resolve_decision(event)
+        # DISPATCH-TIME INVARIANT RECHECK (board D5 + dissent P1): re-assert the BICONDITIONAL
+        # RUN_ENFORCING <=> plan is not None in BOTH directions BEFORE branching. GateDecision.__post_init__
+        # enforces it at construction, but the recheck is the first plan consumer's fail-closed guard: a
+        # forged non-RUN decision CARRYING a plan (or a RUN_ENFORCING carrying none) is refused here, not
+        # silently accepted by returning early on the non-run branch.
+        enforcing = decision.disposition is Disposition.RUN_ENFORCING
+        if enforcing != (decision.plan is not None):
+            raise GateDecisionError(
+                f"dispatch-time invariant: RUN_ENFORCING ({enforcing}) must hold IFF a plan is present "
+                f"({decision.plan is not None}) — refusing an incoherent decision")
+        if not enforcing:
+            # the tier says do NOT run the engine -> typed non-run publication (neutral or blocking).
+            return NonRunDecision(decision.disposition, decision.reason)
+        plan = decision.plan
+        assert plan is not None  # the biconditional above guarantees this (narrowing for the type checker)
+        if plan.policy_id != policy_id:
+            raise GateDecisionError(
+                f"dispatch-time invariant: a RUN_ENFORCING decision for {policy_id!r} carried a plan for "
+                f"{plan.policy_id!r} — refusing to run a mis-routed plan")
+        try:
+            unadmitted = _run_engine_check(
+                event, plan, artifact_source=artifact_source, image=image, resolve=resolve,
+                detector_id=detector_id, trials=trials, budget=budget, first_fail=first_fail,
+                report_sink=report_sink,
+            )
+        except ArtifactHashMismatchError:
+            # the SHA-bind caught the mounted tree differing from its verified hash — a possible TOCTOU
+            # tamper. Blocking infra fault (action_required), a distinct forensic reason; never a pass.
+            return InfrastructureFailure(
+                InfraFailureReason.ARTIFACT_INTEGRITY_MISMATCH,
+                detail=f"artifact tree hash mismatch for {event.head_sha}")
+        except SafeExtractError:
+            # the artifact could not be safely fetched/extracted (a malformed / path-traversing / oversized
+            # tarball rejected by safe_extract_tarball) -> a typed blocking acquisition failure, never a pass.
+            return InfrastructureFailure(
+                InfraFailureReason.ARTIFACT_FETCH_FAILED,
+                detail=f"artifact fetch/extract failed for {event.head_sha}")
+        except DetectorResolutionError:
+            # the enforced detector is unregistered or DRIFTED from the accepted identity -> block, never
+            # enforce an unauthorized / rolled-back detector.
+            return InfrastructureFailure(
+                InfraFailureReason.DETECTOR_UNRESOLVED,
+                detail=f"detector {detector_id!r} unresolved/drifted")
+        return admit_run_result(unadmitted, governance=governance)
 
     return run
 
@@ -235,102 +291,65 @@ class CapturingTrialReportSink:
         self.last = report
 
 
-def make_check_updater(
-    client: GitHubCheckClient, *, name: str,
-    report_capture: CapturingTrialReportSink | None = None,
-) -> CheckUpdater:
-    """Build the executor's ``updater``: drive the Check Run queued->in_progress->completed with the
-    mapped (fail-closed) conclusion and the out-of-band summary. 3.5-close #1.5: if a ``report_capture``
-    is wired (the same sink the job-runner records to), the summary carries the ATTESTED ``detector_id``
-    + resolved ``image_digest`` — non-repudiation of {which detector, which image} on the existing
-    merge-blocking path (not a new heavy signed local receipt)."""
+def _render_job_summary(result: JobResult, name: str) -> str:
+    """Render the Check Run summary from the TYPED ``JobResult``. C4 publication pin: the attested
+    ``detector_id`` + ``image_digest`` are pulled ONLY from an ``AdmittedRunResult``'s OWN authoritative
+    report — never a mutable capture sink that could contaminate a refusal / non-run / infra summary with a
+    previous job's detector/image. A refusal / non-run / infra publishes a stable typed message and NEVER
+    the internal ``detail`` (log-only). Runtime-rejects a bare ``Verdict`` / unknown type."""
+    if isinstance(result, AdmittedRunResult):
+        report = result.report
+        image_digest = (report.execution_identity.image_ref
+                        if report.execution_identity is not None else None)
+        return render_check_summary(
+            result.verdict, name, detector_id=report.detector_id, image_digest=image_digest).summary
+    if isinstance(result, BlockingRefusal):
+        # a fail-closed admission refusal — a real (admission) ERROR verdict, but NO detector/image (the run
+        # was not admitted). ``reason`` is a controlled admission-layer token (never raw detail).
+        return render_check_summary(result.verdict, name).summary + f" [admission: {result.reason.value}]"
+    if isinstance(result, NonRunDecision):
+        return f"Policy not enforced ({result.disposition.value}): {result.reason}"
+    if isinstance(result, InfrastructureFailure):
+        # NEVER ``result.detail`` (internal-log-only) — only the stable, closed reason token.
+        return (
+            f"Gate infrastructure error ({result.reason.value}): the check could not complete; "
+            "this blocks the merge and a maintainer must investigate.")
+    raise TypeError(
+        f"cannot render a Check Run summary for {type(result).__name__} — the updater accepts only a "
+        "JobResult (a bare Verdict/EngineRunResult is rejected)")
+
+
+def make_check_updater(client: GitHubCheckClient, *, name: str) -> CheckUpdater:
+    """Build the executor's ``updater``: drive the Check Run queued->in_progress->completed from the TYPED
+    ``JobResult`` (CP2 S5). The conclusion is ``account(result).conclusion`` (fail-closed by construction,
+    and a runtime reject of a bare ``Verdict`` — the closed union is the contract); the summary is rendered
+    from the typed result via ``_render_job_summary`` (C4: detector/image only from an ``AdmittedRunResult``,
+    never from a mutable capture sink; infra ``detail`` is never published)."""
     lifecycle = CheckRunLifecycle(client, name=name)
 
-    def update(event: GatingEvent, verdict: Verdict) -> None:
+    def update(event: GatingEvent, result: JobResult) -> None:
+        conclusion = account(result).conclusion  # closed-union + fail-closed; rejects a bare Verdict
+        summary = _render_job_summary(result, name)
         check_run_id = lifecycle.open_queued(
-            repo_full_name=event.repo_full_name, head_sha=event.head_sha
-        )
+            repo_full_name=event.repo_full_name, head_sha=event.head_sha)
         lifecycle.mark_in_progress(
-            repo_full_name=event.repo_full_name, check_run_id=check_run_id
-        )
-        detector_id: str | None = None
-        image_digest: str | None = None
-        if report_capture is not None and report_capture.last is not None:
-            report = report_capture.last
-            detector_id = report.detector_id
-            image_digest = (report.execution_identity.image_ref
-                            if report.execution_identity is not None else None)
-        summary = render_check_summary(
-            verdict, name, detector_id=detector_id, image_digest=image_digest).summary
-        lifecycle.complete(
-            repo_full_name=event.repo_full_name,
-            check_run_id=check_run_id,
-            verdict=verdict.status,
-            summary=summary,
-        )
+            repo_full_name=event.repo_full_name, check_run_id=check_run_id)
+        lifecycle.complete_with_conclusion(
+            repo_full_name=event.repo_full_name, check_run_id=check_run_id,
+            conclusion=conclusion, summary=summary)
 
     return update
 
 
-# static_poster(event, conclusion, summary): post a terminal Check Run WITHOUT running the engine
-# — used for non-ENABLED policies (neutral) and DEGRADED (action_required). Kept separate from the
-# engine path so a non-enforcing disposition CANNOT accidentally run the sandbox.
-StaticPoster = Callable[[GatingEvent, CheckConclusion, str], None]
-
-
-def make_static_poster(client: GitHubCheckClient, *, name: str) -> StaticPoster:
-    """Build a poster that drives queued->completed with a STATIC conclusion (no engine, no
-    Verdict). Idempotent via upsert (find-then-PATCH by sha,name), same as the enforcing path."""
-
-    def post(event: GatingEvent, conclusion: CheckConclusion, summary: str) -> None:
-        upsert_check_run(
-            client, repo_full_name=event.repo_full_name, head_sha=event.head_sha,
-            name=name, status=CheckStatus.QUEUED,
-        )
-        upsert_check_run(
-            client, repo_full_name=event.repo_full_name, head_sha=event.head_sha,
-            name=name, status=CheckStatus.COMPLETED, conclusion=conclusion,
-            output=CheckOutput(title=name, summary=summary),
-        )
-
-    return post
-
-
-def dispatch_gated(
-    event: GatingEvent,
-    decision: GateDecision,
-    *,
-    job_runner: JobRunner,
-    updater: CheckUpdater,
-    static_poster: StaticPoster,
-) -> None:
-    """The 3.3 dispatch seam: consult the tier decision BEFORE the engine. Only RUN_ENFORCING
-    (a live/attested ENABLED policy) runs the sandbox and posts the real Verdict. Every other
-    disposition posts a static conclusion and NEVER touches the engine:
-      * SKIP_NEUTRAL          -> neutral (non-blocking; not-yet-enabled / advisory / rejected);
-      * BLOCK_ACTION_REQUIRED -> action_required (BLOCKING; DEGRADED — un-attestable, fail-closed).
-    A DEGRADED policy therefore blocks the merge WITHOUT running the engine and WITHOUT a silent
-    fall-open to neutral (#1)."""
-    if decision.disposition is Disposition.RUN_ENFORCING:
-        verdict = job_runner(event)
-        updater(event, verdict)
-        return
-    conclusion = nonrun_conclusion_for(decision.disposition)
-    static_poster(event, conclusion, f"Policy not enforced ({decision.disposition.value}): {decision.reason}")
-
-
 __all__ = [
     "ArtifactSource",
+    "DecisionResolver",
     "extract_to_spec",
-    "run_engine_check",
     "default_detector_registry",
     "assert_detector_registered",
-    "make_job_runner",
+    "make_gated_job_runner",
     "make_check_updater",
     "CapturingTrialReportSink",
-    "make_static_poster",
-    "dispatch_gated",
-    "StaticPoster",
     "DEFAULT_ENGINE_BUDGET",
     "DEFAULT_TRIALS",
     "DEFAULT_ENTRYPOINT",

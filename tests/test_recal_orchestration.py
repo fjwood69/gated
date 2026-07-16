@@ -205,7 +205,7 @@ class FullLoopTests(unittest.TestCase):
         ohf = c.set_head
 
         def enforcing() -> Disposition:
-            return resolve_disposition("p1", expected_detector_identity=_DET, store=s, snapshot=None,
+            return resolve_disposition("p1", store=s, snapshot=None,
                                        snapshot_key=b"k", now=1.0, oracle_head_for=ohf).disposition
 
         self.assertIs(enforcing(), Disposition.RUN_ENFORCING)

@@ -201,6 +201,24 @@ class CheckRunLifecycle:
     ) -> None:
         """Terminal transition: completed + the mapped (fail-closed) conclusion."""
         conclusion = verdict_to_conclusion(verdict)
+        self.complete_with_conclusion(
+            repo_full_name=repo_full_name, check_run_id=check_run_id,
+            conclusion=conclusion, summary=summary,
+        )
+
+    def complete_with_conclusion(
+        self,
+        *,
+        repo_full_name: str,
+        check_run_id: str,
+        conclusion: CheckConclusion,
+        summary: str,
+    ) -> None:
+        """Terminal transition from an ALREADY-DECIDED conclusion (CP2 S5): the typed publication path for a
+        ``JobResult`` whose conclusion came from ``account(result)`` — an admitted-run verdict, a fail-closed
+        admission refusal / infra ACTION_REQUIRED, or a governance non-run NEUTRAL/ACTION_REQUIRED. The
+        caller owns the fail-closed guarantee (``account``/``PersistedOutcome`` enforce that a non-run and an
+        infra fault publish blocking or neutral coherently); this method just posts it."""
         self._client.update_check_run(
             repo_full_name=repo_full_name,
             check_run_id=check_run_id,

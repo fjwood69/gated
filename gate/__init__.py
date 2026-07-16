@@ -54,7 +54,6 @@ from .detector_registry import (
     registration_binding,
 )
 from .executor import (
-    ERROR_VERDICT,
     Executor,
     LifecycleEvent,
     LifecycleSink,
@@ -74,16 +73,25 @@ from .github_auth import (
     TokenFetcher,
     build_app_jwt_claims,
 )
+from .job_result import (
+    GateOutcome,
+    InfraFailureReason,
+    InfrastructureFailure,
+    JobResult,
+    NonRunDecision,
+    PersistedOutcome,
+    account,
+)
 from .pipeline import (
     ArtifactSource,
     CapturingTrialReportSink,
+    DecisionResolver,
     assert_budget_fits_watchdog,
     assert_detector_registered,
     default_detector_registry,
     extract_to_spec,
     make_check_updater,
-    make_job_runner,
-    run_engine_check,
+    make_gated_job_runner,
 )
 from .preflight import ConfigurationError, verify_check_required
 from .queue import GatingEvent, GatingSink, InMemoryGatingSink, SinkFull
@@ -162,13 +170,19 @@ __all__ = [
     "LifecycleSink",
     "LoggingLifecycleSink",
     "NullLifecycleSink",
-    "ERROR_VERDICT",
-    "run_engine_check",
     "default_detector_registry",
     "assert_detector_registered",
-    "make_job_runner",
+    "make_gated_job_runner",
+    "DecisionResolver",
     "make_check_updater",
     "CapturingTrialReportSink",
+    "JobResult",
+    "GateOutcome",
+    "InfraFailureReason",
+    "InfrastructureFailure",
+    "NonRunDecision",
+    "PersistedOutcome",
+    "account",
     "extract_to_spec",
     "assert_budget_fits_watchdog",
     "ArtifactSource",

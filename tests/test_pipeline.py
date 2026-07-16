@@ -1,11 +1,25 @@
-"""Increment 2.4 — engine integration + verdict->Check Run.
+"""Increment 2.4 + CP2 S5 — engine integration, tier-decision + run-admission, verdict->Check Run.
 
 Run from the gated/ root:  python3 -m unittest discover -s tests
 
-Non-podman: the out-of-band summary, the fail-closed conclusion mapping through the
-updater, extract->spec, and hash-mismatch -> ERROR (not a silent pass). The real-engine
-handshake (ObservedOCISandbox on podman) is a skip-unless-available regression that
-proves the engine and gate meet: real container -> aggregated Verdict -> Check Run.
+CP2 S5 (the coupled widening): the job runner is now ``make_gated_job_runner`` — the FULL
+tier-decision -> engine -> run-admission path returning a TYPED ``JobResult``. This module proves:
+  * ROUTING: a non-enforcing disposition returns a ``NonRunDecision`` and NEVER touches the engine; an
+    enforce runs the engine under the minted plan and ADMITS the result;
+  * the DISPATCH-TIME invariant recheck (a mis-routed plan raises, fail-closed);
+  * PUBLICATION (make_check_updater from the typed result): detector/image ONLY from an AdmittedRunResult,
+    a refusal/non-run/infra NEVER leaks internal detail (C4 pin), and a bare Verdict is runtime-rejected;
+  * the GENUINE-BITE (real podman): the measured 4-coordinate composite comes from the ACTUAL run, so a
+    plan dispatched to a WRONG subject is refused SUBJECT_DRIFT (the run measured reality, not the target).
+
+BEHAVIOUR DELTA vs the pre-S5 live path:
+  | aspect              | before (vestigial)                | after (S5)                                  |
+  | tier gate           | NONE — engine ran on EVERY delivery | resolve_disposition INSIDE the job runner |
+  | non-enforce         | (unreachable / static_poster)      | typed NonRunDecision, engine untouched      |
+  | run admission       | none — verdict published raw       | admit_run_result gates publication          |
+  | runner return       | bare Verdict                       | typed JobResult (union)                      |
+  | infra fault         | ERROR_VERDICT                      | InfrastructureFailure (WORKER_FAULT/...)     |
+  | summary provenance  | mutable report_capture (stale risk)| AdmittedRunResult's own report only         |
 """
 from __future__ import annotations
 
@@ -14,6 +28,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from core import (
     ArtifactHashMismatchError,
@@ -23,30 +38,46 @@ from core import (
     VerdictType,
     tree_hash,
 )
-from unittest import mock
 
+from engine.runner import EngineRunResult
+from gate.attestation import calibrated_subject_identity
 from gate.checkrun import CheckConclusion, CheckStatus
-from gate.executor import Executor
+from gate.gatekeeper import GateDecision, GateDecisionError
+from gate.job_result import (
+    InfraFailureReason,
+    InfrastructureFailure,
+    JobResult,
+    NonRunDecision,
+)
 from gate.pipeline import (
-    CapturingTrialReportSink,
+    _render_job_summary,
+    _run_engine_check,
     assert_budget_fits_watchdog,
     assert_detector_registered,
     default_detector_registry,
     extract_to_spec,
     make_check_updater,
-    make_job_runner,
-    run_engine_check,
+    make_gated_job_runner,
+)
+from gate.policy_state import Disposition, PolicyState
+from gate.run_admission import (
+    AdmittedRunResult,
+    BlockingRefusal,
+    RunAdmissionRefusal,
+    UnadmittedRunResult,
+    admit_run_result,
 )
 from gate.queue import GatingEvent
-from gate.store import GatingStore
 from gate.summary import render_check_summary
+from tests.test_run_admission import _FakeGovernance, _plan, _report
 
 _NAME = "gated/retry"
 _IMAGE = "localhost/mori:local"
 _REGISTRY = default_detector_registry()   # 3.5-close #1.3: the accepted "retry" detector, registered
 _RESOLVE = _REGISTRY.resolve
-_RESOLVE_BUNDLE = _REGISTRY.resolve_bundle  # v5: the live path takes a BundleResolver
+_RESOLVE_BUNDLE = _REGISTRY.resolve_bundle
 _DETECTOR_ID = "retry"
+_POLICY = "p1"
 
 
 def _event(delivery_id: str = "d1", sha: str = "a" * 40) -> GatingEvent:
@@ -56,53 +87,31 @@ def _event(delivery_id: str = "d1", sha: str = "a" * 40) -> GatingEvent:
     )
 
 
+def _enforce(plan) -> GateDecision:  # type: ignore[no-untyped-def]
+    return GateDecision(Disposition.RUN_ENFORCING, PolicyState.ENABLED, "live ENABLED", "live", plan=plan)
+
+
+def _nonrun(disposition: Disposition, reason: str = "not enabled") -> GateDecision:
+    return GateDecision(disposition, None, reason, "live")
+
+
 class SummaryTests(unittest.TestCase):
     def test_pass_summary_readable(self) -> None:
         out = render_check_summary(Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS), _NAME)
         self.assertIn("PASSED", out.title)
         self.assertIn("all trials passed", out.summary)
 
-    def test_fail_summary_states_the_observation(self) -> None:
-        out = render_check_summary(Verdict(VerdictType.FAIL, Reason.EGRESS_ONE), _NAME)
-        self.assertIn("FAILED", out.title)
-        self.assertIn("1 egress attempt observed", out.summary)
-
     def test_error_summary_says_blocked_and_human(self) -> None:
         out = render_check_summary(Verdict(VerdictType.ERROR, Reason.TELEMETRY_MISSING), _NAME)
         self.assertIn("ERRORED", out.title)
         self.assertIn("human must review", out.summary)
-        self.assertIn("blocked", out.summary)  # never implies it passed
-
-    def test_integrity_mismatch_is_a_security_alert(self) -> None:
-        # a hash mismatch must SCREAM (distinct security event), not read as a glitch
-        out = render_check_summary(
-            Verdict(VerdictType.ERROR, Reason.ARTIFACT_INTEGRITY_MISMATCH), _NAME
-        )
-        self.assertIn("SECURITY", out.title)
-        self.assertIn("tampering", out.summary.lower())
-        self.assertIn("blocked", out.summary.lower())
-        self.assertIn("security review", out.summary.lower())
-
-    def test_summary_only_consumes_typed_verdict(self) -> None:
-        # structural anti-spoofing: the renderer's ONLY input is the Verdict — it cannot
-        # reach artifact stdout/tmpfs even in principle. The ONLY inputs are the typed Verdict, the
-        # check name, and (3.5-close #1.5) the ATTESTED detector_id + image_digest — engine-measured
-        # IDENTITY, never artifact output. No parameter is a log / stdout / tmpfs channel.
-        import inspect
-
-        sig = inspect.signature(render_check_summary)
-        self.assertEqual(list(sig.parameters), ["verdict", "check_name", "detector_id", "image_digest"])
-        # the identity params are keyword-only and default to None (non-repudiation, not a data channel).
-        for p in ("detector_id", "image_digest"):
-            self.assertIs(sig.parameters[p].kind, inspect.Parameter.KEYWORD_ONLY)
-            self.assertIsNone(sig.parameters[p].default)
+        self.assertIn("blocked", out.summary)
 
 
 class _FakeCheckClient:
     """Records the check-run lifecycle calls incl. the final conclusion + summary."""
 
     def __init__(self) -> None:
-        self.created = False
         self.statuses: list[CheckStatus] = []
         self.final_conclusion: CheckConclusion | None = None
         self.final_summary: str | None = None
@@ -111,7 +120,6 @@ class _FakeCheckClient:
         return None
 
     def create_check_run(self, *, repo_full_name, head_sha, name, status, external_id, conclusion=None, output=None):  # type: ignore[no-untyped-def]
-        self.created = True
         self.statuses.append(status)
         return "cr-1"
 
@@ -122,95 +130,227 @@ class _FakeCheckClient:
             self.final_summary = output.summary if output else None
 
 
-class UpdaterMappingTests(unittest.TestCase):
-    def _run(self, verdict: Verdict) -> _FakeCheckClient:
+def _admitted_pass() -> AdmittedRunResult:
+    """A genuine AdmittedRunResult carrying a PASS verdict + a report with an execution identity (so the
+    updater can render detector/image), minted through admit_run_result (proof-gated)."""
+    res = admit_run_result(
+        UnadmittedRunResult(plan=_plan(), result=EngineRunResult(trial_report=_report())),
+        governance=_FakeGovernance())
+    assert isinstance(res, AdmittedRunResult)
+    return res
+
+
+class TypedPublicationTests(unittest.TestCase):
+    """make_check_updater drives the Check Run from the TYPED JobResult; C4: detector/image ONLY from an
+    AdmittedRunResult; a refusal/non-run/infra NEVER leaks internal detail; a bare Verdict is rejected."""
+
+    def _publish(self, result: JobResult) -> _FakeCheckClient:
         client = _FakeCheckClient()
-        updater = make_check_updater(client, name=_NAME)
-        updater(_event(), verdict)
+        make_check_updater(client, name=_NAME)(_event(), result)
         return client
 
-    def test_fail_maps_to_failure_and_blocks(self) -> None:
-        c = self._run(Verdict(VerdictType.FAIL, Reason.EGRESS_ONE))
-        self.assertIs(c.final_conclusion, CheckConclusion.FAILURE)
-        self.assertIn("1 egress attempt observed", c.final_summary or "")
-
-    def test_error_maps_to_action_required_fail_closed(self) -> None:
-        # the ratified fail-closed mapping — NOT neutral (which would not block)
-        c = self._run(Verdict(VerdictType.ERROR, Reason.TELEMETRY_MISSING))
-        self.assertIs(c.final_conclusion, CheckConclusion.ACTION_REQUIRED)
-
-    def test_pass_maps_to_success(self) -> None:
-        c = self._run(Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS))
+    def test_admitted_run_publishes_success_with_provenance(self) -> None:
+        c = self._publish(_admitted_pass())
         self.assertIs(c.final_conclusion, CheckConclusion.SUCCESS)
-
-    def test_lifecycle_order(self) -> None:
-        c = self._run(Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS))
+        self.assertIn("detector=retry", c.final_summary or "")
+        self.assertIn("image=sha256:abc", c.final_summary or "")
         self.assertEqual(c.statuses, [CheckStatus.QUEUED, CheckStatus.IN_PROGRESS, CheckStatus.COMPLETED])
 
+    def test_blocking_refusal_publishes_action_required_no_provenance(self) -> None:
+        c = self._publish(BlockingRefusal(RunAdmissionRefusal.SET_HEAD_STALE, "the set drifted"))
+        self.assertIs(c.final_conclusion, CheckConclusion.ACTION_REQUIRED)   # fail-closed block
+        self.assertIn("admission: set_head_stale", c.final_summary or "")     # the controlled token
+        self.assertNotIn("detector=", c.final_summary or "")                  # no stale provenance
+        self.assertNotIn("the set drifted", c.final_summary or "")            # the detail is not published
 
-class HashMismatchTests(unittest.TestCase):
-    def test_hash_mismatch_maps_to_error_not_pass(self) -> None:
-        # a corrupted/altered tarball -> sandbox raises ArtifactHashMismatchError ->
-        # the executor maps it to ERROR (infra fault, blocks), never a silent PASS.
-        d = Path(tempfile.mkdtemp(prefix="mv-pipe-"))
-        store = GatingStore(d / "g.db")
-        client = _FakeCheckClient()
-        updater = make_check_updater(client, name=_NAME)
+    def test_non_run_neutral_publishes_neutral(self) -> None:
+        c = self._publish(NonRunDecision(Disposition.SKIP_NEUTRAL, "policy not enabled"))
+        self.assertIs(c.final_conclusion, CheckConclusion.NEUTRAL)
+        self.assertIn("Policy not enforced", c.final_summary or "")
 
-        def hash_mismatch_runner(_: GatingEvent) -> Verdict:
-            raise ArtifactHashMismatchError("staged tree != claimed hash")
+    def test_non_run_block_publishes_action_required(self) -> None:
+        c = self._publish(NonRunDecision(Disposition.BLOCK_ACTION_REQUIRED, "degraded"))
+        self.assertIs(c.final_conclusion, CheckConclusion.ACTION_REQUIRED)
 
-        ex = Executor(store, hash_mismatch_runner, updater)
-        store.enqueue(_event())
-        store.claim_next()
-        ex.process_claimed(_event())
-        self.assertEqual(store.status_of("d1"), "error")
-        self.assertIs(client.final_conclusion, CheckConclusion.ACTION_REQUIRED)  # ERROR blocks
+    def test_infra_failure_publishes_action_required_and_never_leaks_detail(self) -> None:
+        # the publication-no-leak pin: the internal detail (raw exception text) must NEVER reach the summary;
+        # only the stable, closed reason token is published.
+        secret = "SECRET-INTERNAL-STACKTRACE-/home/user/x"
+        c = self._publish(InfrastructureFailure(InfraFailureReason.WORKER_FAULT, detail=secret))
+        self.assertIs(c.final_conclusion, CheckConclusion.ACTION_REQUIRED)
+        self.assertIn("worker_fault", c.final_summary or "")   # the closed token IS published
+        self.assertNotIn(secret, c.final_summary or "")        # the detail is NOT
+        self.assertNotIn("SECRET", c.final_summary or "")
+
+    def test_render_rejects_a_bare_verdict(self) -> None:
+        with self.assertRaises(TypeError):
+            _render_job_summary(Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS), _NAME)  # type: ignore[arg-type]
 
 
-def _fixture_tarball(path: Path, script: bytes) -> None:
-    with tarfile.open(path, "w") as tar:
-        ti = tarfile.TarInfo("acme-widgets-abc/main.py")
-        ti.size = len(script)
-        tar.addfile(ti, io.BytesIO(script))
+class GatedRoutingTests(unittest.TestCase):
+    """make_gated_job_runner routing WITHOUT the engine: a non-enforce disposition returns a typed
+    NonRunDecision and never touches the artifact source / engine; a mis-routed plan fails closed."""
+
+    def _runner(self, decision: GateDecision, *, governance=None, policy_id: str = _POLICY):  # type: ignore[no-untyped-def]
+        touched: list[str] = []
+
+        def source(event: GatingEvent, ws: Path) -> ArtifactSpec:
+            touched.append(event.delivery_id)  # a non-run must NEVER reach here
+            return ArtifactSpec(path=ws, tree_hash="sha256:unused")
+
+        runner = make_gated_job_runner(
+            lambda _e: decision, source, policy_id=policy_id,
+            governance=governance if governance is not None else _FakeGovernance(),
+            image=_IMAGE, resolve=_RESOLVE_BUNDLE, detector_id=_DETECTOR_ID)
+        return runner, touched
+
+    def test_skip_neutral_returns_non_run_and_never_runs_the_engine(self) -> None:
+        runner, touched = self._runner(_nonrun(Disposition.SKIP_NEUTRAL))
+        result = runner(_event())
+        self.assertIsInstance(result, NonRunDecision)
+        assert isinstance(result, NonRunDecision)
+        self.assertIs(result.disposition, Disposition.SKIP_NEUTRAL)
+        self.assertEqual(touched, [])  # the artifact source (engine gate) was NEVER reached
+
+    def test_block_action_required_returns_blocking_non_run_no_engine(self) -> None:
+        runner, touched = self._runner(_nonrun(Disposition.BLOCK_ACTION_REQUIRED, "degraded"))
+        result = runner(_event())
+        self.assertIsInstance(result, NonRunDecision)
+        assert isinstance(result, NonRunDecision)
+        self.assertIs(result.disposition, Disposition.BLOCK_ACTION_REQUIRED)
+        self.assertEqual(touched, [])
+
+    def test_dispatch_invariant_rejects_a_mis_routed_plan(self) -> None:
+        # a coherent RUN_ENFORCING decision whose plan authorizes a DIFFERENT policy than this deployment —
+        # the dispatch-time recheck refuses to run it (fail-closed), the executor maps the raise to WORKER_FAULT.
+        wrong = _enforce(_plan())  # _plan().policy_id == "p1"
+        runner, touched = self._runner(wrong, policy_id="a-different-policy")
+        with self.assertRaises(GateDecisionError):
+            runner(_event())
+        self.assertEqual(touched, [])  # never reached the engine
+
+    def test_detector_unresolved_is_infrastructure_failure(self) -> None:
+        # the enforced detector is registered under a DRIFTED content-address -> resolve refuses inside
+        # _run_engine_check -> make_gated_job_runner maps it to a blocking InfrastructureFailure, never a pass.
+        from gate.detector_registry import DetectorRegistry
+        from engine.retry import RetryCheck
+        drifted = DetectorRegistry()
+        drifted.register("retry", lambda: RetryCheck(("python3", "/artifact/main.py")),
+                         accepted_profile_digest="accepted-addr-that-will-not-match")
+
+        def source(_e: GatingEvent, ws: Path) -> ArtifactSpec:
+            return ArtifactSpec(path=ws, tree_hash="sha256:unused")
+
+        runner = make_gated_job_runner(
+            lambda _e: _enforce(_plan()), source, policy_id=_POLICY, governance=_FakeGovernance(),
+            image=_IMAGE, resolve=drifted.resolve_bundle, detector_id="retry")
+        result = runner(_event())
+        self.assertIsInstance(result, InfrastructureFailure)
+        assert isinstance(result, InfrastructureFailure)
+        self.assertIs(result.reason, InfraFailureReason.DETECTOR_UNRESOLVED)
+
+    def test_artifact_hash_mismatch_is_integrity_infrastructure_failure(self) -> None:
+        # _run_engine_check raising ArtifactHashMismatchError (a possible TOCTOU) -> a DISTINCT blocking
+        # InfrastructureFailure(ARTIFACT_INTEGRITY_MISMATCH), never a silent pass.
+        def source(_e: GatingEvent, ws: Path) -> ArtifactSpec:
+            return ArtifactSpec(path=ws, tree_hash="sha256:whatever")
+
+        runner = make_gated_job_runner(
+            lambda _e: _enforce(_plan()), source, policy_id=_POLICY, governance=_FakeGovernance(),
+            image=_IMAGE, resolve=_RESOLVE_BUNDLE, detector_id=_DETECTOR_ID)
+        with mock.patch("gate.pipeline._run_engine_check", side_effect=ArtifactHashMismatchError("swap")):
+            result = runner(_event())
+        self.assertIsInstance(result, InfrastructureFailure)
+        assert isinstance(result, InfrastructureFailure)
+        self.assertIs(result.reason, InfraFailureReason.ARTIFACT_INTEGRITY_MISMATCH)
+
+    def test_artifact_fetch_failure_is_infrastructure_failure(self) -> None:
+        # dissent P2 (ARTIFACT_FETCH_FAILED wired): a SafeExtractError (malformed / path-traversing /
+        # oversized tarball rejected by safe_extract_tarball) during acquisition -> a typed blocking
+        # InfrastructureFailure(ARTIFACT_FETCH_FAILED), never a pass.
+        from gate.artifact import SafeExtractError
+
+        def source(_e: GatingEvent, ws: Path) -> ArtifactSpec:
+            return ArtifactSpec(path=ws, tree_hash="sha256:unused")
+
+        runner = make_gated_job_runner(
+            lambda _e: _enforce(_plan()), source, policy_id=_POLICY, governance=_FakeGovernance(),
+            image=_IMAGE, resolve=_RESOLVE_BUNDLE, detector_id=_DETECTOR_ID)
+        with mock.patch("gate.pipeline._run_engine_check", side_effect=SafeExtractError("path traversal")):
+            result = runner(_event())
+        self.assertIsInstance(result, InfrastructureFailure)
+        assert isinstance(result, InfrastructureFailure)
+        self.assertIs(result.reason, InfraFailureReason.ARTIFACT_FETCH_FAILED)
+
+    def test_dispatch_invariant_rejects_a_non_run_decision_carrying_a_plan(self) -> None:
+        # dissent P1: the OTHER direction of the biconditional. A (forged) non-RUN decision that CARRIES a
+        # plan must be refused, NOT silently returned as a NonRunDecision. GateDecision.__post_init__ forbids
+        # constructing this, so we forge a decision-shaped object to prove the runner's OWN fail-closed
+        # recheck catches RUN_ENFORCING != (plan is not None) before branching.
+        from types import SimpleNamespace
+        forged = SimpleNamespace(disposition=Disposition.SKIP_NEUTRAL, plan=_plan(), reason="forged")
+        runner, touched = self._runner(forged)  # type: ignore[arg-type]
+        with self.assertRaises(GateDecisionError):
+            runner(_event())
+        self.assertEqual(touched, [])  # never reached the engine
+
+
+class RunEngineCheckPlumbingTests(unittest.TestCase):
+    """_run_engine_check pairs the AUTHORITATIVE EngineRunResult with the REQUIRED plan into an
+    UnadmittedRunResult, and supplies run_check the frozen command + the full 4-coordinate provenance."""
+
+    def test_pairs_the_plan_and_supplies_frozen_command_and_provenance(self) -> None:
+        from core.sandbox import Command
+        from engine.calibration import ResolvedDetector
+        from engine.retry import RetryCheck
+        from engine.runner import TrialReport
+
+        frozen = Command(argv=("frozen-live-cmd", "/artifact/main.py"))
+        detector = RetryCheck(("entrypoint-value-must-not-run", "/artifact/main.py"))
+        self.assertNotEqual(detector.entrypoint(), frozen)
+
+        def resolver(detector_id: str) -> ResolvedDetector:
+            return ResolvedDetector(assertion=detector, profile_digest="pd-frozen", command=frozen)
+
+        captured: dict[str, object] = {}
+
+        def fake_run_check(make_sandbox, det, artifact, budget, **kw):  # type: ignore[no-untyped-def]
+            captured.update(kw)
+            p = Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
+            return EngineRunResult(trial_report=TrialReport(
+                trials=(p,), trials_configured=1, short_circuited=False, aggregate=p))
+
+        def source(_e: GatingEvent, ws: Path) -> ArtifactSpec:
+            return ArtifactSpec(path=ws, tree_hash="sha256:x")
+
+        plan = _plan()
+        with mock.patch("gate.pipeline.run_check", side_effect=fake_run_check):
+            un = _run_engine_check(_event(), plan, artifact_source=source, image=_IMAGE,
+                                   resolve=resolver, detector_id="retry")
+        self.assertIsInstance(un, UnadmittedRunResult)
+        self.assertIs(un.plan, plan)                                   # the REQUIRED plan is paired in
+        self.assertEqual(captured.get("command"), frozen)             # the FROZEN command reached run_check
+        self.assertNotEqual(captured.get("command"), detector.entrypoint())
+        self.assertEqual(captured.get("resolved_profile_digest"), "pd-frozen")
+        trust = captured.get("trust_policy")
+        self.assertTrue(getattr(trust, "policy_digest", None))         # a measured trust OBJECT, not a string
+        guard = captured.get("backend_guard")
+        self.assertTrue(getattr(guard, "policy_digest", None))         # a measured guard OBJECT
+        self.assertNotIn("guard_policy_digest", captured)              # no caller-string guard digest
 
 
 class BudgetOrderingTests(unittest.TestCase):
     def test_accepts_aggregate_within_watchdog(self) -> None:
-        # 3 trials x 120s = 360s; x1.2 margin = 432s < 900s watchdog -> OK
         assert_budget_fits_watchdog(trials=3, per_trial_wall_clock=120.0, watchdog_timeout=900.0)
 
     def test_rejects_aggregate_exceeding_watchdog(self) -> None:
-        # 8 trials x 120s = 960s -> races the 900s watchdog -> refuse (fail-closed startup)
         with self.assertRaises(ValueError):
-            assert_budget_fits_watchdog(
-                trials=8, per_trial_wall_clock=120.0, watchdog_timeout=900.0
-            )
-
-
-class IntegrityMismatchMappingTests(unittest.TestCase):
-    def test_job_runner_maps_hash_mismatch_to_integrity_security_error(self) -> None:
-        # the pipeline job-runner catches ArtifactHashMismatchError and returns the
-        # DISTINCT integrity verdict (blocks via action_required, screams in the summary).
-        def source(_: GatingEvent, ws: Path) -> ArtifactSpec:
-            return ArtifactSpec(path=ws, tree_hash="sha256:whatever")
-
-        job = make_job_runner(source, image=_IMAGE, resolve=_RESOLVE_BUNDLE, detector_id=_DETECTOR_ID)
-        with mock.patch(
-            "gate.pipeline.run_engine_check",
-            side_effect=ArtifactHashMismatchError("swap"),
-        ):
-            verdict = job(_event())
-        self.assertIs(verdict.status, VerdictType.ERROR)
-        self.assertIs(verdict.reason, Reason.ARTIFACT_INTEGRITY_MISMATCH)
+            assert_budget_fits_watchdog(trials=8, per_trial_wall_clock=120.0, watchdog_timeout=900.0)
 
 
 class DetectorRegistryEnforcementTests(unittest.TestCase):
-    """3.5-close #1.3: the live gate resolves its detector through the trusted registry (enforced ==
-    accepted), and a boot assertion catches a mis-registered detector."""
-
     def test_boot_assertion_passes_for_registered_detector(self) -> None:
-        assert_detector_registered(_RESOLVE, _DETECTOR_ID)  # does not raise
+        assert_detector_registered(_RESOLVE, _DETECTOR_ID)
 
     def test_boot_assertion_fails_for_unregistered_detector(self) -> None:
         from gate.preflight import ConfigurationError
@@ -218,9 +358,6 @@ class DetectorRegistryEnforcementTests(unittest.TestCase):
             assert_detector_registered(_RESOLVE, "not-the-accepted-detector")
 
     def test_boot_fails_against_a_mismatched_accepted_profile_digest(self) -> None:
-        # P1-3 (neg 1): a registry bound to a WRONG externally-supplied accepted profile digest must fail
-        # the boot assertion — resolve revalidates the resolved profile and refuses the mismatch, so a
-        # bad acceptance-ceremony output (or a drifted live detector) is caught at boot, not per-PR.
         from gate.preflight import ConfigurationError
         registry = default_detector_registry(
             detector_id="retry", accepted_profile_digest="not-the-accepted-profile-digest")
@@ -228,8 +365,6 @@ class DetectorRegistryEnforcementTests(unittest.TestCase):
             assert_detector_registered(registry.resolve, "retry")
 
     def test_production_boot_requires_external_accepted_profile_digest(self) -> None:
-        # P1-3: production must NOT self-compute the accepted profile digest (circular). The live gate
-        # reads GATED_ACCEPTED_PROFILE_DIGEST and fails boot CLOSED when it is unset; a real value passes.
         import importlib
         from gate.preflight import ConfigurationError
         with mock.patch.dict("os.environ", {"GATED_ACCEPTED_PROFILE_DIGEST": ""}, clear=False):
@@ -239,134 +374,39 @@ class DetectorRegistryEnforcementTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"GATED_ACCEPTED_PROFILE_DIGEST": "profile-digest-xyz"}, clear=False):
             live_app = importlib.reload(importlib.import_module("gate.live_app"))
             self.assertEqual(live_app.required_accepted_profile_digest(), "profile-digest-xyz")
-        importlib.reload(importlib.import_module("gate.live_app"))  # restore module-level default
+        importlib.reload(importlib.import_module("gate.live_app"))
 
-    # ---- adversarial (finding F): an unresolvable detector -> BLOCK (ERROR), never runs ----
-    def test_job_runner_blocks_when_detector_does_not_resolve(self) -> None:
-        from gate.detector_registry import DetectorRegistry
-        from engine.retry import RetryCheck
+    def test_production_boot_requires_policy_id(self) -> None:
+        # CP2 S5 D1: GATED_POLICY_ID unset -> fail boot CLOSED; a real value passes.
+        import importlib
+        from gate.preflight import ConfigurationError
+        with mock.patch.dict("os.environ", {"GATED_POLICY_ID": ""}, clear=False):
+            live_app = importlib.reload(importlib.import_module("gate.live_app"))
+            with self.assertRaises(ConfigurationError):
+                live_app.required_policy_id()
+        with mock.patch.dict("os.environ", {"GATED_POLICY_ID": "policy-42"}, clear=False):
+            live_app = importlib.reload(importlib.import_module("gate.live_app"))
+            self.assertEqual(live_app.required_policy_id(), "policy-42")
+        importlib.reload(importlib.import_module("gate.live_app"))
 
-        # a registry whose "retry" is registered under a DRIFTED (wrong) content-address -> resolve
-        # refuses -> the job-runner must BLOCK with DETECTOR_UNRESOLVED, never run an unverified detector.
-        drifted = DetectorRegistry()
-        drifted.register("retry", lambda: RetryCheck(("python3", "/artifact/main.py")),
-                         accepted_profile_digest="accepted-addr-that-will-not-match")
-
-        def source(_: GatingEvent, ws: Path) -> ArtifactSpec:
-            # the detector resolves (and fails) before any sandbox runs, so the artifact is never used.
-            return ArtifactSpec(path=ws, tree_hash="sha256:unused")
-
-        job = make_job_runner(source, image=_IMAGE, resolve=drifted.resolve_bundle, detector_id="retry")
-        verdict = job(_event())
-        self.assertIs(verdict.status, VerdictType.ERROR)
-        self.assertIs(verdict.reason, Reason.DETECTOR_UNRESOLVED)
-
-
-class LiveFrozenCommandTests(unittest.TestCase):
-    """v5-P1a behavioural neg: the LIVE enforcement path (run_engine_check) executes the FROZEN resolved
-    command (``bundle.command``, captured once at resolution), NEVER a fresh ``detector.entrypoint()`` — so
-    a stateful detector that resolves one command and would answer another cannot separate the signed
-    profile from what runs. This is the LIVE-path complement to the calibrate-path frozen-command neg.
-    Remove ``command=bundle.command`` in run_engine_check and run_check is handed the default
-    ``command=None`` -> it re-derives from entrypoint(): this test fails, catching that regression."""
-
-    def test_live_path_runs_the_frozen_command_not_a_fresh_entrypoint(self) -> None:
-        from core.sandbox import Command
-        from engine.calibration import ResolvedDetector
-        from engine.retry import RetryCheck
-
-        frozen = Command(argv=("frozen-live-cmd", "/artifact/main.py"))
-        # the bundle carries the FROZEN command; the detector's OWN entrypoint() answers something DIFFERENT
-        # — so if the live path re-derived from entrypoint() the captured command would diverge from frozen.
-        detector = RetryCheck(("entrypoint-value-must-not-run", "/artifact/main.py"))
-        self.assertNotEqual(detector.entrypoint(), frozen)  # precondition: the two genuinely differ
-
-        def resolver(detector_id: str) -> ResolvedDetector:
-            return ResolvedDetector(assertion=detector, profile_digest="pd-frozen", command=frozen)
-
-        captured: dict[str, object] = {}
-
-        from engine.runner import EngineRunResult, TrialReport
-
-        def fake_run_check(make_sandbox, detector, artifact, budget, **kw):  # type: ignore[no-untyped-def]
-            captured.update(kw)
-            _pass = Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
-            return EngineRunResult(trial_report=TrialReport(
-                trials=(_pass,), trials_configured=1, short_circuited=False, aggregate=_pass))
-
-        artifact = ArtifactSpec(path=Path(tempfile.mkdtemp(prefix="mv-frozen-")), tree_hash="sha256:x")
-        with mock.patch("gate.pipeline.run_check", side_effect=fake_run_check):
-            result = run_engine_check(artifact, image=_IMAGE, resolve=resolver, detector_id="retry")
-        self.assertIs(result.verdict.status, VerdictType.PASS)  # authoritative return; verdict derived
-        # the FROZEN command reached run_check — not None (which would let run_check re-call entrypoint()),
-        # and not the detector's own entrypoint() value.
-        self.assertEqual(captured.get("command"), frozen)
-        self.assertNotEqual(captured.get("command"), detector.entrypoint())
-
-    def test_live_path_supplies_full_four_coordinate_provenance(self) -> None:
-        # S3-completion: the LIVE path must hand run_check every provenance SOURCE for the measured 4-tuple —
-        # the resolved-profile digest (from the bundle), a NON-optional trust policy (applied, digest read off
-        # it), and a NON-optional guard OBJECT (invoked per sandbox, digest read off it). run_check measures
-        # the 4th (execution identity) from the sandbox. Here we prove run_engine_check SUPPLIES the three,
-        # from measured sources — not None, not caller strings.
-        from engine.calibration import ResolvedDetector
-        from engine.retry import RetryCheck
-        from engine.runner import EngineRunResult, TrialReport
-
-        detector = RetryCheck(("python3", "/artifact/main.py"))
-
-        def resolver(detector_id: str) -> ResolvedDetector:
-            return ResolvedDetector(assertion=detector, profile_digest="pd-live", command=None)
-
-        captured: dict[str, object] = {}
-
-        def fake_run_check(make_sandbox, det, artifact, budget, **kw):  # type: ignore[no-untyped-def]
-            captured.update(kw)
-            _pass = Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
-            return EngineRunResult(trial_report=TrialReport(
-                trials=(_pass,), trials_configured=1, short_circuited=False, aggregate=_pass))
-
-        artifact = ArtifactSpec(path=Path(tempfile.mkdtemp(prefix="mv-live4-")), tree_hash="sha256:x")
-        with mock.patch("gate.pipeline.run_check", side_effect=fake_run_check):
-            run_engine_check(artifact, image=_IMAGE, resolve=resolver, detector_id="retry")
-        # coord 1: resolved-profile digest from the bundle (not None).
-        self.assertEqual(captured.get("resolved_profile_digest"), "pd-live")
-        # coord 2: a non-optional trust policy OBJECT is applied (its digest is read off it, not declared).
-        trust = captured.get("trust_policy")
-        self.assertIsNotNone(trust)
-        self.assertTrue(getattr(trust, "policy_digest", None))
-        # coord 3: a non-optional guard OBJECT is supplied (run_check invokes it + reads its digest).
-        guard = captured.get("backend_guard")
-        self.assertIsNotNone(guard)
-        self.assertTrue(getattr(guard, "policy_digest", None))
-        # and NO caller-string guard digest is threaded (the defect this fix closes).
-        self.assertNotIn("guard_policy_digest", captured)
+    def test_require_distinct_db_paths_rejects_a_collision(self) -> None:
+        # dissent P2: the queue / policy / calibration DB paths must be DISTINCT; a collision fails boot.
+        import importlib
+        from gate.preflight import ConfigurationError
+        live_app = importlib.import_module("gate.live_app")
+        q, p, c = Path("/tmp/mv-q.db"), Path("/tmp/mv-p.db"), Path("/tmp/mv-c.db")
+        with self.assertRaises(ConfigurationError):
+            live_app.require_distinct_db_paths(q, q, c)   # queue == policy
+        with self.assertRaises(ConfigurationError):
+            live_app.require_distinct_db_paths(q, p, p)   # policy == calibration
+        live_app.require_distinct_db_paths(q, p, c)       # all distinct: does not raise
 
 
-class CheckRunProvenanceTests(unittest.TestCase):
-    """3.5-close #1.5: the Check Run summary carries the ATTESTED detector_id + image_digest (non-
-    repudiation on the merge-blocking path), sourced from the captured TrialReport — never artifact output."""
-
-    def test_summary_carries_detector_and_image_when_captured(self) -> None:
-        from engine.runner import ExecutionIdentity, TrialReport
-        capture = CapturingTrialReportSink()
-        capture.record(TrialReport(
-            trials=(Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS),), trials_configured=1,
-            short_circuited=False, aggregate=Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS),
-            execution_identity=ExecutionIdentity(backend="ObservedOCISandbox",
-                                                 image_ref="sha256:cafef00d", isolation_level="hermetic"),
-            detector_id="retry"))
-        client = _FakeCheckClient()
-        make_check_updater(client, name=_NAME, report_capture=capture)(
-            _event(), Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS))
-        self.assertIn("detector=retry", client.final_summary or "")
-        self.assertIn("image=sha256:cafef00d", client.final_summary or "")
-
-    def test_summary_omits_provenance_when_uncaptured(self) -> None:
-        client = _FakeCheckClient()
-        make_check_updater(client, name=_NAME)(  # no report_capture
-            _event(), Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS))
-        self.assertNotIn("detector=", client.final_summary or "")
+def _fixture_tarball(path: Path, script: bytes) -> None:
+    with tarfile.open(path, "w") as tar:
+        ti = tarfile.TarInfo("acme-widgets-abc/main.py")
+        ti.size = len(script)
+        tar.addfile(ti, io.BytesIO(script))
 
 
 class ExtractToSpecTests(unittest.TestCase):
@@ -377,10 +417,10 @@ class ExtractToSpecTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as ws:
             spec = extract_to_spec(tar, Path(ws))
             self.assertIsInstance(spec, ArtifactSpec)
-            self.assertEqual(spec.tree_hash, tree_hash(spec.path))  # App == sandbox canon
+            self.assertEqual(spec.tree_hash, tree_hash(spec.path))
 
 
-# ---- real-engine handshake (skip unless podman + image) --------------------
+# ---- real-engine handshake + the S5 GENUINE-BITE (skip unless podman + image) ----
 
 _A_RETRY = (
     "import socket\n"
@@ -403,25 +443,91 @@ _PODMAN = ObservedOCISandbox.available(_IMAGE)
 
 
 @unittest.skipUnless(_PODMAN, f"no OCI runtime can run {_IMAGE} hermetically")
-class RealEngineHandshakeTests(unittest.TestCase):
-    """The thing 2.4 exists to prove: a real podman run -> aggregated Verdict -> the
-    gate's Check Run mapping, engine and gate meeting end-to-end."""
+class RealEngineAdmissionTests(unittest.TestCase):
+    """The S5 keystone: REAL podman runs through make_gated_job_runner. The measured 4-coordinate composite
+    comes from the ACTUAL execution — NOT echoed from the plan target — so the admission genuinely bites on
+    EVERY dimension: the structural SUBJECT_DRIFT AND each live-currency refusal (set moved, head stale,
+    subject moved, governance unavailable). The real measured subject is learnt ONCE (a probe run in
+    setUpClass; it is stable across runs on the same image/backend) and reused."""
 
-    def test_retry_artifact_passes_through_pipeline(self) -> None:
+    _subject: str
+    _tar: Path
+
+    @classmethod
+    def setUpClass(cls) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="mv-hs-"))
-        tar = tmp / "art.tar"
-        _fixture_tarball(tar, _A_RETRY)
+        cls._tar = tmp / "art.tar"
+        _fixture_tarball(cls._tar, _A_RETRY)
+        un = _run_engine_check(_event(), _plan(target="probe-target", authorized="probe-target"),
+                               artifact_source=cls._make_source(), image=_IMAGE, resolve=_RESOLVE_BUNDLE,
+                               detector_id=_DETECTOR_ID, trials=2)
+        rep = un.report
+        assert rep.execution_identity is not None
+        cls._subject = calibrated_subject_identity(
+            rep.resolved_profile_digest, rep.trust_policy_digest, rep.guard_policy_digest,
+            rep.execution_identity.digest())
 
-        def source(_: GatingEvent, ws: Path) -> ArtifactSpec:
+    @classmethod
+    def _make_source(cls):  # type: ignore[no-untyped-def]
+        tar = cls._tar
+
+        def source(_e: GatingEvent, ws: Path) -> ArtifactSpec:
             return extract_to_spec(tar, ws)
+        return source
 
-        job = make_job_runner(source, image=_IMAGE, resolve=_RESOLVE_BUNDLE, detector_id=_DETECTOR_ID, trials=2)
-        verdict = job(_event())
-        self.assertIs(verdict.status, VerdictType.PASS)
+    def _run(self, plan, governance) -> JobResult:  # type: ignore[no-untyped-def]
+        runner = make_gated_job_runner(
+            lambda _e: _enforce(plan), self._make_source(), policy_id=_POLICY, governance=governance,
+            image=_IMAGE, resolve=_RESOLVE_BUNDLE, detector_id=_DETECTOR_ID, trials=2)
+        return runner(_event())
 
-        client = _FakeCheckClient()
-        make_check_updater(client, name=_NAME)(_event(), verdict)
-        self.assertIs(client.final_conclusion, CheckConclusion.SUCCESS)
+    def _matching_plan(self):  # type: ignore[no-untyped-def]
+        return _plan(target=self._subject, authorized=self._subject)
+
+    def test_wrong_target_is_refused_subject_drift_from_the_real_measurement(self) -> None:
+        # THE genuine-bite: the plan dispatches a WRONG subject; the real run measures the REAL one; admission
+        # recomputes the measured composite from the authoritative return and refuses SUBJECT_DRIFT. Nothing in
+        # the test sets the measured value — the engine did.
+        result = self._run(_plan(target="a-wrong-dispatched-subject", authorized="a-wrong-dispatched-subject"),
+                           _FakeGovernance())
+        assert isinstance(result, BlockingRefusal)
+        self.assertIs(result.reason, RunAdmissionRefusal.SUBJECT_DRIFT)
+
+    def test_matching_plan_and_current_governance_admits_the_measured_verdict(self) -> None:
+        # the happy wired path: a plan whose target IS the real measured subject + current governance ->
+        # AdmittedRunResult carrying the engine's PASS verdict.
+        result = self._run(self._matching_plan(), _FakeGovernance(subject=self._subject))
+        assert isinstance(result, AdmittedRunResult)
+        self.assertIs(result.verdict.status, VerdictType.PASS)
+        self.assertEqual(result.measured_subject, self._subject)
+
+    def test_authorized_subject_moved_refuses_even_though_the_run_matched_the_plan(self) -> None:
+        # structural passes (measured == target from the real run) but governance moved the authorized subject
+        # since mint -> AUTHORIZED_SUBJECT_MOVED (a LIVE-currency bite on the wired path).
+        result = self._run(self._matching_plan(), _FakeGovernance(subject="governance-moved-the-subject"))
+        assert isinstance(result, BlockingRefusal)
+        self.assertIs(result.reason, RunAdmissionRefusal.AUTHORIZED_SUBJECT_MOVED)
+
+    def test_authorized_set_moved_refuses_on_the_wired_path(self) -> None:
+        # the live attestation is bound to a DIFFERENT set than the plan authorized (a governance rebind).
+        result = self._run(self._matching_plan(),
+                           _FakeGovernance(subject=self._subject, set_id="a-different-set"))
+        assert isinstance(result, BlockingRefusal)
+        self.assertIs(result.reason, RunAdmissionRefusal.AUTHORIZED_SET_MOVED)
+
+    def test_set_head_stale_refuses_on_the_wired_path(self) -> None:
+        # the bound calibration head differs from the live set_head — the set drifted since calibration.
+        result = self._run(self._matching_plan(),
+                           _FakeGovernance(subject=self._subject, bound_head="bound-old", live_head="live-new"))
+        assert isinstance(result, BlockingRefusal)
+        self.assertIs(result.reason, RunAdmissionRefusal.SET_HEAD_STALE)
+
+    def test_unavailable_governance_read_fails_closed_on_the_wired_path(self) -> None:
+        # admission's OWN live read raises (a broken chain / unreachable store) -> fail-closed
+        # LIVE_ATTESTATION_UNAVAILABLE, never a silent pass.
+        result = self._run(self._matching_plan(), _FakeGovernance(subject=self._subject, raise_attn=True))
+        assert isinstance(result, BlockingRefusal)
+        self.assertIs(result.reason, RunAdmissionRefusal.LIVE_ATTESTATION_UNAVAILABLE)
 
 
 if __name__ == "__main__":

@@ -18,11 +18,13 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from core import ArtifactSpec, Reason, Verdict, VerdictType
+from core import ArtifactSpec
 from engine.runner import TrialReport
 
+from .calibration_store import CalibrationStore
 from .dedup import InMemoryDeliveryLog
 from .executor import Executor, Watchdog
+from .gatekeeper import GateDecision, resolve_disposition
 from .github_auth import FileKeySource, InstallationTokenProvider
 from .github_live import RealGitHubCheckClient, RealJwtSigner, RealTokenFetcher, download_tarball
 from http.server import ThreadingHTTPServer
@@ -30,13 +32,13 @@ from http.server import ThreadingHTTPServer
 from .http_server import _handler_factory  # reuse the transport handler
 from .ledger import OverrideLedger, VerdictRow, capture_override, render_ledger_line
 from .pipeline import (
-    CapturingTrialReportSink,
     assert_detector_registered,
     default_detector_registry,
     extract_to_spec,
     make_check_updater,
-    run_engine_check,
+    make_gated_job_runner,
 )
+from .policy_store import PolicyStore
 from .preflight import ConfigurationError
 from .queue import GatingEvent, InMemoryOverrideSink
 from .ratelimit import RateLimitBudget, TokenBucketRateLimiter
@@ -74,6 +76,14 @@ LEDGER_DB = os.environ.get("GATED_LEDGER_DB")            # default: alongside th
 # SHA-bound; works for PUBLIC forks with the base token; a private fork needs an App install
 # on the fork). repo_full_name stays BASE regardless — only the fetch source changes.
 FORK_FETCH = os.environ.get("GATED_FORK_FETCH", "0") not in ("0", "false", "no", "")
+# CP2 S5: the SINGLE policy this deployed check enforces (D1: one policy per deployed check; a per-event
+# policy resolver is a named-next increment). Fail boot closed if unset (see required_policy_id).
+POLICY_ID = os.environ.get("GATED_POLICY_ID")
+# The governance stores live on their OWN DB files, SEPARATE from the queue DB: the tier decision reads the
+# PolicyStore; the post-run admission-currency check reads the PolicyStore + CalibrationStore. Defaults sit
+# alongside the queue DB.
+POLICY_DB = os.environ.get("GATED_POLICY_DB")            # default: alongside the gate db
+CALIBRATION_DB = os.environ.get("GATED_CALIBRATION_DB")  # default: alongside the gate db
 
 
 class _LoggingTrialReportSink:
@@ -111,10 +121,55 @@ def required_accepted_profile_digest() -> str:
     return digest
 
 
+def required_policy_id() -> str:
+    """CP2 S5 D1: the deployed check enforces exactly ONE policy; ``resolve_disposition`` + the dispatch-time
+    invariant recheck both need its id. Fail boot CLOSED when ``GATED_POLICY_ID`` is unset/blank (a missing
+    policy id would leave the tier decision without a subject)."""
+    pid = (POLICY_ID or "").strip()
+    if not pid:
+        raise ConfigurationError(
+            "production gate requires GATED_POLICY_ID (the single policy this deployed check enforces)")
+    return pid
+
+
+def require_distinct_db_paths(queue_db: Path, policy_db: Path, calibration_db: Path) -> None:
+    """CP2 S5 (dissent P2): the queue / policy / calibration stores MUST live on DISTINCT DB files — a shared
+    file would let one store's writes corrupt another's schema/rows. Comments + defaults do NOT prevent an
+    env-configured collision (``GATED_POLICY_DB`` == ``GATED_CALIBRATION_DB``, say); assert the RESOLVED
+    paths are distinct at boot and fail CLOSED."""
+    resolved = {"queue": queue_db.resolve(), "policy": policy_db.resolve(),
+                "calibration": calibration_db.resolve()}
+    if len(set(resolved.values())) != len(resolved):
+        raise ConfigurationError(
+            "the queue / policy / calibration DB paths must be DISTINCT (a shared file lets one store "
+            f"corrupt another): {dict((k, str(v)) for k, v in resolved.items())}")
+
+
+class _ProductionAdmissionGovernanceView:
+    """The production ``AdmissionGovernanceView`` (CP2 S5, board D2): admission's OWN post-run governance
+    read. ``current_attestation`` is backed DIRECTLY by ``PolicyStore.current_attestation`` — which already
+    gates ICV == the current identity contract AND the hash-chained pass exact-match IN-STORE, returning the
+    ``(set_id, oracle_head, subject)`` 3-tuple — so there is NO view-side ICV gate to duplicate (a store
+    invariant belongs in the store, not re-implemented per consumer). ``oracle_head_for`` is
+    ``CalibrationStore.set_head``. Both reads may RAISE (a broken chain / unreachable store);
+    ``admit_run_result`` catches and fails closed. Read-only — admission never mutates governance state."""
+
+    def __init__(self, policy_store: PolicyStore, calibration_store: CalibrationStore) -> None:
+        self._policy_store = policy_store
+        self._calibration_store = calibration_store
+
+    def current_attestation(self, policy_id: str) -> tuple[str, str, str] | None:
+        return self._policy_store.current_attestation(policy_id)
+
+    def oracle_head_for(self, set_id: str) -> str | None:
+        return self._calibration_store.set_head(set_id)
+
+
 def build(
     db_path: Path,
 ) -> tuple[WebhookReceiver, Executor, Watchdog, InstallationTokenProvider, Callable[[], int]]:
     accepted_profile_digest = required_accepted_profile_digest()  # P1-3: fail boot if unset (no self-compute)
+    policy_id = required_policy_id()  # CP2 S5 D1: fail boot if GATED_POLICY_ID unset
     app_id = int(os.environ["GATED_APP_ID"])
     installs = frozenset(
         int(x) for x in os.environ.get("GATED_INSTALLATION_IDS", "").split(",") if x
@@ -128,7 +183,16 @@ def build(
         fetcher=RealTokenFetcher(budget),
         clock=time.time,
     )
-    store = GatingStore(db_path)
+    # CP2 S5: SEPARATE governance stores (NOT the queue DB) — the tier decision reads the PolicyStore; the
+    # post-run admission-currency read reads the PolicyStore + CalibrationStore. Own DB files.
+    queue_db = db_path
+    policy_db = Path(POLICY_DB) if POLICY_DB else db_path.with_name("gated-policy.db")
+    calibration_db = Path(CALIBRATION_DB) if CALIBRATION_DB else db_path.with_name("gated-calibration.db")
+    require_distinct_db_paths(queue_db, policy_db, calibration_db)  # dissent P2: fail boot on a collision
+    store = GatingStore(queue_db)
+    policy_store = PolicyStore(policy_db)
+    calibration_store = CalibrationStore(calibration_db)
+    governance = _ProductionAdmissionGovernanceView(policy_store, calibration_store)
     # C3: the override ledger lives out-of-band — a SEPARATE DB file, the gate's trusted
     # store, never the repo under test (NFR4). The in-memory capture sink is drained by the
     # poll loop; loss on crash is safe (ledger idempotency + reconciliation).
@@ -157,17 +221,10 @@ def build(
         download_tarball(fetch_repo, event.head_sha, str(ws / "head.tar"), token)
         return extract_to_spec(ws / "head.tar", ws)
 
-    # 3.5-close #1.5: capture the trial report so the Check Run summary carries the attested detector_id
-    # + image_digest. Fan out to the audit log too. Single-writer safe (Executor max_workers=1 below).
-    _log_sink = _LoggingTrialReportSink()
-    report_capture = CapturingTrialReportSink()
-
-    class _FanoutSink:
-        def record(self, report: object) -> None:
-            _log_sink.record(report)       # type: ignore[arg-type]
-            report_capture.record(report)  # type: ignore[arg-type]
-
-    report_sink = _FanoutSink()
+    # C4: the engine's trial report is DIAGNOSTIC logging only. The authoritative Check Run summary is
+    # rendered from the TYPED JobResult (an AdmittedRunResult carries its OWN report); no capture sink feeds
+    # the summary — a stale capture must never contaminate a refusal / non-run / infra summary.
+    report_sink = _LoggingTrialReportSink()
 
     # 3.5-close #1.3: the enforced detector is resolved by NAME through the trusted registry (enforced ==
     # accepted). Boot assertion — fail HERE if the accepted detector does not resolve, not per-PR.
@@ -178,27 +235,24 @@ def build(
     # (wrong ceremony output, or a drifted live detector) fails boot here, not per-PR.
     assert_detector_registered(detector_registry.resolve, DETECTOR_ID)
 
-    def job_runner(event: GatingEvent) -> Verdict:
-        from .artifact import extraction_workspace
-        from .detector_registry import DetectorResolutionError
+    def resolve_decision(event: GatingEvent) -> GateDecision:
+        # CP2 S5: the tier decision for THIS deployment's single policy. snapshot=None (D3): a store outage
+        # with no signed snapshot -> UNATTESTABLE block (fail-closed; the signed-snapshot fallback is a
+        # named-next increment). Oracle currency is the live CalibrationStore set head.
+        return resolve_disposition(
+            policy_id, store=policy_store, snapshot=None, snapshot_key=b"",
+            now=time.time(), oracle_head_for=calibration_store.set_head)
 
-        with extraction_workspace() as ws:
-            artifact = artifact_source(event, ws)
-            try:
-                # S3-completion: consume run_engine_check's AUTHORITATIVE EngineRunResult return (verdict is
-                # its derived property). The report_sink/report_capture summary is now audit-SECONDARY — the
-                # merge DECISION (verdict) is the direct return, never report_capture.last. (The full
-                # admit_run_result typestate is the CP2 wiring increment.)
-                return run_engine_check(
-                    artifact, image=IMAGE, resolve=detector_registry.resolve_bundle, detector_id=DETECTOR_ID,
-                    trials=TRIALS, first_fail=SHORT_CIRCUIT, report_sink=report_sink,
-                ).verdict
-            except DetectorResolutionError:
-                # enforced detector unregistered / drifted -> block (never enforce an unverified detector).
-                return Verdict(VerdictType.ERROR, Reason.DETECTOR_UNRESOLVED)
+    # CP2 S5: the FULL tier-decision + engine + run-admission job runner (de-vestigialised path). A non-run
+    # disposition publishes a typed NonRunDecision and never runs the engine; an enforce runs the engine
+    # under the minted plan and ADMITS the result (post-run currency) before publishing the measured verdict.
+    job_runner = make_gated_job_runner(
+        resolve_decision, artifact_source, policy_id=policy_id, governance=governance,
+        image=IMAGE, resolve=detector_registry.resolve_bundle, detector_id=DETECTOR_ID,
+        trials=TRIALS, first_fail=SHORT_CIRCUIT, report_sink=report_sink)
 
     client = RealGitHubCheckClient(provider, next(iter(installs)), budget=budget)
-    updater = make_check_updater(client, name=CHECK_NAME, report_capture=report_capture)
+    updater = make_check_updater(client, name=CHECK_NAME)
 
     executor = Executor(store, job_runner, updater, max_workers=1)
     watchdog = Watchdog(store, updater, timeout_seconds=WATCHDOG_TIMEOUT)

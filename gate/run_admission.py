@@ -201,10 +201,13 @@ class BlockingRefusal:
 
     ``sub_reason`` (CP2 board C3) is OPERATIONAL LEGIBILITY only — not a safety distinction (every refusal
     blocks identically). It disambiguates the coarse ``LIVE_ATTESTATION_UNAVAILABLE`` / ``ORACLE_UNAVAILABLE``
-    layers so an operator can tell a store outage (``store_unreachable``) from an absent attestation
-    (``attestation_absent`` — the policy is not ENABLED or its contract drifted; the finer
-    ``policy_not_enabled`` vs ``icv_mismatch`` split is supplied by the production governance view). Empty for
-    the structural layers, which are already precise via ``reason``."""
+    layers so an operator can tell a store outage (``store_unreachable`` — the read raised) from an absent
+    attestation (``attestation_absent`` — ``current_attestation`` returned None: the policy is not ENABLED OR
+    its contract drifted). The production governance view (``PolicyStore.current_attestation``) returns only
+    tuple-or-None, so it CANNOT atomically distinguish ``policy_not_enabled`` from ``icv_mismatch`` (both
+    collapse to None); a finer split would need a dedicated atomic diagnostic store API (named-next) and must
+    NOT be manufactured through a second racy read. Empty for the structural layers (already precise via
+    ``reason``)."""
 
     reason: RunAdmissionRefusal
     detail: str

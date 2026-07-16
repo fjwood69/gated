@@ -28,7 +28,6 @@ from core import (
     VerdictType,
 )
 from core.calibration import Fixture, FixtureLabel
-from core.identity import DetectorManifest, identity_for
 from engine.calibration import ResolvedDetector
 from gate.authority import GovernanceApproval
 from gate.calibration_store import AdmissionCapability, CalibrationStore, ChangeOp
@@ -156,10 +155,14 @@ def _snap(pid: str, detector: str, *, set_id: str = "default", oracle_head: str 
 
 def _resolve(store, pid, *, detector="det-1", snapshot=None, now=1100.0,  # type: ignore[no-untyped-def]
              oracle_head_for=None):
+    # ``detector`` is retained for call-site compatibility but NO LONGER consulted: CP2 S5 removed the
+    # pre-run declared-identity comparison (the run's identity is unmeasurable pre-run; the authority is the
+    # POST-run SUBJECT_DRIFT check in admit_run_result). Kept so existing call sites need not all change.
+    del detector
     if oracle_head_for is None:
         oracle_head_for = lambda s: "fx-head"  # noqa: E731 — default: bound head matches -> enforce
     return resolve_disposition(
-        pid, expected_detector_identity=detector, store=store, snapshot=snapshot,
+        pid, store=store, snapshot=snapshot,
         snapshot_key=_KEY, now=now, oracle_head_for=oracle_head_for,
     )
 
@@ -279,13 +282,10 @@ class Done1_UnattestableBlocksTests(unittest.TestCase):
         self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
         self.assertEqual(d.source, "unattestable")
 
-    def test_store_unreachable_identity_mismatch_blocks(self) -> None:
-        # addition #1: the snapshot attests det-1 but det-EVIL is about to run -> refuse to enforce
-        # an un-calibrated detector.
-        u = _UnreachableStore(Path(tempfile.mkdtemp(prefix="mv-gk-u4-")) / "t.db")
-        d = _resolve(u, "p1", detector="det-EVIL", snapshot=_snap("p1", "det-1"), now=1100.0)
-        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
-        self.assertEqual(d.source, "unattestable")
+    # CP2 S5: the pre-run declared-identity comparison was REMOVED (a snapshot-attests-X-but-Y-about-to-run
+    # block). It was tautological/spoofable pre-run — the run's identity is unmeasurable until it runs. The
+    # authority is now the POST-run SUBJECT_DRIFT check in admit_run_result (covered in test_run_admission +
+    # the genuine-bite negatives). The former test_store_unreachable_identity_mismatch_blocks is deleted.
 
     def test_tampered_chain_blocks(self) -> None:
         s = _store()
@@ -454,49 +454,6 @@ class Close3ScopedOracleTests(unittest.TestCase):
         self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
         self.assertEqual(d.source, "unattestable")
 
-
-class TransitiveSpoofIntegrationTests(unittest.TestCase):
-    """close-2 integration (UAT Phase 1): the 4-tuple execution identity, threaded end-to-end through
-    the gate, refuses a detector whose TRANSITIVE (host-side) dependency drifted — on BOTH the live
-    path and the signed-snapshot fallback. Uses the real ``core.identity.bind_identity`` (not string
-    placeholders): the only coordinate that moves is ``host_closure_digest`` (the detector's own build
-    artifact, the sandbox image, and the eval profile are byte-identical), which is exactly the
-    transitive-dependency spoof the 2-tuple missed and the 4-tuple closes.
-
-    Regression guard: before the live-path identity fix, the live assertions here returned
-    RUN_ENFORCING — the identity invariant held only during a store outage and fell open on the
-    primary path."""
-
-    def _identity(self, *, host_closure: str) -> str:
-        # same detector build + same artifact image + same eval profile; ONLY the host closure moves.
-        m = DetectorManifest(check_type="egress", entrypoint=("python3", "main.py"),
-                             impl_digest="detector-build-v1", eval_profile={"trials": 3, "budget": 1.0})
-        return identity_for(m, host_closure_digest=host_closure, artifact_image_digest="img-sha-v1")
-
-    def test_live_path_refuses_host_closure_drift(self) -> None:
-        id_v1 = self._identity(host_closure="closure-v1")
-        id_v2 = self._identity(host_closure="closure-v2")  # a host-side helper changed
-        self.assertNotEqual(id_v1, id_v2)  # the drift produced a new identity
-        s = _store()
-        _enable(s, "p1", detector=id_v1)  # calibrated + ENABLED for the v1 closure
-        # the detector about to run is bound to the v1 closure -> enforce.
-        self.assertIs(_resolve(s, "p1", detector=id_v1).disposition, Disposition.RUN_ENFORCING)
-        # the detector about to run has the DRIFTED (v2) closure -> refuse (un-calibrated), on the
-        # LIVE path with the store fully reachable.
-        d = _resolve(s, "p1", detector=id_v2)
-        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
-        self.assertEqual(d.source, "unattestable")
-
-    def test_snapshot_path_refuses_host_closure_drift(self) -> None:
-        id_v1 = self._identity(host_closure="closure-v1")
-        id_v2 = self._identity(host_closure="closure-v2")
-        u = _UnreachableStore(Path(tempfile.mkdtemp(prefix="mv-gk-spoof-")) / "t.db")
-        snap = _snap("p1", id_v1)  # the survivable snapshot attests the v1 identity
-        self.assertIs(_resolve(u, "p1", detector=id_v1, snapshot=snap).disposition,
-                      Disposition.RUN_ENFORCING)  # store blip, matching identity -> survives
-        d = _resolve(u, "p1", detector=id_v2, snapshot=snap)  # drifted closure during the outage
-        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
-        self.assertEqual(d.source, "unattestable")
 
 
 class Done5_NoC3PathTests(unittest.TestCase):

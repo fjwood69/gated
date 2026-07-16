@@ -57,18 +57,18 @@ def _event(delivery: str = "closed-1", sha: str = "a" * 40, pr: int | None = 7) 
 
 class ClassifyMergeTests(unittest.TestCase):
     def test_fail_is_human_override(self) -> None:
-        o = classify_merge([_row("done", "FAIL", "EGRESS_ONE")])
+        o = classify_merge([_row("done", "fail", "EGRESS_ONE")])
         self.assertIs(o.kind, OutcomeKind.HUMAN_OVERRIDE)
-        self.assertEqual(o.verdict, "FAIL")
+        self.assertEqual(o.verdict, "fail")
         self.assertEqual(o.reason, "EGRESS_ONE")
 
     def test_error_verdict_is_human_override(self) -> None:
-        o = classify_merge([_row("done", "ERROR", "OBSERVATION_INCOMPLETE")])
+        o = classify_merge([_row("done", "error", "OBSERVATION_INCOMPLETE")])
         self.assertIs(o.kind, OutcomeKind.HUMAN_OVERRIDE)
-        self.assertEqual(o.verdict, "ERROR")
+        self.assertEqual(o.verdict, "error")
 
     def test_pass_is_no_override(self) -> None:
-        self.assertIs(classify_merge([_row("done", "PASS")]).kind, OutcomeKind.NO_OVERRIDE)
+        self.assertIs(classify_merge([_row("done", "pass")]).kind, OutcomeKind.NO_OVERRIDE)
 
     def test_no_rows_is_never_evaluated(self) -> None:
         o = classify_merge([])
@@ -77,7 +77,7 @@ class ClassifyMergeTests(unittest.TestCase):
 
     def test_processing_is_in_flight_even_with_a_stale_done(self) -> None:
         # F2 staleness: a newer check in flight must NOT be masked by an older done verdict.
-        o = classify_merge([_row("done", "PASS", t=1.0), _row("processing", t=2.0)])
+        o = classify_merge([_row("done", "pass", t=1.0), _row("processing", t=2.0)])
         self.assertIs(o.sub_reason, UnverifiableReason.EVALUATION_IN_FLIGHT)
 
     def test_error_status_is_infra_not_verdict_error(self) -> None:
@@ -85,8 +85,46 @@ class ClassifyMergeTests(unittest.TestCase):
         o = classify_merge([_row("error")])
         self.assertIs(o.sub_reason, UnverifiableReason.INFRA_ERROR)
 
+    def test_allowing_done_plus_error_row_is_infra_error_not_no_override(self) -> None:
+        # board C5, "infra cannot disappear": classify_merge returns from the `done` branch BEFORE the tail
+        # error check, so a passing/neutral done row + an error row for the SAME sha would have MASKED the
+        # error as NO_OVERRIDE. The infra fault (which blocked and was merged past) must be surfaced.
+        o = classify_merge([_row("done", "pass", t=1.0), _row("error", t=2.0)])
+        self.assertIs(o.kind, OutcomeKind.UNVERIFIABLE)
+        self.assertIs(o.sub_reason, UnverifiableReason.INFRA_ERROR)
+        # and the neutral-gate variant of "allowing" is masked identically without the fix.
+        o2 = classify_merge([_row("done", verdict=None, gate_outcome="neutral_gate", t=1.0),
+                             _row("error", t=2.0)])
+        self.assertIs(o2.sub_reason, UnverifiableReason.INFRA_ERROR)
+
+    def test_blocking_done_wins_over_a_coexisting_error_row(self) -> None:
+        # C5 precedence: a DEFINITE blocking done outcome (a merged-past blocking verdict) is the salient,
+        # most-specific fact and WINS even if an error row also exists for the sha.
+        o = classify_merge([_row("done", "fail", "EGRESS_ONE", t=1.0), _row("error", t=2.0)])
+        self.assertIs(o.kind, OutcomeKind.HUMAN_OVERRIDE)
+        self.assertEqual(o.verdict, "fail")
+
+    def test_error_only_force_merge_is_captured_not_silent(self) -> None:
+        # the skeptic probe (RESOLVED): a force-merge past an infra-only sha is an UNVERIFIABLE/INFRA_ERROR
+        # audit record — captured, NOT silently NO_OVERRIDE, and NOT mislabelled HUMAN_OVERRIDE (no verdict
+        # was produced). capture_override appends every UNVERIFIABLE, so it is on the record.
+        o = classify_merge([_row("error", t=1.0)])
+        self.assertIs(o.kind, OutcomeKind.UNVERIFIABLE)
+        self.assertIsNone(o.verdict)
+
+    def test_lowercase_pass_is_allowing_uppercase_is_indeterminate(self) -> None:
+        # dissent P1c + Fred ruling: the classifier matches the PERSISTED WIRE values (VerdictType.value ==
+        # lowercase). A real 'pass' is ALLOWING (a clean merge -> NO_OVERRIDE). An uppercase 'PASS'/'FAIL' is
+        # an UNKNOWN verdict (no documented historical uppercase wire format) -> INDETERMINATE, never trusted
+        # as allowing/blocking.
+        self.assertIs(classify_merge([_row("done", "pass")]).kind, OutcomeKind.NO_OVERRIDE)
+        self.assertIs(classify_merge([_row("done", "PASS")]).sub_reason,
+                      UnverifiableReason.INDETERMINATE_GATE)
+        self.assertIs(classify_merge([_row("done", "FAIL", "EGRESS_ONE")]).sub_reason,
+                      UnverifiableReason.INDETERMINATE_GATE)
+
     def test_contradictory_terminals_are_ambiguous(self) -> None:
-        o = classify_merge([_row("done", "PASS", t=1.0), _row("done", "FAIL", "EGRESS_ONE", t=2.0)])
+        o = classify_merge([_row("done", "pass", t=1.0), _row("done", "fail", "EGRESS_ONE", t=2.0)])
         self.assertIs(o.sub_reason, UnverifiableReason.AMBIGUOUS)
 
     def test_block_gate_merged_past_is_human_override(self) -> None:
@@ -115,7 +153,7 @@ class ClassifyMergeTests(unittest.TestCase):
 
     def test_contradictory_pass_with_block_gate_is_indeterminate(self) -> None:
         # board: validate the COMPLETE pair — a PASS verdict tagged block_gate is incoherent, NOT allowing.
-        o = classify_merge([_row("done", "PASS", gate_outcome="block_gate")])
+        o = classify_merge([_row("done", "pass", gate_outcome="block_gate")])
         self.assertIs(o.sub_reason, UnverifiableReason.INDETERMINATE_GATE)
 
     def test_run_verdict_gate_with_no_verdict_is_indeterminate(self) -> None:
@@ -128,13 +166,13 @@ class ClassifyMergeTests(unittest.TestCase):
         self.assertIs(o.sub_reason, UnverifiableReason.INDETERMINATE_GATE)
 
     def test_verdict_paired_with_a_gate_is_indeterminate(self) -> None:
-        o = classify_merge([_row("done", "FAIL", "EGRESS_ONE", gate_outcome="neutral_gate")])
+        o = classify_merge([_row("done", "fail", "EGRESS_ONE", gate_outcome="neutral_gate")])
         self.assertIs(o.sub_reason, UnverifiableReason.INDETERMINATE_GATE)
 
     def test_latest_non_pass_reason_wins(self) -> None:
         o = classify_merge([
-            _row("done", "FAIL", "EGRESS_ONE", t=1.0),
-            _row("done", "FAIL", "NON_DETERMINISTIC", t=2.0),
+            _row("done", "fail", "EGRESS_ONE", t=1.0),
+            _row("done", "fail", "NON_DETERMINISTIC", t=2.0),
         ])
         self.assertEqual(o.reason, "NON_DETERMINISTIC")  # the effective-at-merge (latest) one
 
@@ -145,7 +183,7 @@ class OverrideLedgerTests(unittest.TestCase):
     def test_append_then_verify_chain(self) -> None:
         lg = _ledger()
         lg.append(delivery_id="d1", kind=OverrideKind.HUMAN_OVERRIDE, repo_full_name="acme/widgets",
-                  pr=1, sha="a" * 40, verdict="FAIL", reason="EGRESS_ONE")
+                  pr=1, sha="a" * 40, verdict="fail", reason="EGRESS_ONE")
         lg.append(delivery_id="d2", kind=OverrideKind.UNVERIFIABLE, repo_full_name="acme/widgets",
                   pr=2, sha="b" * 40, sub_reason="NEVER_EVALUATED")
         self.assertEqual(lg.count(), 2)
@@ -154,9 +192,9 @@ class OverrideLedgerTests(unittest.TestCase):
     def test_chain_links_prev_to_record_hash(self) -> None:
         lg = _ledger()
         r1 = lg.append(delivery_id="d1", kind=OverrideKind.HUMAN_OVERRIDE,
-                       repo_full_name="r", pr=1, sha="a" * 40, verdict="FAIL", reason="X").record
+                       repo_full_name="r", pr=1, sha="a" * 40, verdict="fail", reason="X").record
         r2 = lg.append(delivery_id="d2", kind=OverrideKind.HUMAN_OVERRIDE,
-                       repo_full_name="r", pr=2, sha="b" * 40, verdict="FAIL", reason="Y").record
+                       repo_full_name="r", pr=2, sha="b" * 40, verdict="fail", reason="Y").record
         self.assertEqual(r2.prev_hash, r1.record_hash)  # linear chain
         self.assertEqual(lg.head_anchor(), (r2.seq, r2.record_hash))
 
@@ -164,9 +202,9 @@ class OverrideLedgerTests(unittest.TestCase):
         # F4: at-least-once webhooks — a re-delivery must NOT double-stamp or fork the chain.
         lg = _ledger()
         a = lg.append(delivery_id="dup", kind=OverrideKind.HUMAN_OVERRIDE,
-                      repo_full_name="r", pr=1, sha="a" * 40, verdict="FAIL", reason="X")
+                      repo_full_name="r", pr=1, sha="a" * 40, verdict="fail", reason="X")
         b = lg.append(delivery_id="dup", kind=OverrideKind.HUMAN_OVERRIDE,
-                      repo_full_name="r", pr=1, sha="a" * 40, verdict="FAIL", reason="X")
+                      repo_full_name="r", pr=1, sha="a" * 40, verdict="fail", reason="X")
         self.assertTrue(a.newly_appended)
         self.assertFalse(b.newly_appended)
         self.assertEqual(a.record.seq, b.record.seq)
@@ -175,9 +213,9 @@ class OverrideLedgerTests(unittest.TestCase):
     def test_tamper_of_prior_record_is_detected(self) -> None:
         lg = _ledger()
         lg.append(delivery_id="d1", kind=OverrideKind.HUMAN_OVERRIDE, repo_full_name="r",
-                  pr=1, sha="a" * 40, verdict="FAIL", reason="EGRESS_ONE")
+                  pr=1, sha="a" * 40, verdict="fail", reason="EGRESS_ONE")
         lg.append(delivery_id="d2", kind=OverrideKind.HUMAN_OVERRIDE, repo_full_name="r",
-                  pr=2, sha="b" * 40, verdict="FAIL", reason="EGRESS_ONE")
+                  pr=2, sha="b" * 40, verdict="fail", reason="EGRESS_ONE")
         self.assertTrue(lg.verify_chain())
         # an attacker edits row 1's verdict FAIL->PASS to hide the override, in place.
         conn = lg._conn()  # type: ignore[attr-defined]
@@ -190,17 +228,17 @@ class OverrideLedgerTests(unittest.TestCase):
 class CaptureOverrideTests(unittest.TestCase):
     def test_fail_merge_appends_human_override_with_fields(self) -> None:
         lg = _ledger()
-        rows = [_row("done", "FAIL", "EGRESS_ONE")]
+        rows = [_row("done", "fail", "EGRESS_ONE")]
         rec = capture_override(_event(), lambda _sha: rows, lg, policy_version="v1")
         assert rec is not None
         self.assertIs(rec.kind, OverrideKind.HUMAN_OVERRIDE)
-        self.assertEqual((rec.verdict, rec.reason, rec.pr, rec.merged_by), ("FAIL", "EGRESS_ONE", 7, "admin-alice"))
+        self.assertEqual((rec.verdict, rec.reason, rec.pr, rec.merged_by), ("fail", "EGRESS_ONE", 7, "admin-alice"))
         self.assertEqual(rec.policy_version, "v1")  # capture-time metadata, carried
         self.assertEqual(lg.count(), 1)
 
     def test_pass_merge_records_nothing(self) -> None:
         lg = _ledger()
-        rec = capture_override(_event(), lambda _sha: [_row("done", "PASS")], lg)
+        rec = capture_override(_event(), lambda _sha: [_row("done", "pass")], lg)
         self.assertIsNone(rec)  # D-Q1: clean merge is silent
         self.assertEqual(lg.count(), 0)
 
@@ -219,14 +257,14 @@ class CaptureOverrideTests(unittest.TestCase):
 
         def lookup(sha: str) -> list[VerdictRow]:
             calls.append(sha)
-            return [_row("done", "FAIL", "EGRESS_ONE")]
+            return [_row("done", "fail", "EGRESS_ONE")]
 
         capture_override(_event(sha="c" * 40), lookup, lg)
         self.assertEqual(calls, ["c" * 40])  # exactly one store read, keyed by the merged SHA
 
     def test_capture_is_idempotent_across_redelivery(self) -> None:
         lg = _ledger()
-        rows = [_row("done", "FAIL", "EGRESS_ONE")]
+        rows = [_row("done", "fail", "EGRESS_ONE")]
         capture_override(_event(delivery="dup"), lambda _s: rows, lg)
         capture_override(_event(delivery="dup"), lambda _s: rows, lg)
         self.assertEqual(lg.count(), 1)
@@ -239,7 +277,7 @@ class CaptureOverrideTests(unittest.TestCase):
                 raise RuntimeError("ledger db locked")
 
         with self.assertRaises(RuntimeError):
-            capture_override(_event(), lambda _s: [_row("done", "FAIL", "X")], _ThrowingLedger())  # type: ignore[arg-type]
+            capture_override(_event(), lambda _s: [_row("done", "fail", "X")], _ThrowingLedger())  # type: ignore[arg-type]
 
 
 # ---- truthful capture: the auditor-facing rendering --------------------------
@@ -247,13 +285,13 @@ class CaptureOverrideTests(unittest.TestCase):
 class RenderLegibilityTests(unittest.TestCase):
     def test_human_override_line_does_not_claim_required_bypass(self) -> None:
         lg = _ledger()
-        rec = capture_override(_event(), lambda _s: [_row("done", "FAIL", "EGRESS_ONE")], lg)
+        rec = capture_override(_event(), lambda _s: [_row("done", "fail", "EGRESS_ONE")], lg)
         assert rec is not None
         line = render_ledger_line(rec)
         # the headline done-test: the record must NOT imply a REQUIRED check was bypassed —
         # the gate never had the administration scope to know that.
         self.assertNotIn("required", line.lower())
-        self.assertIn("gate verdict was FAIL", line)
+        self.assertIn("gate verdict was fail", line)  # the persisted WIRE value (VerdictType.value)
         self.assertIn("did not approve", line)
 
     def test_unverifiable_line_states_no_backing_verdict(self) -> None:

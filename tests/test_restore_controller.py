@@ -151,14 +151,14 @@ class RestoreControllerTests(unittest.TestCase):
         h0 = c.set_head("X")
         s = _policy_store_enabled(h0)
         # enabled + head current -> enforcing.
-        self.assertIs(resolve_disposition("p1", expected_detector_identity=_DET, store=s,
+        self.assertIs(resolve_disposition("p1", store=s,
                                           snapshot=None, snapshot_key=b"k", now=1.0,
                                           oracle_head_for=c.set_head).disposition,
                       Disposition.RUN_ENFORCING)
         # a security engineer appends a new known-bad -> set_head moves -> live UNATTESTABLE (blocking).
         c.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_appr("g1", "g2", op="drift"), fixture_id="b2",
                  set_id="X", label=FixtureLabel.KNOWN_BAD, payload=b"bad2")
-        self.assertIs(resolve_disposition("p1", expected_detector_identity=_DET, store=s,
+        self.assertIs(resolve_disposition("p1", store=s,
                                           snapshot=None, snapshot_key=b"k", now=1.0,
                                           oracle_head_for=c.set_head).disposition,
                       Disposition.BLOCK_ACTION_REQUIRED)
@@ -170,7 +170,7 @@ class RestoreControllerTests(unittest.TestCase):
         self.assertIs(outcome.result, RestoreResult.RESTORED)
         self.assertIs(s.current_state("p1"), PolicyState.ENABLED)   # tier NEVER changed
         # live enforcement RESUMES — the evidence now matches the current head.
-        self.assertIs(resolve_disposition("p1", expected_detector_identity=_DET, store=s,
+        self.assertIs(resolve_disposition("p1", store=s,
                                           snapshot=None, snapshot_key=b"k", now=1.0,
                                           oracle_head_for=c.set_head).disposition,
                       Disposition.RUN_ENFORCING)
@@ -188,7 +188,7 @@ class RestoreControllerTests(unittest.TestCase):
         self.assertIs(outcome.result, RestoreResult.REFUSED_NOT_CLEAN_PASS)
         self.assertEqual(s.policy_head("p1"), head_before)  # NO record appended — meter didn't move tier
         # still blocking (transiently UNATTESTABLE).
-        self.assertIs(resolve_disposition("p1", expected_detector_identity=_DET, store=s,
+        self.assertIs(resolve_disposition("p1", store=s,
                                           snapshot=None, snapshot_key=b"k", now=1.0,
                                           oracle_head_for=c.set_head).disposition,
                       Disposition.BLOCK_ACTION_REQUIRED)

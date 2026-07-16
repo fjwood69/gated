@@ -32,29 +32,26 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Protocol
 
-from core import Reason, Verdict, VerdictType
-
-from .checkrun import verdict_to_conclusion
+from .job_result import InfraFailureReason, InfrastructureFailure, JobResult, account
 from .queue import GatingEvent
 from .store import GatingStore
 
 _log = logging.getLogger("gated.gate.lifecycle")
 
-# Engine/telemetry fault (job raised, or watchdog forced) -> a blocking ERROR verdict.
-ERROR_VERDICT = Verdict(VerdictType.ERROR, Reason.OBSERVATION_INCOMPLETE)
-
-# The check that RAN (any verdict) is DB-terminal 'done'; an infra fault / watchdog
-# force is DB-terminal 'error'. Both post a completed Check Run (the conclusion
-# difference is the verdict->conclusion mapping in checkrun.py).
-JobRunner = Callable[[GatingEvent], Verdict]     # fetch+extract+build+run engine (injected)
-CheckUpdater = Callable[[GatingEvent, Verdict], None]  # post the terminal Check Run (injected)
+# CP2 S5: the job runner returns a TYPED ``JobResult`` (never a bare Verdict). ``account`` maps it to the
+# HONEST persistence + publication fields; the updater publishes from the typed result. A DB-terminal 'done'
+# row is an admitted run / admission refusal / governance non-run; a DB-terminal 'error' row is an
+# infrastructure fault (``InfrastructureFailure``) — a worker exception, an unaccounted return, or a
+# watchdog force. Both post one completed Check Run (the conclusion is ``account(result).conclusion``).
+JobRunner = Callable[[GatingEvent], JobResult]     # fetch+extract+build+run engine+admit (injected)
+CheckUpdater = Callable[[GatingEvent, JobResult], None]  # post the terminal Check Run from the typed result
 
 
 class Transition(Enum):
     CLAIMED = "claimed"
-    COMPLETED = "completed"        # ran to a verdict, posted
-    ERRORED = "errored"           # job raised -> ERROR verdict, posted
-    WATCHDOG_FORCED = "watchdog_forced"  # stuck job force-ERRORed
+    COMPLETED = "completed"        # a 'done' row (admitted run / admission refusal / non-run), posted
+    ERRORED = "errored"           # an 'error' row (infra fault: worker exception / unaccounted / watchdog), posted
+    WATCHDOG_FORCED = "watchdog_forced"  # stuck job force-completed to a blocking infra error
     POST_SKIPPED = "post_skipped"  # lost the finalize race -> did NOT post (post-once)
 
 
@@ -112,31 +109,42 @@ class Executor:
 
     def process_claimed(self, event: GatingEvent) -> None:
         """Run one ALREADY-CLAIMED (status=processing) delivery to a terminal, POST-ONCE
-        Check Run update. Safe to call from any worker thread."""
+        Check Run update. Safe to call from any worker thread.
+
+        Two DISTINCT infra faults, NOT collapsed (board C2): a worker that RAISES is a ``WORKER_FAULT``;
+        a worker that RETURNS a non-``JobResult`` (so ``account`` rejects it) is an ``UNACCOUNTED_RESULT``.
+        ``account`` sits OUTSIDE the job-runner ``try`` so a bad-return is classified distinctly from a
+        raise, and BOTH fail closed (a blocking ``error`` row) rather than crashing the poll loop."""
         self._emit(event, Transition.CLAIMED, event.head_sha)
+        result: JobResult
         try:
-            verdict = self._job_runner(event)
-            terminal, transition = "done", Transition.COMPLETED
-        except Exception as exc:  # infra/engine fault -> ERROR, never a hang
-            verdict = ERROR_VERDICT
-            terminal, transition = "error", Transition.ERRORED
+            result = self._job_runner(event)
+        except Exception as exc:  # a worker exception -> WORKER_FAULT (blocking error), never a hang
+            result = InfrastructureFailure(InfraFailureReason.WORKER_FAULT, detail=repr(exc))
             _log.warning("gate job raised for %s: %r", event.delivery_id, exc)
+        try:
+            outcome = account(result)
+        except TypeError as exc:  # a non-JobResult RETURN (not a raise) — distinct from WORKER_FAULT
+            _log.error("gate job returned a non-JobResult for %s: %r", event.delivery_id, exc)
+            result = InfrastructureFailure(InfraFailureReason.UNACCOUNTED_RESULT, detail=repr(exc))
+            outcome = account(result)
 
         won = self._store.finalize(
             event.delivery_id,
-            terminal,
-            verdict=verdict.status.value,
-            reason=verdict.reason.value,
+            outcome.status,
+            verdict=(outcome.verdict.status.value if outcome.verdict is not None else None),
+            reason=outcome.reason,
+            gate_outcome=(outcome.gate_outcome.value if outcome.gate_outcome is not None else None),
         )
         if not won:
             # the watchdog (or another worker) already finalized -> do NOT double-post
             self._emit(event, Transition.POST_SKIPPED, "lost finalize race")
             return
-        self._updater(event, verdict)
-        # record the ACTUAL posted conclusion as an audit FACT (not merely derivable):
-        # verdict.reason + the conclusion GitHub was told, for the compliance trail.
-        conclusion = verdict_to_conclusion(verdict.status)
-        self._emit(event, transition, f"{verdict.reason.value} -> {conclusion.value}")
+        self._updater(event, result)
+        # record the ACTUAL posted conclusion as an audit FACT: the outcome's stable reason token + the
+        # conclusion GitHub was told. A 'done' row COMPLETED (ran/refused/non-run); an 'error' row ERRORED (infra).
+        transition = Transition.COMPLETED if outcome.status == "done" else Transition.ERRORED
+        self._emit(event, transition, f"{outcome.reason} -> {outcome.conclusion.value}")
 
     def drain(self) -> int:
         """Claim + process every currently-claimable delivery across the bounded pool.
@@ -177,15 +185,21 @@ class Watchdog:
         self._lifecycle = lifecycle if lifecycle is not None else LoggingLifecycleSink()
 
     def sweep_once(self) -> int:
-        """Force-ERROR every stale processing delivery we win the finalize for. Returns
-        the number forced."""
+        """Force every stale processing delivery we win the finalize for to a blocking infra ERROR.
+        Returns the number forced. A wedged worker force-completed by the watchdog is an
+        ``InfrastructureFailure(WATCHDOG_TIMEOUT)`` — a blocking 'error' row (verdict None, no gate
+        outcome), published via the same typed updater as every other outcome (POST-ONCE)."""
         forced = 0
         for event in self._store.sweep_stale(self._timeout):
+            result: JobResult = InfrastructureFailure(
+                InfraFailureReason.WATCHDOG_TIMEOUT, detail="stale processing past the watchdog deadline")
+            outcome = account(result)
             won = self._store.finalize(
                 event.delivery_id,
-                "error",
-                verdict=VerdictType.ERROR.value,
-                reason="watchdog_timeout",
+                outcome.status,
+                verdict=None,
+                reason=outcome.reason,
+                gate_outcome=None,
             )
             if not won:
                 # the worker completed between the sweep and the finalize -> skip
@@ -193,7 +207,7 @@ class Watchdog:
                     LifecycleEvent(event.delivery_id, Transition.POST_SKIPPED, "worker won")
                 )
                 continue
-            self._updater(event, ERROR_VERDICT)
+            self._updater(event, result)
             self._lifecycle.record(
                 LifecycleEvent(event.delivery_id, Transition.WATCHDOG_FORCED, "stale timeout")
             )

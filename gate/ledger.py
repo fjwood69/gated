@@ -93,18 +93,25 @@ class MergeOutcome:
     sub_reason: UnverifiableReason | None = None
 
 
-_KNOWN_VERDICTS = frozenset({"PASS", "FAIL", "ERROR"})
+# The PERSISTED WIRE verdict values (VerdictType.value == "pass"/"fail"/"error"): the executor finalises
+# ``verdict.status.value``, so the store — and therefore this classifier's input — speaks lowercase. These
+# are the stable wire tokens, NOT the enum member names; an UPPERCASE "PASS" is an UNKNOWN verdict here (there
+# is no documented historical uppercase wire format), so it classifies INDETERMINATE, never allowing/blocking.
+_PASS_WIRE = "pass"
+_KNOWN_VERDICTS = frozenset({"pass", "fail", "error"})
 
 
 def _row_class(row: VerdictRow) -> str:
     """CP2 closure 1: classify ONE ``done`` row as ``allowing`` / ``blocking`` / ``indeterminate`` by
     validating the COMPLETE (verdict, gate_outcome) PAIR — a contradictory or unknown pair is INDETERMINATE,
-    never silently trusted. The ONLY coherent combinations:
-      - legacy (gate_outcome=None) + a KNOWN verdict  -> allowing (PASS) / blocking (FAIL|ERROR);
-      - RUN_VERDICT + a KNOWN verdict                 -> allowing (PASS) / blocking (FAIL|ERROR);
+    never silently trusted. The ``verdict`` is the PERSISTED WIRE value (lowercase ``pass``/``fail``/``error``
+    == VerdictType.value); an uppercase or otherwise-unknown string is INDETERMINATE. The ONLY coherent
+    combinations:
+      - legacy (gate_outcome=None) + a KNOWN verdict  -> allowing (pass) / blocking (fail|error);
+      - RUN_VERDICT + a KNOWN verdict                 -> allowing (pass) / blocking (fail|error);
       - BLOCK_GATE + no verdict                       -> blocking (a blocking non-run merged past);
       - NEUTRAL_GATE + no verdict                     -> allowing.
-    Everything else — a PASS paired with block_gate, a verdict paired with a gate, RUN_VERDICT with no
+    Everything else — a pass paired with block_gate, a verdict paired with a gate, RUN_VERDICT with no
     verdict, or an UNKNOWN verdict string — is INDETERMINATE (an unknown verdict is NOT auto-blocking)."""
     v, g = row.verdict, row.gate_outcome
     if v is None:
@@ -116,28 +123,32 @@ def _row_class(row: VerdictRow) -> str:
     if v not in _KNOWN_VERDICTS:
         return "indeterminate"                 # an unknown verdict string is never trusted as blocking
     if g is None or g == GateOutcome.RUN_VERDICT.value:
-        return "allowing" if v == "PASS" else "blocking"
+        return "allowing" if v == _PASS_WIRE else "blocking"
     return "indeterminate"                     # a known verdict paired with BLOCK/NEUTRAL gate — contradictory
 
 
 def classify_merge(rows: Sequence[VerdictRow]) -> MergeOutcome:
     """PURE: map the 2.3-store rows for a merged SHA to an audit outcome. No I/O.
 
-    Precedence (audit-conservative, CP2 closure 1 — classify the GATE OUTCOME, not just the engine verdict):
+    Precedence (audit-conservative, CP2 closure 1 + S5 C5 — classify the GATE OUTCOME, not just the engine
+    verdict; and an infra fault can never DISAPPEAR behind an allowing done row):
       1. any delivery still ``processing`` -> UNVERIFIABLE/EVALUATION_IN_FLIGHT (F2 staleness).
       2. ``done`` rows present, each classed allowing / blocking / indeterminate from verdict + gate outcome:
            - any INDETERMINATE (a done row with neither a verdict nor a known gate outcome, e.g. a historical
              row) -> UNVERIFIABLE/INDETERMINATE_GATE (never a clean success);
-           - mixed allowing + blocking     -> UNVERIFIABLE/AMBIGUOUS;
-           - blocking-only                 -> HUMAN_OVERRIDE (latest blocking row; a blocking NON-RUN carries
-             verdict=None + its stable gate-outcome reason, rendered "gate outcome was ...");
-           - allowing-only                 -> NO_OVERRIDE (record nothing, D-Q1).
+           - mixed allowing + blocking      -> UNVERIFIABLE/AMBIGUOUS;
+           - any blocking (WINS over a coexisting error) -> HUMAN_OVERRIDE (latest blocking row; a blocking
+             NON-RUN carries verdict=None + its stable gate-outcome reason, rendered "gate outcome was ...");
+           - allowing-only + any error row  -> UNVERIFIABLE/INFRA_ERROR (C5: an infra fault that blocked and
+             was merged past must not vanish behind a passing/neutral row);
+           - allowing-only (no error)       -> NO_OVERRIDE (record nothing, D-Q1).
       3. no ``done`` rows but ``error`` rows -> UNVERIFIABLE/INFRA_ERROR (F3: infra, not verdict).
       4. no rows at all                      -> UNVERIFIABLE/NEVER_EVALUATED.
     """
     if any(r.status == "processing" for r in rows):
         return MergeOutcome(OutcomeKind.UNVERIFIABLE, sub_reason=UnverifiableReason.EVALUATION_IN_FLIGHT)
 
+    has_error = any(r.status == "error" for r in rows)
     done = [r for r in rows if r.status == "done"]
     if done:
         classes = {r: _row_class(r) for r in done}
@@ -148,13 +159,21 @@ def classify_merge(rows: Sequence[VerdictRow]) -> MergeOutcome:
         if allowing and blocking:
             return MergeOutcome(OutcomeKind.UNVERIFIABLE, sub_reason=UnverifiableReason.AMBIGUOUS)
         if blocking:
-            # the latest blocking row: a verdict-bearing block carries its verdict/reason; a blocking non-run
-            # carries verdict=None + its stable gate-outcome reason (no hash-bound ledger field — reuse fields).
+            # a definite BLOCKING done outcome WINS even if an error row coexists (a merged-past blocking
+            # verdict/gate is the salient, most-specific fact). The latest blocking row: a verdict-bearing
+            # block carries its verdict/reason; a blocking non-run carries verdict=None + its stable
+            # gate-outcome reason (no hash-bound ledger field — reuse fields).
             latest = max(blocking, key=lambda r: r.updated_at)
             return MergeOutcome(OutcomeKind.HUMAN_OVERRIDE, verdict=latest.verdict, reason=latest.reason)
+        # allowing-only among the done rows: a clean PASS/neutral alone is NO_OVERRIDE — BUT an error row for
+        # the SAME sha must NOT disappear behind it (board C5, "infra cannot disappear"). An infra fault that
+        # blocked (action_required) and was merged past is an audit fact; classify_merge returns from this
+        # `done` branch before the tail error check, so surface it HERE as INFRA_ERROR.
+        if has_error:
+            return MergeOutcome(OutcomeKind.UNVERIFIABLE, sub_reason=UnverifiableReason.INFRA_ERROR)
         return MergeOutcome(OutcomeKind.NO_OVERRIDE)
 
-    if any(r.status == "error" for r in rows):
+    if has_error:
         return MergeOutcome(OutcomeKind.UNVERIFIABLE, sub_reason=UnverifiableReason.INFRA_ERROR)
 
     return MergeOutcome(OutcomeKind.UNVERIFIABLE, sub_reason=UnverifiableReason.NEVER_EVALUATED)
