@@ -112,6 +112,28 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(self.store.enqueue(_event("d1")))  # completed job, ignore
         self.assertEqual(self.store.status_of("d1"), "done")
 
+    def test_finalize_persists_gate_outcome_round_trips_through_verdicts_for_sha(self) -> None:
+        # CP2 closure 1: the gate-outcome discriminator persists INDEPENDENTLY of the verdict + is exposed to
+        # the classifier. A blocking non-run carries gate_outcome='block_gate' with NO verdict.
+        sha = "e" * 40
+        self.store.enqueue(_event("d1", sha=sha))
+        self.store.claim_next()
+        self.store.finalize("d1", "done", gate_outcome="block_gate", reason="block_action_required")
+        rows = self.store.verdicts_for_sha(sha)
+        self.assertEqual(len(rows), 1)
+        status, verdict, reason, _updated, gate_outcome = rows[0]
+        self.assertEqual(status, "done")
+        self.assertIsNone(verdict)                       # no fabricated verdict
+        self.assertEqual(gate_outcome, "block_gate")
+        self.assertEqual(reason, "block_action_required")
+
+    def test_verdicts_for_sha_gate_outcome_defaults_none(self) -> None:
+        sha = "1" * 40
+        self.store.enqueue(_event("d2", sha=sha))
+        self.store.claim_next()
+        self.store.finalize("d2", "done", verdict="PASS", reason="UNANIMOUS_PASS")  # no gate_outcome
+        self.assertIsNone(self.store.verdicts_for_sha(sha)[0][4])
+
     def test_same_sha_claimable_after_prior_errored(self) -> None:
         # a NEW delivery for a SHA whose prior delivery ERRORED (not processing) must be
         # claimable — the same-SHA guard blocks only on 'processing', never on error/done.

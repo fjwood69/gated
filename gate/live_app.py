@@ -205,8 +205,8 @@ def build(
 
     def verdict_lookup(sha: str) -> list[VerdictRow]:
         return [
-            VerdictRow(status=s, verdict=v, reason=r, updated_at=u)
-            for (s, v, r, u) in store.verdicts_for_sha(sha)
+            VerdictRow(status=s, verdict=v, reason=r, updated_at=u, gate_outcome=g)
+            for (s, v, r, u, g) in store.verdicts_for_sha(sha)
         ]
 
     def drain_overrides() -> int:

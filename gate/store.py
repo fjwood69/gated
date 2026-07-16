@@ -76,6 +76,11 @@ class GatingStore:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(gating)")}
         if "head_repo_full_name" not in cols:
             conn.execute("ALTER TABLE gating ADD COLUMN head_repo_full_name TEXT")
+        # CP2 closure 1: the persisted GATE OUTCOME discriminator (independent of the verdict). Nullable +
+        # idempotent — a historical row reads NULL and the classifier treats a done+no-verdict+no-gate row as
+        # INDETERMINATE (never clean), so old rows stay classifiable without a backfill.
+        if "gate_outcome" not in cols:
+            conn.execute("ALTER TABLE gating ADD COLUMN gate_outcome TEXT")
         conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
@@ -175,16 +180,21 @@ class GatingStore:
         check_run_id: str | None = None,
         verdict: str | None = None,
         reason: str | None = None,
+        gate_outcome: str | None = None,
     ) -> bool:
         """POST-ONCE guard: move processing -> terminal, but ONLY if still processing.
         Returns True iff this caller won the finalize (and may therefore post the one
-        terminal Check Run update); False means another worker/watchdog already did."""
+        terminal Check Run update); False means another worker/watchdog already did.
+
+        ``gate_outcome`` (CP2 closure 1) persists the closed gate-outcome discriminator INDEPENDENTLY of the
+        engine ``verdict``, so the override classifier can tell a merge-past-a-blocking-non-run from a clean
+        merge without a fabricated verdict."""
         if status not in ("done", "error"):
             raise ValueError(f"terminal status must be done|error, got {status!r}")
         cur = self._conn().execute(
-            "UPDATE gating SET status=?, check_run_id=?, verdict=?, reason=?, updated_at=? "
+            "UPDATE gating SET status=?, check_run_id=?, verdict=?, reason=?, gate_outcome=?, updated_at=? "
             "WHERE delivery_id=? AND status='processing'",
-            (status, check_run_id, verdict, reason, self._clock(), delivery_id),
+            (status, check_run_id, verdict, reason, gate_outcome, self._clock(), delivery_id),
         )
         return cur.rowcount == 1
 
@@ -203,17 +213,20 @@ class GatingStore:
         ).fetchone()
         return None if row is None else str(row["status"])
 
-    def verdicts_for_sha(self, head_sha: str) -> list[tuple[str, str | None, str | None, float]]:
-        """C3 read-only: ALL gating rows for a SHA as ``(status, verdict, reason,
-        updated_at)`` — the raw input to the override-ledger classifier. NOT a single-row
-        lookup: multiple deliveries (opened+reopened) can share a SHA, and a stale ``done``
-        can coexist with a newer ``processing`` — the classifier resolves precedence. This
-        read NEVER triggers a check-run; it only inspects recorded state (NFR6)."""
+    def verdicts_for_sha(
+        self, head_sha: str
+    ) -> list[tuple[str, str | None, str | None, float, str | None]]:
+        """C3 read-only: ALL gating rows for a SHA as ``(status, verdict, reason, updated_at, gate_outcome)``
+        — the raw input to the override-ledger classifier. NOT a single-row lookup: multiple deliveries
+        (opened+reopened) can share a SHA, and a stale ``done`` can coexist with a newer ``processing`` — the
+        classifier resolves precedence. ``gate_outcome`` (CP2 closure 1) lets it classify a blocking non-run
+        merged-past without a fabricated verdict. This read NEVER triggers a check-run (NFR6)."""
         rows = self._conn().execute(
-            "SELECT status, verdict, reason, updated_at FROM gating WHERE head_sha=?",
+            "SELECT status, verdict, reason, updated_at, gate_outcome FROM gating WHERE head_sha=?",
             (head_sha,),
         ).fetchall()
-        return [(r["status"], r["verdict"], r["reason"], float(r["updated_at"])) for r in rows]
+        return [(r["status"], r["verdict"], r["reason"], float(r["updated_at"]), r["gate_outcome"])
+                for r in rows]
 
 
 class StoreBackedGatingSink:
