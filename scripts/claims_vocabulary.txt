@@ -20,3 +20,16 @@ guarantees execution
 guaranteed safe
 fully-bound
 genuinely blind
+# CP2 S7 — narrow PROOF / PLAN-CONTEXT overclaim phrases. The run-admission proof is a trusted in-process
+# call-path convention, and AuthorizedRunPlan is API cohesion — NEITHER is an unforgeable boundary. These
+# ASSERTIVE phrases claim otherwise and are collision-free (they appear nowhere legitimately). Deliberately
+# NOT the bare words "unforgeable" / "impossible" / "never" / "guarantee" / "cryptographic": those have
+# legitimate NEGATED disclaimers ("NOT an unforgeable boundary"), real asymmetric-crypto uses ("holds only
+# the public key, cannot forge"), enforced-invariant / by-construction uses, and honest fundamental-limit
+# claims — banning the bare word would force a growing suppressions file, the theatre this guard avoids.
+unconstructible
+provably unforgeable
+unforgeable capability
+unforgeable-by-convention
+sealed token
+sealed-token

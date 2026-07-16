@@ -141,7 +141,9 @@ class _ReAttestGrant:
 
     def __init__(self, mint: object) -> None:
         if mint is not _REATTEST_MINT:
-            raise TypeError("_ReAttestGrant cannot be constructed outside gate.policy_store")
+            raise TypeError(
+                "_ReAttestGrant requires the module's internal mint sentinel; use the intended path "
+                "(the reattest CAS mints it)")
 
 
 def _mint_reattest_grant() -> _ReAttestGrant:

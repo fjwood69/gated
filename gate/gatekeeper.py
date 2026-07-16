@@ -83,7 +83,9 @@ class GateDecision:
     INVARIANT (CP2, enforced in ``__post_init__``): ``disposition is RUN_ENFORCING`` iff ``plan is not
     None``. Only an enforcing decision carries a plan (minted from the SAME governance snapshot that decided
     to enforce, so mint-coherence holds by construction); every non-run disposition carries ``None``. The
-    dispatcher therefore never has to synthesise a plan, and an unplanned enforce is impossible."""
+    dispatcher therefore never has to synthesise a plan. (An unplanned enforce cannot arise from a
+    WELL-FORMED ``GateDecision``; a forged decision-shaped object is caught by the dispatch-time recheck in
+    ``make_gated_job_runner`` — the first plan consumer — not by this constructor.)"""
 
     disposition: Disposition
     state: PolicyState | None

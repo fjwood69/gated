@@ -85,8 +85,9 @@ class ResolvedDetector:
 BundleResolver = Callable[[str], ResolvedDetector]
 
 # 3.5-close #1.6: an INJECTED guard that raises if the RETURNED sandbox is not an audited backend.
-# The engine calls it (dependency inversion) but cannot mint the trusted-backend token — the gate holds
-# ``gate.backends.trusted_backend_guard``; engine ⊥ gate preserved (a plain Callable over core.Sandbox).
+# The engine calls it (dependency inversion) but does NOT construct the trusted-backend token — engine ⊥ gate
+# means the engine never imports the gate's token machinery; the gate mints and holds
+# ``gate.backends.trusted_backend_guard`` (a plain Callable over core.Sandbox).
 BackendGuard = Callable[[Sandbox], None]
 
 

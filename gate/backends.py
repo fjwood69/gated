@@ -8,16 +8,19 @@ module confines security-relevant calibration to the AUDITED backends (``OCISand
 external proxy + escape probe).
 
 HOW — a construction guard under the trusted-gate model, NOT authorization. Audited backends are built
-through ``trusted_sandbox_factory`` and stamped with a capability token whose constructor is
-module-private, so ONLY this module can mint it; ``trusted_backend_guard`` verifies the RETURNED sandbox
-object bears that exact token by IDENTITY (not a forgeable type name). A caller outside gate cannot mint
-the token, so it cannot forge a trusted backend — and because the guard checks the object that was
-actually RETURNED, a factory that accepts the token but returns a different object is still refused
-(board amendment).
+through ``trusted_sandbox_factory`` and stamped with a capability token whose constructor requires the
+module's internal mint sentinel; ``trusted_backend_guard`` verifies the RETURNED sandbox object bears that
+exact token by IDENTITY (not a forgeable type name). The sentinel is a TRUSTED-CODE convention — same-address
+code CAN read the module-private objects, so this routes construction through the INTENDED API; it is NOT an
+unforgeable boundary against untrusted in-process code. And because the guard checks the object that was
+actually RETURNED, a factory that accepts the token but returns a different object is still refused (board
+amendment).
 
-ADVERSARY / TRUSTED PROCESS. A within-runtime construction guard: it stops a caller from smuggling an
-unaudited backend into calibration. It is NOT authority against a malicious deployer who can import this
-module and read the token — that requires a BUILD-TIME SIGNED MANIFEST of trusted-backend module hashes
+ADVERSARY / TRUSTED PROCESS. A within-runtime construction guard: it REJECTS an unstamped / unaudited
+sandbox object (the guard checks the RETURNED object bears the exact ticket), routing construction through
+the intended public path (``guarded_backend``) under trusted code. It is NOT authority against a malicious
+deployer who can import this module and read the sentinel — that requires a BUILD-TIME SIGNED MANIFEST of
+trusted-backend module hashes
 verified by the host / TEE (deploy-tier, the same tier as SoD / KMS; see ARCHITECTURE.md). In the
 in-process reference this is hygiene against operational error + caller smuggling, not authorization
 against a compromised gate.
@@ -41,14 +44,18 @@ _MINT = object()  # module-private mint sentinel — the token constructor refus
 
 
 class _TrustedBackendTicket:
-    """A capability token minted ONLY inside this module (its constructor refuses any key but the
-    module-private ``_MINT``). Possessing the exact instance IS the capability; it is not exported."""
+    """A capability token whose constructor requires the module's internal mint sentinel (``_MINT``).
+    Possessing the exact instance IS the capability; it is not exported. A TRUSTED-CODE convention —
+    same-address code can read ``_MINT``, so this routes construction through the intended path, it is NOT
+    an unforgeable boundary."""
 
     __slots__ = ()
 
     def __init__(self, mint: object) -> None:
         if mint is not _MINT:
-            raise TypeError("_TrustedBackendTicket cannot be constructed outside gate.backends")
+            raise TypeError(
+                "_TrustedBackendTicket requires the module's internal mint sentinel; use the intended path "
+                "(gate.backends.trusted_sandbox_factory)")
 
 
 _TICKET = _TrustedBackendTicket(_MINT)
@@ -124,7 +131,8 @@ class BackendGuardPolicy(Protocol):
     (``Callable[[Sandbox], None]``), so the engine consumes ``__call__`` as a plain callable and never
     learns this gate type (engine ⊥ gate). ``policy_digest`` is measured PROVENANCE — the calibration layer
     reads it OFF the applied object (never separately supplied), so S3 binds the digest of the guard that
-    actually ran (policy-A-applied-while-digest-B-supplied is impossible by construction)."""
+    actually ran: there is NO independent digest ARGUMENT — the digest is read from the invoked guard
+    object, so a policy-A-applied-while-digest-B-supplied split has no argument through which to enter."""
 
     policy_id: str
 

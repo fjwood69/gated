@@ -89,13 +89,15 @@ def assert_budget_fits_watchdog(
     margin: float = 1.2,
 ) -> None:
     """Fail-closed startup invariant (completeness-pass P5, refined by the multi-trial
-    reality): ``run_check`` applies the budget PER TRIAL, so the aggregate engine time is
-    ``trials × per_trial_wall_clock``. That aggregate (× a safety margin) MUST fit inside
-    the 2.3 watchdog window, else a slow multi-trial run races the watchdog's force-ERROR.
+    reality): ``run_check`` applies the budget PER TRIAL, so the MODELED aggregate engine time is
+    ``trials × per_trial_wall_clock``. That modeled aggregate (× a safety margin) MUST fit inside
+    the 2.3 watchdog window, else even the engine's own MODELED worst case would reach the watchdog.
 
-    The App MUST call this at startup and refuse to boot on violation — an ENFORCED
-    invariant, not a documented request (a race in the verdict engine must be
-    impossible-by-construction, not avoided-by-documentation)."""
+    ``live_app.build()`` invokes this at startup and REFUSES TO BOOT when the bounded timing inequality
+    (``trials × per_trial_wall_clock × margin >= watchdog_timeout``) holds — an ENFORCED startup invariant
+    (not a documented request). This enforces ordering for the MODELED aggregate trial budget plus margin
+    ONLY; the watchdog remains the fail-closed OUTER bound for artifact acquisition, sandbox setup/teardown,
+    scheduling, and other UNMODELED stalls."""
     aggregate = trials * per_trial_wall_clock
     if aggregate * margin >= watchdog_timeout:
         raise ValueError(

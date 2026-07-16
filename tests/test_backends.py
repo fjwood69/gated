@@ -2,8 +2,9 @@
 python3 -m unittest discover -s tests
 
 The guard confines security-relevant calibration to AUDITED backends (whose isolation is verified in
-code), refusing a backend that merely DECLARES HERMETIC. The token's constructor is module-private, so a
-caller cannot mint one; the guard verifies the RETURNED object bears the exact token (board amendment:
+code), refusing a backend that merely DECLARES HERMETIC. The token's constructor requires the module's
+internal mint sentinel, so a caller routes through the intended path (a trusted-code convention, not an
+unforgeable boundary); the guard verifies the RETURNED object bears the exact token (board amendment:
 a factory that returns a different object is still refused).
 """
 from __future__ import annotations
@@ -43,7 +44,8 @@ class TrustedBackendGuardTests(unittest.TestCase):
             trusted_backend_guard(_HermeticNoOp())
 
     def test_ticketless_object_cannot_forge_the_token(self) -> None:
-        # a caller cannot mint the token; stamping an arbitrary object is not identity-equal -> refused.
+        # a caller outside the intended path holds no exact token; stamping an arbitrary object is not
+        # identity-equal to the real ticket -> refused.
         sb = _HermeticNoOp()
         object.__setattr__(sb, "_gated_trusted_backend_ticket", object())  # a forged "token"
         with self.assertRaises(UntrustedBackendError):

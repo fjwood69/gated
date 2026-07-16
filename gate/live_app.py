@@ -32,6 +32,8 @@ from http.server import ThreadingHTTPServer
 from .http_server import _handler_factory  # reuse the transport handler
 from .ledger import OverrideLedger, VerdictRow, capture_override, render_ledger_line
 from .pipeline import (
+    DEFAULT_ENGINE_BUDGET,
+    assert_budget_fits_watchdog,
     assert_detector_registered,
     default_detector_registry,
     extract_to_spec,
@@ -170,6 +172,13 @@ def build(
 ) -> tuple[WebhookReceiver, Executor, Watchdog, InstallationTokenProvider, Callable[[], int]]:
     accepted_profile_digest = required_accepted_profile_digest()  # P1-3: fail boot if unset (no self-compute)
     policy_id = required_policy_id()  # CP2 S5 D1: fail boot if GATED_POLICY_ID unset
+    # S7 (dissent): WIRE the enforced startup invariant — the engine applies the budget PER TRIAL, so the
+    # aggregate (trials x per-trial x margin) MUST fit the watchdog window, else a slow multi-trial run races
+    # the watchdog's force-ERROR. Previously only tests called this, so the docstring's "the App MUST call
+    # this at startup" was a gap; the live path now enforces it and fails boot CLOSED on violation.
+    assert_budget_fits_watchdog(
+        trials=TRIALS, per_trial_wall_clock=DEFAULT_ENGINE_BUDGET.wall_clock_seconds,
+        watchdog_timeout=WATCHDOG_TIMEOUT)
     app_id = int(os.environ["GATED_APP_ID"])
     installs = frozenset(
         int(x) for x in os.environ.get("GATED_INSTALLATION_IDS", "").split(",") if x

@@ -2,8 +2,8 @@
 
 Load-bearing: the RUNTIME token cannot append (1b); as of 3.4 admitting a fixture (ADD_KNOWN_BAD /
 ADD_KNOWN_GOOD) AND deprecating one (DEPRECATE_KNOWN_BAD) require a real GovernanceApproval with two
-distinct principals — the enum is not proof of dual control, and this makes the admission gate the
-only sufficient-authority path in. DELETES are forbidden (a deprecated known-bad stays in the chain,
+distinct principals — the enum is not proof of dual control, and the DUAL APPROVAL is the authority
+(admit() is the intended path enforcing it). DELETES are forbidden (a deprecated known-bad stays in the chain,
 excluded from head); the chain is tamper-evident (reusing core.chain) and load fails CLOSED.
 """
 from __future__ import annotations

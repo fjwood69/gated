@@ -248,9 +248,10 @@ class EveryRefusalBlocksTests(unittest.TestCase):
 
 class ProofGatedConstructionTests(unittest.TestCase):
     """Construction is gated by a RESULT-BOUND proof (not a reusable grant): the metadata is DERIVED from
-    the proof (no caller-supplied fields to forge), the proof cannot be constructed outside the module, and
-    the constructor verifies proof↔run coherence + re-runs the pure structural validator. A direct
-    construction can bypass NEITHER the live checks NOR the report recompute NOR reuse a foreign proof."""
+    the proof (no caller-supplied fields to forge), the proof requires the module's internal mint sentinel
+    (a trusted-code call-path convention, NOT an unforgeable boundary), and the constructor verifies
+    proof↔run coherence + re-runs the pure structural validator. A direct construction can bypass NEITHER
+    the live checks NOR the report recompute NOR reuse a foreign proof."""
 
     def test_proof_cannot_be_constructed_without_the_mint_sentinel(self) -> None:
         # a caller cannot fabricate a proof — the constructor refuses any key but the module-private mint.

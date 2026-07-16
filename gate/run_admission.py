@@ -283,9 +283,10 @@ class _LiveAdmissionProof:
     run: a different report (same subject, different verdict) or a different plan (same policy/subject,
     different authorized set) both change the bound object and fail construction.
 
-    Its constructor refuses any key but the module-private ``_PROOF_MINT`` sentinel, so a caller outside this
-    module cannot construct one. In-process call-path convention (the structural no-bypass test asserts
-    ``_mint_live_admission_proof`` is CALLED only from ``admit_run_result``), NOT an unforgeable boundary —
+    Its constructor requires the module's internal ``_PROOF_MINT`` sentinel, so a caller must route through
+    the intended path to construct one (same-address code CAN read the sentinel). In-process call-path
+    convention (the structural no-bypass test asserts ``_mint_live_admission_proof`` is CALLED only from
+    ``admit_run_result``), NOT an unforgeable boundary —
     the load-bearing control is that ``admit_run_result`` actually ran the live reads before minting."""
 
     policy_id: str
@@ -299,8 +300,8 @@ class _LiveAdmissionProof:
     def __post_init__(self, mint: object) -> None:
         if mint is not _PROOF_MINT:
             raise RunAdmissionError(
-                "_LiveAdmissionProof cannot be constructed outside gate.run_admission "
-                "(mint it via admit_run_result's live checks)")
+                "_LiveAdmissionProof requires the module's internal mint sentinel; use the intended path "
+                "(admit_run_result's live checks mint it)")
 
 
 def _mint_live_admission_proof(

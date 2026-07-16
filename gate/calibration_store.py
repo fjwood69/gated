@@ -76,20 +76,21 @@ class ChangeOp(IntEnum):
 
 
 class AdmissionCapability:
-    """Merge-ready #1: an unforgeable-by-convention capability proving a fixture ADD is going through
-    the admission gate. ``append`` REFUSES an ADD op without it, so there is no low-level path that
-    adds a fixture while skipping the validated, dual-controlled, safe (revoke+outbox) admission — the
-    bypass is removed, not merely a safe path added alongside it. Constructed ONLY by
-    ``gate.admission.admit()`` (enforced by the structural no-bypass test); any other construction in
-    the gate tree fails that test. Tests seed via the same capability (they are trusted)."""
+    """Merge-ready #1: a TYPE MARKER + structural call-path convention that a fixture ADD is going through
+    the admission gate. It is PUBLICLY CONSTRUCTIBLE (a plain marker, no mint sentinel — same-address code
+    can instantiate it); the control is NOT that the marker is unmintable but that ``append`` REFUSES an ADD
+    op WITHOUT one AND a structural no-bypass test asserts the ONLY construction in the gate tree is
+    ``gate.admission.admit()``. So it routes fixture ADDs through the validated, dual-controlled, safe
+    (revoke+outbox) admission by INTENDED-API convention under trusted code — NOT an unforgeable boundary,
+    and NOT authority against untrusted in-process code. Tests seed via the same marker (they are trusted)."""
 
     __slots__ = ()
 
 
 # Ops that require REAL dual control — a GovernanceApproval with two distinct principals. As of 3.4
 # this is every op that admits a fixture to the oracle (both ADDs) plus the weakening DEPRECATE:
-# admitting is high-stakes (a known-bad blocks merges; a known-good masks a true positive). This is
-# what makes gate/admission.py the only sufficient-authority path in. See ``append``.
+# admitting is high-stakes (a known-bad blocks merges; a known-good masks a true positive). The AUTHORITY
+# is this dual approval; gate/admission.py is the INTENDED path that enforces it. See ``append``.
 _DUAL_APPROVAL_OPS: frozenset[ChangeOp] = frozenset(
     {ChangeOp.ADD_KNOWN_BAD, ChangeOp.ADD_KNOWN_GOOD, ChangeOp.DEPRECATE_KNOWN_BAD}
 )
@@ -196,9 +197,12 @@ class CalibrationStore:
     ) -> int:
         """Append a fixture-set change, hash-chained. PRIVILEGED. RUNTIME can never append (1b).
 
-        Merge-ready #1: the two ADD ops additionally REQUIRE an ``AdmissionCapability`` — there is no
-        low-level path that adds a fixture while skipping the admission gate's validation + safe append.
-        Only ``gate.admission.admit()`` holds the capability; a direct ADD without it is refused.
+        Merge-ready #1: the two ADD ops additionally REQUIRE an ``AdmissionCapability`` type MARKER — a
+        structural call-path convention that routes ADDs through the intended ``gate.admission.admit()``
+        path (which runs the admission gate's validation + safe append). The marker is PUBLICLY
+        constructible, so it is NOT the authority — the dual ``GovernanceApproval`` (below) is; an ADD
+        without the marker is refused, and a structural no-bypass test asserts only ``admit()`` constructs
+        it in the gate tree.
 
         3.5 job-1 (transactional outbox): when ``outbox_set_id`` is given, the fixture INSERT and a
         ``re_calibration_outbox`` row (carrying the NEW ``set_head`` computed inside the transaction)
@@ -210,16 +214,16 @@ class CalibrationStore:
         Authority model (3.4): admitting a fixture to the ORACLE is high-stakes governance, so the
         ADD ops AND the weakening DEPRECATE op all require a real ``approval`` — ``GovernanceApproval``
         with TWO DISTINCT authenticated principals (an enum a single caller names is not proof of
-        dual control). This makes the ADMISSION GATE the only sufficient-authority path into the
-        fixture store: a known-bad can block merges, a known-good can mask a true positive — both
-        earn dual control. SUPERSEDE (a correction of an existing known-good) keeps the ENUM for now.
+        dual control). The DUAL APPROVAL is the AUTHORITY: a known-bad can block merges, a known-good can
+        mask a true positive — both earn dual control, and ``admit()`` is the intended path that enforces
+        it. SUPERSEDE (a correction of an existing known-good) keeps the ENUM for now.
         Principals are recorded in ``added_by`` (schema/digest unchanged). No update/delete method."""
         if op in (ChangeOp.ADD_KNOWN_BAD, ChangeOp.ADD_KNOWN_GOOD) and not isinstance(
             admission, AdmissionCapability
         ):
             raise PrivilegedOperationError(
-                f"{op.name} may only be appended through the admission gate (gate.admission.admit) — "
-                "a fixture cannot be added on the low-level path, skipping validation + safe append"
+                f"{op.name} requires an AdmissionCapability marker — route it through the intended path "
+                "(gate.admission.admit, which enforces dual GovernanceApproval + validation + safe append)"
             )
         if op in _DUAL_APPROVAL_OPS:
             if approval is None or not approval.meets(2):

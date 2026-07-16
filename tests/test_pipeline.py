@@ -400,6 +400,18 @@ class DetectorRegistryEnforcementTests(unittest.TestCase):
             live_app.require_distinct_db_paths(q, p, p)   # policy == calibration
         live_app.require_distinct_db_paths(q, p, c)       # all distinct: does not raise
 
+    def test_boot_refuses_when_engine_budget_races_the_watchdog(self) -> None:
+        # S7 (dissent): assert_budget_fits_watchdog is now WIRED into build() — the enforced startup
+        # invariant. A per-trial budget x trials x margin that would race the watchdog fails boot CLOSED
+        # (previously only tests called it, so the "App MUST call this at startup" claim was a real gap).
+        import importlib
+        env = {"GATED_ACCEPTED_PROFILE_DIGEST": "pd-xyz", "GATED_POLICY_ID": "p1", "GATED_TRIALS": "8"}
+        with mock.patch.dict("os.environ", env, clear=False):
+            live_app = importlib.reload(importlib.import_module("gate.live_app"))
+            with self.assertRaises(ValueError):   # 8 x 120 x 1.2 = 1152 >= 900s watchdog -> boot refused
+                live_app.build(Path(tempfile.mkdtemp(prefix="mv-boot-")) / "g.db")
+        importlib.reload(importlib.import_module("gate.live_app"))  # restore module-level defaults
+
 
 def _fixture_tarball(path: Path, script: bytes) -> None:
     with tarfile.open(path, "w") as tar:

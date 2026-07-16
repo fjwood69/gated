@@ -6,7 +6,10 @@ stays total and enforced (a future commit reintroducing overclaim language fails
 
 Design (board-ratified scoped form, not the full claims-as-data registry):
   * scans PYTHON STRING LITERALS (docstrings + string constants) via the ``ast`` module — so COMMENTS
-    are EXEMPT, which dodges the false-positive-on-explanatory-comments problem a naive grep has;
+    are EXEMPT, which dodges the false-positive-on-explanatory-comments problem a naive grep has. NOTE
+    (CP2 S7): a COMMENT that asserts a security PROPERTY is held to the SAME honesty standard as a
+    docstring — the linter cannot scan comments without a high false-positive rate, so comments are a
+    MANUAL-review surface, not exempt-from-the-standard;
   * plus designated Markdown docs (line scan);
   * against a NARROW banned vocabulary of unambiguous overclaim PHRASES (absolute-safety /
     execution-assurance / guarantee / un-bypassable / fully-bound) — NOT common single words like
