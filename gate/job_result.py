@@ -97,14 +97,34 @@ class PersistedOutcome:
     conclusion: CheckConclusion
 
     def __post_init__(self) -> None:
+        # EXHAUSTIVE coherence (board): each freshly-minted outcome carries a COHERENT (status, gate_outcome,
+        # verdict, conclusion) tuple — a done row carries EXACTLY ONE GateOutcome, an error row carries none.
+        # (Only PERSISTED historical VerdictRows may lack a gate outcome; a minted PersistedOutcome never can.)
         if self.status not in ("done", "error"):
             raise ValueError(f"status must be done|error, got {self.status!r}")
-        if self.gate_outcome is GateOutcome.RUN_VERDICT and self.verdict is None:
-            raise ValueError("RUN_VERDICT requires a real verdict")
-        if self.gate_outcome in (GateOutcome.BLOCK_GATE, GateOutcome.NEUTRAL_GATE) and self.verdict is not None:
-            raise ValueError(f"{self.gate_outcome.value} must NOT carry a verdict (a non-run produced none)")
-        if self.status == "error" and (self.gate_outcome is not None or self.verdict is not None):
-            raise ValueError("an infra/error row carries NEITHER a gate outcome NOR a verdict")
+        if self.status == "error":
+            if self.gate_outcome is not None or self.verdict is not None:
+                raise ValueError("an infra/error row carries NEITHER a gate outcome NOR a verdict")
+            if self.conclusion is not CheckConclusion.ACTION_REQUIRED:
+                raise ValueError("an infra/error row must publish ACTION_REQUIRED (blocking)")
+            return
+        if self.gate_outcome is None:
+            raise ValueError("a done outcome must carry exactly one GateOutcome")
+        if self.gate_outcome is GateOutcome.RUN_VERDICT:
+            if self.verdict is None:
+                raise ValueError("RUN_VERDICT requires a real verdict")
+            if self.conclusion is not verdict_to_conclusion(self.verdict.status):
+                raise ValueError("RUN_VERDICT conclusion must match the verdict's conclusion")
+        elif self.gate_outcome is GateOutcome.BLOCK_GATE:
+            if self.verdict is not None:
+                raise ValueError("BLOCK_GATE must NOT carry a verdict (a non-run produced none)")
+            if self.conclusion is not CheckConclusion.ACTION_REQUIRED:
+                raise ValueError("BLOCK_GATE must publish ACTION_REQUIRED")
+        elif self.gate_outcome is GateOutcome.NEUTRAL_GATE:
+            if self.verdict is not None:
+                raise ValueError("NEUTRAL_GATE must NOT carry a verdict (a non-run produced none)")
+            if self.conclusion is not CheckConclusion.NEUTRAL:
+                raise ValueError("NEUTRAL_GATE must publish NEUTRAL")
 
 
 def account(result: JobResult) -> PersistedOutcome:

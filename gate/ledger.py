@@ -93,21 +93,31 @@ class MergeOutcome:
     sub_reason: UnverifiableReason | None = None
 
 
+_KNOWN_VERDICTS = frozenset({"PASS", "FAIL", "ERROR"})
+
+
 def _row_class(row: VerdictRow) -> str:
-    """CP2 closure 1: classify ONE ``done`` row as ``allowing`` / ``blocking`` / ``indeterminate`` from the
-    engine verdict AND the persisted gate outcome (independent of the verdict — a BLOCKING governance non-run
-    has NO verdict yet must still count as blocking). A ``done`` row that carries NEITHER a verdict NOR a
-    known gate outcome (a historical pre-CP2 row, or an unaccounted write) is INDETERMINATE — never silently
-    read as clean."""
-    if row.verdict == "PASS":
-        return "allowing"
-    if row.verdict is not None:            # FAIL / ERROR — a recorded non-PASS verdict
-        return "blocking"
-    if row.gate_outcome == GateOutcome.BLOCK_GATE.value:
-        return "blocking"                  # a blocking non-run gate (merge-past -> override) — no verdict
-    if row.gate_outcome == GateOutcome.NEUTRAL_GATE.value:
-        return "allowing"                  # a non-blocking neutral gate
-    return "indeterminate"                 # verdict None + gate None/unknown
+    """CP2 closure 1: classify ONE ``done`` row as ``allowing`` / ``blocking`` / ``indeterminate`` by
+    validating the COMPLETE (verdict, gate_outcome) PAIR — a contradictory or unknown pair is INDETERMINATE,
+    never silently trusted. The ONLY coherent combinations:
+      - legacy (gate_outcome=None) + a KNOWN verdict  -> allowing (PASS) / blocking (FAIL|ERROR);
+      - RUN_VERDICT + a KNOWN verdict                 -> allowing (PASS) / blocking (FAIL|ERROR);
+      - BLOCK_GATE + no verdict                       -> blocking (a blocking non-run merged past);
+      - NEUTRAL_GATE + no verdict                     -> allowing.
+    Everything else — a PASS paired with block_gate, a verdict paired with a gate, RUN_VERDICT with no
+    verdict, or an UNKNOWN verdict string — is INDETERMINATE (an unknown verdict is NOT auto-blocking)."""
+    v, g = row.verdict, row.gate_outcome
+    if v is None:
+        if g == GateOutcome.BLOCK_GATE.value:
+            return "blocking"
+        if g == GateOutcome.NEUTRAL_GATE.value:
+            return "allowing"
+        return "indeterminate"                 # None + (None | RUN_VERDICT | unknown gate) — incoherent
+    if v not in _KNOWN_VERDICTS:
+        return "indeterminate"                 # an unknown verdict string is never trusted as blocking
+    if g is None or g == GateOutcome.RUN_VERDICT.value:
+        return "allowing" if v == "PASS" else "blocking"
+    return "indeterminate"                     # a known verdict paired with BLOCK/NEUTRAL gate — contradictory
 
 
 def classify_merge(rows: Sequence[VerdictRow]) -> MergeOutcome:
@@ -413,6 +423,16 @@ def render_ledger_line(record: OverrideRecord) -> str:
     who = f" by @{record.merged_by}" if record.merged_by else ""
     pr = f"PR #{record.pr}" if record.pr is not None else "a PR"
     if record.kind is OverrideKind.HUMAN_OVERRIDE:
+        if record.verdict is None:
+            # a blocking NON-RUN gate (no engine verdict) — render the GATE OUTCOME truthfully, NEVER
+            # "the gate verdict was None" (there was no verdict; the governance gate itself blocked). The
+            # rendering stays "required"-free (the headline no-"required" legibility rule) — the stored
+            # reason token ``block_action_required`` is the machine record; the human line says BLOCKING.
+            return (
+                f"{pr} (head {record.sha[:12]}) merged{who} while the gate outcome was BLOCKING "
+                "(a governance gate withheld approval; no engine verdict was produced). "
+                "The gate did not approve this merge."
+            )
         return (
             f"{pr} (head {record.sha[:12]}) merged{who} while the gate verdict was "
             f"{record.verdict} ({record.reason}). The gate did not approve this merge."

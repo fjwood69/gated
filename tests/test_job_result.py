@@ -78,6 +78,22 @@ class AccountMapperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PersistedOutcome("error", v, None, "x", CheckConclusion.ACTION_REQUIRED)
 
+    def test_persisted_outcome_done_requires_exactly_one_gate_outcome(self) -> None:
+        # board: a minted done outcome must carry a GateOutcome (only PERSISTED historical rows may lack it).
+        with self.assertRaises(ValueError):
+            PersistedOutcome("done", None, None, "x", CheckConclusion.NEUTRAL)
+
+    def test_persisted_outcome_conclusion_must_cohere(self) -> None:
+        v = Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
+        with self.assertRaises(ValueError):   # RUN_VERDICT PASS must conclude SUCCESS, not NEUTRAL
+            PersistedOutcome("done", v, GateOutcome.RUN_VERDICT, "x", CheckConclusion.NEUTRAL)
+        with self.assertRaises(ValueError):   # BLOCK_GATE must conclude ACTION_REQUIRED
+            PersistedOutcome("done", None, GateOutcome.BLOCK_GATE, "x", CheckConclusion.NEUTRAL)
+        with self.assertRaises(ValueError):   # NEUTRAL_GATE must conclude NEUTRAL
+            PersistedOutcome("done", None, GateOutcome.NEUTRAL_GATE, "x", CheckConclusion.ACTION_REQUIRED)
+        with self.assertRaises(ValueError):   # error must conclude ACTION_REQUIRED
+            PersistedOutcome("error", None, None, "x", CheckConclusion.NEUTRAL)
+
     def test_non_run_decision_refuses_run_enforcing(self) -> None:
         with self.assertRaises(ValueError):
             NonRunDecision(Disposition.RUN_ENFORCING, "x")

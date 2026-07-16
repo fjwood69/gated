@@ -113,6 +113,24 @@ class ClassifyMergeTests(unittest.TestCase):
                             _row("done", gate_outcome="block_gate", t=2.0)])
         self.assertIs(o.sub_reason, UnverifiableReason.AMBIGUOUS)
 
+    def test_contradictory_pass_with_block_gate_is_indeterminate(self) -> None:
+        # board: validate the COMPLETE pair — a PASS verdict tagged block_gate is incoherent, NOT allowing.
+        o = classify_merge([_row("done", "PASS", gate_outcome="block_gate")])
+        self.assertIs(o.sub_reason, UnverifiableReason.INDETERMINATE_GATE)
+
+    def test_run_verdict_gate_with_no_verdict_is_indeterminate(self) -> None:
+        o = classify_merge([_row("done", verdict=None, gate_outcome="run_verdict")])
+        self.assertIs(o.sub_reason, UnverifiableReason.INDETERMINATE_GATE)
+
+    def test_unknown_verdict_string_is_indeterminate_not_blocking(self) -> None:
+        # an unknown verdict must NOT auto-classify as blocking (would fabricate a HUMAN_OVERRIDE).
+        o = classify_merge([_row("done", "WEIRD_VALUE")])
+        self.assertIs(o.sub_reason, UnverifiableReason.INDETERMINATE_GATE)
+
+    def test_verdict_paired_with_a_gate_is_indeterminate(self) -> None:
+        o = classify_merge([_row("done", "FAIL", "EGRESS_ONE", gate_outcome="neutral_gate")])
+        self.assertIs(o.sub_reason, UnverifiableReason.INDETERMINATE_GATE)
+
     def test_latest_non_pass_reason_wins(self) -> None:
         o = classify_merge([
             _row("done", "FAIL", "EGRESS_ONE", t=1.0),
@@ -245,6 +263,21 @@ class RenderLegibilityTests(unittest.TestCase):
         line = render_ledger_line(rec)
         self.assertNotIn("required", line.lower())
         self.assertIn("could not attest", line)
+
+    def test_blocking_non_run_override_renders_gate_outcome_not_a_none_verdict(self) -> None:
+        # CP2 closure 1: a blocking NON-RUN override (verdict=None, gate_outcome=block_gate) must render the
+        # gate OUTCOME truthfully — never "the gate verdict was None" — and stay "required"-free (legibility).
+        lg = _ledger()
+        rec = capture_override(
+            _event(),
+            lambda _s: [_row("done", verdict=None, reason="block_action_required", gate_outcome="block_gate")],
+            lg)
+        assert rec is not None
+        line = render_ledger_line(rec)
+        self.assertIn("gate outcome was BLOCKING", line)
+        self.assertNotIn("verdict was None", line)
+        self.assertNotIn("required", line.lower())        # honours the sealed no-'required' legibility rule
+        self.assertIn("did not approve", line)
 
 
 # ---- the receiver routing (closed+merged -> capture; unmerged -> drop) --------
