@@ -11,11 +11,37 @@ can never persist an unaccounted publication.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 
 from core import Verdict
 from gate.checkrun import CheckConclusion, verdict_to_conclusion
 from gate.policy_state import Disposition, nonrun_conclusion_for
 from gate.run_admission import AdmittedRunResult, BlockingRefusal
+
+
+class InfraFailureReason(Enum):
+    """The CLOSED set of infrastructure-failure causes (board S5: never a free string). Only this stable
+    token — or a trusted message keyed by it — is ever PUBLISHED; the ``detail`` field (raw exception text /
+    artifact-derived output) is INTERNAL-LOG-ONLY and must never reach the Check Run summary."""
+
+    WORKER_FAULT = "worker_fault"                          # an unexpected worker exception
+    DETECTOR_UNRESOLVED = "detector_unresolved"            # the enforced detector did not resolve
+    ARTIFACT_INTEGRITY_MISMATCH = "artifact_integrity_mismatch"  # TOCTOU: staged tree != verified hash
+    ARTIFACT_FETCH_FAILED = "artifact_fetch_failed"        # could not fetch/extract the artifact
+    WATCHDOG_TIMEOUT = "watchdog_timeout"                  # a wedged worker force-completed by the watchdog
+    UNACCOUNTED_RESULT = "unaccounted_result"             # the job runner returned a non-JobResult type
+
+
+class GateOutcome(Enum):
+    """The CLOSED gate-outcome discriminator persisted ALONGSIDE (and independently of) the engine verdict
+    (board S5, closure 1) — so the override classifier can tell a merge-past-a-BLOCKING-non-run from a clean
+    merge WITHOUT a fabricated verdict. ``RUN_VERDICT`` = a real engine/admission verdict was produced;
+    ``BLOCK_GATE`` = a blocking governance non-run (no verdict); ``NEUTRAL_GATE`` = a non-blocking governance
+    non-run (no verdict). An infra/error row carries NO gate outcome (None)."""
+
+    RUN_VERDICT = "run_verdict"
+    BLOCK_GATE = "block_gate"
+    NEUTRAL_GATE = "neutral_gate"
 
 
 @dataclass(frozen=True)
@@ -44,8 +70,8 @@ class InfrastructureFailure:
     verdict — no admitted run produced one, and mislabelling it a ``BlockingRefusal`` would claim the
     admission gate refused when in fact the machinery never reached a verdict."""
 
-    reason: str    # a short machine token for the audit + summary (e.g. "detector_unresolved")
-    detail: str
+    reason: InfraFailureReason  # the CLOSED cause (the only thing published); NEVER a free string
+    detail: str                 # raw diagnostic (exception text etc.) — INTERNAL LOGS ONLY, never published
 
 
 # The closed publication union. A bare ``Verdict`` / ``EngineRunResult`` is deliberately NOT a member — the
@@ -56,30 +82,50 @@ JobResult = AdmittedRunResult | BlockingRefusal | NonRunDecision | Infrastructur
 @dataclass(frozen=True)
 class PersistedOutcome:
     """What the Executor persists (``store.finalize``) + tells the updater to publish, derived HONESTLY per
-    type: ``status`` is ``error`` ONLY for an infra fault; ``verdict`` is present ONLY when an admitted run
-    or an admission refusal produced one (``None`` for a neutral/blocking non-run — no fabrication); ``reason``
-    is always a machine token for the audit trail; ``conclusion`` is the merge outcome GitHub is told."""
+    type. ``status`` is ``error`` ONLY for an infra fault; ``verdict`` is present ONLY when an admitted run
+    or an admission refusal produced one; ``gate_outcome`` is the closed discriminator persisted INDEPENDENTLY
+    of the verdict (so the override classifier need not read a fabricated verdict); ``reason`` is a stable
+    audit token; ``conclusion`` is the merge outcome GitHub is told.
 
-    status: str                  # "done" | "error"
-    verdict: Verdict | None      # ONLY an admitted run / admission refusal has one; else None
-    reason: str                  # audit token (never a fabricated verdict)
+    VALID COMBINATIONS enforced (board S5): ``RUN_VERDICT`` requires a real verdict; ``BLOCK_GATE`` /
+    ``NEUTRAL_GATE`` require NO verdict; an infra/error row carries NEITHER a gate outcome NOR a verdict."""
+
+    status: str                        # "done" | "error"
+    verdict: Verdict | None            # ONLY an admitted run / admission refusal has one; else None
+    gate_outcome: GateOutcome | None   # closed discriminator, independent of the verdict (None for infra)
+    reason: str                        # stable audit token (never a fabricated verdict)
     conclusion: CheckConclusion
+
+    def __post_init__(self) -> None:
+        if self.status not in ("done", "error"):
+            raise ValueError(f"status must be done|error, got {self.status!r}")
+        if self.gate_outcome is GateOutcome.RUN_VERDICT and self.verdict is None:
+            raise ValueError("RUN_VERDICT requires a real verdict")
+        if self.gate_outcome in (GateOutcome.BLOCK_GATE, GateOutcome.NEUTRAL_GATE) and self.verdict is not None:
+            raise ValueError(f"{self.gate_outcome.value} must NOT carry a verdict (a non-run produced none)")
+        if self.status == "error" and (self.gate_outcome is not None or self.verdict is not None):
+            raise ValueError("an infra/error row carries NEITHER a gate outcome NOR a verdict")
 
 
 def account(result: JobResult) -> PersistedOutcome:
     """The EXHAUSTIVE typed accounting map (board): every ``JobResult`` member -> its honest persistence +
-    publication fields. A bare ``Verdict`` / ``EngineRunResult`` (or any non-union type) is REJECTED — the
-    Executor never persists or publishes an unaccounted outcome."""
+    publication fields, with a CLOSED ``gate_outcome`` discriminator so a merge-past-a-blocking-non-run is
+    recorded WITHOUT a fabricated verdict. A bare ``Verdict`` / ``EngineRunResult`` (or any non-union type) is
+    REJECTED — the Executor never persists or publishes an unaccounted outcome."""
     if isinstance(result, AdmittedRunResult):
         v = result.verdict
-        return PersistedOutcome("done", v, v.reason.value, verdict_to_conclusion(v.status))
+        return PersistedOutcome("done", v, GateOutcome.RUN_VERDICT, v.reason.value,
+                                verdict_to_conclusion(v.status))
     if isinstance(result, BlockingRefusal):
-        v = result.verdict  # Verdict(ERROR, RUN_UNADMITTED) — the fail-closed publication verdict
-        return PersistedOutcome("done", v, v.reason.value, verdict_to_conclusion(v.status))
+        v = result.verdict  # Verdict(ERROR, RUN_UNADMITTED) — a real (admission) verdict was produced
+        return PersistedOutcome("done", v, GateOutcome.RUN_VERDICT, v.reason.value,
+                                verdict_to_conclusion(v.status))
     if isinstance(result, NonRunDecision):
-        return PersistedOutcome("done", None, result.disposition.value, result.conclusion)
+        blocking = result.disposition is Disposition.BLOCK_ACTION_REQUIRED
+        gate = GateOutcome.BLOCK_GATE if blocking else GateOutcome.NEUTRAL_GATE
+        return PersistedOutcome("done", None, gate, result.disposition.value, result.conclusion)
     if isinstance(result, InfrastructureFailure):
-        return PersistedOutcome("error", None, result.reason, CheckConclusion.ACTION_REQUIRED)
+        return PersistedOutcome("error", None, None, result.reason.value, CheckConclusion.ACTION_REQUIRED)
     raise TypeError(
         f"not a JobResult: {type(result).__name__} — the Executor accepts only "
         "AdmittedRunResult|BlockingRefusal|NonRunDecision|InfrastructureFailure "
@@ -87,6 +133,8 @@ def account(result: JobResult) -> PersistedOutcome:
 
 
 __all__ = [
+    "InfraFailureReason",
+    "GateOutcome",
     "NonRunDecision",
     "InfrastructureFailure",
     "JobResult",

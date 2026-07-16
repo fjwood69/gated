@@ -12,6 +12,8 @@ from core import Reason, Verdict, VerdictType
 from engine.runner import EngineRunResult
 from gate.checkrun import CheckConclusion
 from gate.job_result import (
+    GateOutcome,
+    InfraFailureReason,
     InfrastructureFailure,
     NonRunDecision,
     PersistedOutcome,
@@ -30,6 +32,7 @@ class AccountMapperTests(unittest.TestCase):
         self.assertEqual(out.status, "done")
         assert out.verdict is not None
         self.assertIs(out.verdict.status, VerdictType.PASS)          # the ACTUAL engine verdict
+        self.assertIs(out.gate_outcome, GateOutcome.RUN_VERDICT)
         self.assertIs(out.conclusion, CheckConclusion.SUCCESS)
 
     def test_blocking_refusal_maps_to_done_error_run_unadmitted(self) -> None:
@@ -39,26 +42,41 @@ class AccountMapperTests(unittest.TestCase):
         assert out.verdict is not None
         self.assertIs(out.verdict.status, VerdictType.ERROR)
         self.assertIs(out.verdict.reason, Reason.RUN_UNADMITTED)
+        self.assertIs(out.gate_outcome, GateOutcome.RUN_VERDICT)     # a real (admission) verdict exists
         self.assertIs(out.conclusion, CheckConclusion.ACTION_REQUIRED)
 
-    def test_non_run_neutral_maps_to_done_no_verdict_neutral(self) -> None:
+    def test_non_run_neutral_maps_to_done_no_verdict_neutral_gate(self) -> None:
         out = account(NonRunDecision(Disposition.SKIP_NEUTRAL, "not enabled"))
         self.assertEqual(out.status, "done")
         self.assertIsNone(out.verdict)                               # NOTHING ran — no fabricated verdict
+        self.assertIs(out.gate_outcome, GateOutcome.NEUTRAL_GATE)
         self.assertIs(out.conclusion, CheckConclusion.NEUTRAL)
 
-    def test_non_run_block_maps_to_done_no_verdict_action_required(self) -> None:
+    def test_non_run_block_maps_to_done_no_verdict_block_gate(self) -> None:
         out = account(NonRunDecision(Disposition.BLOCK_ACTION_REQUIRED, "degraded"))
-        self.assertEqual(out.status, "done")                         # a blocking gate outcome, recorded
+        self.assertEqual(out.status, "done")                         # a blocking gate outcome, RECORDED
         self.assertIsNone(out.verdict)
+        self.assertIs(out.gate_outcome, GateOutcome.BLOCK_GATE)      # closure 1: independently classifiable
         self.assertIs(out.conclusion, CheckConclusion.ACTION_REQUIRED)
 
-    def test_infrastructure_failure_maps_to_error_no_verdict_blocking(self) -> None:
-        out = account(InfrastructureFailure("detector_unresolved", "drifted"))
+    def test_infrastructure_failure_maps_to_error_no_gate_no_verdict(self) -> None:
+        out = account(InfrastructureFailure(InfraFailureReason.DETECTOR_UNRESOLVED, "drifted det xyz"))
         self.assertEqual(out.status, "error")                        # the machinery FAULTED
         self.assertIsNone(out.verdict)                               # no gate verdict was produced
+        self.assertIsNone(out.gate_outcome)                          # infra carries NO gate outcome
+        self.assertEqual(out.reason, "detector_unresolved")          # the CLOSED enum token (not raw detail)
         self.assertIs(out.conclusion, CheckConclusion.ACTION_REQUIRED)
         self.assertIsInstance(out, PersistedOutcome)
+
+    def test_persisted_outcome_rejects_invalid_combinations(self) -> None:
+        # RUN_VERDICT without a verdict; a gate non-run WITH a verdict; error carrying a gate/verdict.
+        v = Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
+        with self.assertRaises(ValueError):
+            PersistedOutcome("done", None, GateOutcome.RUN_VERDICT, "x", CheckConclusion.SUCCESS)
+        with self.assertRaises(ValueError):
+            PersistedOutcome("done", v, GateOutcome.BLOCK_GATE, "x", CheckConclusion.ACTION_REQUIRED)
+        with self.assertRaises(ValueError):
+            PersistedOutcome("error", v, None, "x", CheckConclusion.ACTION_REQUIRED)
 
     def test_non_run_decision_refuses_run_enforcing(self) -> None:
         with self.assertRaises(ValueError):
