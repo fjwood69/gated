@@ -251,7 +251,15 @@ class WorkerFailedTerminalTaxonomyTests(unittest.TestCase):
     """CP3 formal terminal taxonomy: the FAILED terminal is recognised on crash-redelivery (ALREADY_FAILED,
     the mirror of ALREADY_DONE) and under the pause-race, and the taxonomy does not LEAK (a non-worker terminal
     stays STALE). Exact-enum assertions are mandatory (board): a 'no-measure+no-mutation' check alone would
-    pass for BOTH STALE and ALREADY_FAILED."""
+    pass for BOTH STALE and ALREADY_FAILED.
+
+    Coverage boundary (board seal, residual 3): the worker-level STALE leak-guard is pinned via the
+    MOST-CONFUSABLE case — a matching failed_churn (a NON-worker, human-gated terminal) vs a matching
+    failed_detector. The remaining obsolete cases (satisfied-at-ANOTHER-fence, superseded, advanced-past,
+    vanished) all take the SAME single obsolete->STALE branch with the SAME consequence (complete obsolete
+    work, zero PolicyStore mutation) and are covered at the underlying primitive
+    (test_intent_completion.TerminalizeFailedDetectorTests: satisfied/advanced/vanished -> STALE). A full
+    status x fence matrix AT THE WORKER LEVEL is deferred test-hardening, ratified NOT a seal gate."""
 
     def test_already_failed_job_completes_without_remeasuring(self) -> None:
         # crash after failed_detector, before queue.complete: the re-delivered worker sees failed_detector +
