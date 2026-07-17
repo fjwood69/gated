@@ -31,9 +31,10 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Iterator, Mapping
 
 from core.chain import GENESIS_HASH, chain_hash, content_digest
 from gate.attestation import IDENTITY_CONTRACT_VERSION
@@ -1234,40 +1235,52 @@ class PolicyStore:
                 f"the calibration_pass for ref {calibration_result_ref!r} does not match the intent binding "
                 "— cross-wiring corruption; refusing to accept ALREADY_SATISFIED over a mismatched pass")
 
+    @contextmanager
+    def _verified_read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        """A single locked, chain-verified SQLite read snapshot (board C4). Opens ONE ``BEGIN`` read
+        transaction under the store lock, runs ``verify_chain`` INSIDE it (fail-closed: a broken chain
+        raises ``ChainIntegrityError``), and yields the connection so the caller's reads all see ONE
+        consistent view — never a verify-then-read window where a concurrent commit / tamper between the
+        two makes the read describe a different instant than the one verified. Commits on normal exit,
+        rolls back on any exception. ``verify_chain`` is lock-free, so there is no re-entrancy on
+        ``self._lock``; the public read methods are the only entry points (no caller holds the lock while
+        entering this). This is the single atomic-read mechanism shared by ``current_attestation_snapshot``,
+        ``current_state``, and ``current_authorized_context`` — not three ad-hoc copies."""
+        with self._lock:
+            conn = self._conn()
+            conn.execute("BEGIN")  # a consistent WAL read snapshot: verify + reads see one view
+            try:
+                if not self.verify_chain():
+                    raise ChainIntegrityError(
+                        "tier-transition chain failed verification — refusing to read")
+                yield conn
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     def current_attestation(self, policy_id: str) -> tuple[str, str, str] | None:
         """The ``(set_id, oracle_head, detector_identity)`` the policy's CURRENT calibration was
         bound to — or None if the policy is not ENABLED (only an ENABLED policy enforces). Fails
-        CLOSED on a broken chain. The gatekeeper compares ``oracle_head`` to the live
+        CLOSED on a broken chain. The gatekeeper / live admission compares ``oracle_head`` to the live
         ``set_head(set_id)`` (a mismatch means the set's membership changed since calibration ->
         transient UNATTESTABLE; close-3, scoped) AND compares ``detector_identity`` to the 4-tuple
-        identity of the detector about to run (a mismatch means the detector's build / host closure /
-        image / eval profile drifted since calibration -> the transitive-spoof close, on the LIVE
-        path; close-2). Returning the identity is what lets the live path honour the identity.py
-        invariant symmetrically with the signed-snapshot fallback."""
-        if not self.verify_chain():
-            raise ChainIntegrityError("tier-transition chain failed verification — refusing to read")
-        row = self._conn().execute(
-            "SELECT new_state, calibration_result_ref, set_id, pinned_set_version, detector_identity,"
-            " identity_contract_version FROM tier_transition_chain WHERE policy_id=? "
-            "ORDER BY seq DESC LIMIT 1", (policy_id,)
-        ).fetchone()
-        if row is None or row["new_state"] != PolicyState.ENABLED.value:
+        identity of the detector about to run.
+
+        CP2 final-dissent: DELEGATES to ``current_attestation_snapshot`` so the chain-verify + row read +
+        pass-exact-match happen inside ONE locked SQLite snapshot (S2, board C4), genuinely atomic, not a
+        chain-verify-then-read window. The 3-tuple is the snapshot's 5-tuple with the ALREADY-VALIDATED ICV
+        AND the generation dropped (the snapshot's ENABLED + ICV + pass-exact-match gates are identical); no
+        duplicated weaker (non-atomic) logic remains. (Not re-entrant: no caller holds the store lock while
+        calling this.) Its own callers are ``enabled_policies_for_set`` + ``recal_metrics`` (which need the
+        3-tuple binding, not the generation); the production live-admission adapter
+        (``_ProductionAdmissionGovernanceView``) reads ``current_attestation_snapshot`` DIRECTLY (it needs the
+        generation for the ABA bracket)."""
+        snap = self.current_attestation_snapshot(policy_id)
+        if snap is None:
             return None
-        # S3 ckpt4-fix2b/2c: the HEAD must be under the CURRENT contract (old evidence inadmissible now), and
-        # the pass must exact-match the HASH-CHAINED record's OWN coordinates (ref + set_id + pinned_set_version
-        # + detector_identity + ICV) — then we return the TRANSITION-bound values, INCLUDING set_id, not the
-        # pass-row values. set_id was the LAST attestation coordinate still read off the mutable, unchained
-        # calibration_pass row (ckpt4-fix2c): a direct edit of pass.set_id could repoint which set's drift the
-        # gatekeeper checks. Now set_id is hash-chained into the record and returned from it, so that edit
-        # cannot change the effective current attestation (and fails the pass exact-match below anyway).
-        if row["identity_contract_version"] != IDENTITY_CONTRACT_VERSION:
-            return None
-        if not self._pass_exists_unlocked(
-            str(row["calibration_result_ref"]), policy_id, str(row["set_id"]),
-            str(row["pinned_set_version"]), str(row["detector_identity"]), IDENTITY_CONTRACT_VERSION,
-        ):
-            return None
-        return (str(row["set_id"]), str(row["pinned_set_version"]), str(row["detector_identity"]))
+        set_id, oracle_head, detector_identity, _icv, _generation = snap  # drop ICV + generation (3-tuple protocol)
+        return (set_id, oracle_head, detector_identity)
 
     def _current_authorized_context_unlocked(self, policy_id: str) -> tuple[str, str, int] | None:
         """S3 restore-continuity: the FULL authorization context the policy's CURRENT ENABLED calibration
@@ -1300,55 +1313,59 @@ class PolicyStore:
         """S3 restore-continuity: the locked, chain-verified read of the authorization context
         ``(set_id, subject, identity_contract_version)`` — what the RestoreController reads ONCE to derive
         every CAS input from a single snapshot (no read-then-read TOCTOU between set and subject). Fails
-        CLOSED on a broken chain. ``reattest`` re-checks the SAME 3-tuple atomically under the store lock."""
-        if not self.verify_chain():
-            raise ChainIntegrityError("tier-transition chain failed verification — refusing to read")
-        return self._current_authorized_context_unlocked(policy_id)
+        CLOSED on a broken chain. ``reattest`` re-checks the SAME 3-tuple atomically under the store lock.
 
-    def current_attestation_snapshot(self, policy_id: str) -> tuple[str, str, str, int] | None:
+        ABA-hardening: the ``verify_chain`` + row read + pass-exact-match now run inside ONE
+        ``_verified_read_snapshot`` (a locked ``BEGIN``), so the documented atomic-read guarantee is TRUE —
+        a concurrent commit / tamper between the verify and the read cannot make the returned context
+        describe a different instant than the one verified (the prior verify-then-read window is closed)."""
+        with self._verified_read_snapshot():
+            return self._current_authorized_context_unlocked(policy_id)
+
+    def current_attestation_snapshot(self, policy_id: str) -> tuple[str, str, str, int, str] | None:
         """3.5 CP4 CP2 (board D2/C4): the SINGLE chain-verified enforcement snapshot the gatekeeper reads ONCE
         to drive detector-subject comparison, oracle currency, AND the ``AuthorizedRunPlan`` mint —
-        ``(set_id, bound_oracle_head, subject, identity_contract_version)`` or None (not ENABLED / no matching
-        pass under the current contract). Superset of ``current_attestation`` (adds ICV) so mint-coherence
-        (target==authorized) is TRUE BY CONSTRUCTION: the plan's set/subject/ICV all come from this ONE row.
+        ``(set_id, bound_oracle_head, subject, identity_contract_version, generation)`` or None (not ENABLED /
+        no matching pass under the current contract). Superset of ``current_attestation`` (adds ICV +
+        generation) so mint-coherence (target==authorized) is TRUE BY CONSTRUCTION: the plan's set/subject/ICV
+        all come from this ONE row.
+
+        ``generation`` = this ENABLED head row's own ``record_hash`` — the policy's MONOTONIC generation.
+        Monotonic UNDER TWO ASSUMPTIONS the model already relies on: (1) the tier-transition chain is
+        APPEND-ONLY (this store has no mutate/delete path; direct-DB truncation is the deploy-tier adversary,
+        out of the in-process model), and (2) ``record_hash`` folds ``prev_hash`` under a collision-resistant
+        hash. Given both, a ``record_hash`` value NEVER repeats once a new record is appended — UNLIKE the
+        calibration ``set_head`` membership digest, which can ABA (deprecate→re-add returns an earlier value).
+        It is captured INSIDE this atomic snapshot so an enforcement caller can BRACKET the (separate,
+        non-atomic) live ``set_head`` read between this generation and a later ``policy_head`` re-read: if the
+        generation is unchanged across the bracket, no policy transition occurred during the oracle read, so a
+        ``set_head`` ABA (deprecate→re-add returning an earlier head) cannot admit a policy that has since left
+        ENABLED. See ``gatekeeper._enforce_if_oracle_current`` and ``run_admission.admit_run_result``.
 
         Board C4: chain verification + the row read + the pass check happen inside ONE SQLite read
-        transaction under the store lock (``verify_chain`` is lock-free, so no re-entrancy), so this is a
-        genuinely atomic snapshot — NOT a materialised view assembled from two reads (which would reintroduce
-        the read-between-reads race). Fails CLOSED on a broken chain."""
-        with self._lock:
-            conn = self._conn()
-            conn.execute("BEGIN")  # a consistent read snapshot (WAL): verify + read + pass-check see one view
-            try:
-                if not self.verify_chain():
-                    raise ChainIntegrityError(
-                        "tier-transition chain failed verification — refusing to read")
-                row = conn.execute(
-                    "SELECT new_state, calibration_result_ref, set_id, pinned_set_version, detector_identity,"
-                    " identity_contract_version FROM tier_transition_chain WHERE policy_id=? "
-                    "ORDER BY seq DESC LIMIT 1", (policy_id,)
-                ).fetchone()
-                if row is None or row["new_state"] != PolicyState.ENABLED.value:
-                    conn.execute("COMMIT")
-                    return None
-                # the ENABLED head must be under the CURRENT contract, and its pass must exact-match the
-                # hash-chained record's own coordinates (mirrors current_attestation exactly, +ICV returned).
-                if row["identity_contract_version"] != IDENTITY_CONTRACT_VERSION:
-                    conn.execute("COMMIT")
-                    return None
-                if not self._pass_exists_unlocked(
-                    str(row["calibration_result_ref"]), policy_id, str(row["set_id"]),
-                    str(row["pinned_set_version"]), str(row["detector_identity"]), IDENTITY_CONTRACT_VERSION,
-                ):
-                    conn.execute("COMMIT")
-                    return None
-                result = (str(row["set_id"]), str(row["pinned_set_version"]),
-                          str(row["detector_identity"]), int(row["identity_contract_version"]))
-                conn.execute("COMMIT")
-                return result
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
+        transaction under the store lock (``_verified_read_snapshot``; ``verify_chain`` is lock-free, so no
+        re-entrancy), so this is a genuinely atomic snapshot — NOT a materialised view assembled from two
+        reads (which would reintroduce the read-between-reads race). Fails CLOSED on a broken chain."""
+        with self._verified_read_snapshot() as conn:
+            row = conn.execute(
+                "SELECT new_state, calibration_result_ref, set_id, pinned_set_version, detector_identity,"
+                " identity_contract_version, record_hash FROM tier_transition_chain WHERE policy_id=? "
+                "ORDER BY seq DESC LIMIT 1", (policy_id,)
+            ).fetchone()
+            if row is None or row["new_state"] != PolicyState.ENABLED.value:
+                return None
+            # the ENABLED head must be under the CURRENT contract, and its pass must exact-match the
+            # hash-chained record's own coordinates (mirrors current_attestation exactly, +ICV +generation).
+            if row["identity_contract_version"] != IDENTITY_CONTRACT_VERSION:
+                return None
+            if not self._pass_exists_unlocked(
+                str(row["calibration_result_ref"]), policy_id, str(row["set_id"]),
+                str(row["pinned_set_version"]), str(row["detector_identity"]), IDENTITY_CONTRACT_VERSION,
+            ):
+                return None
+            return (str(row["set_id"]), str(row["pinned_set_version"]),
+                    str(row["detector_identity"]), int(row["identity_contract_version"]),
+                    str(row["record_hash"]))
 
     def pass_binding(
         self, calibration_result_ref: str, policy_id: str, pinned_set_version: str,
@@ -1472,10 +1489,14 @@ class PolicyStore:
     def current_state(self, policy_id: str) -> PolicyState | None:
         """The current tier of ``policy_id`` (head of its replayed sub-chain), or None if the
         policy has no records. Fails CLOSED: a broken chain raises rather than return a tier that
-        may have been tampered — the caller (gatekeeper) maps a raise to a blocking decision."""
-        if not self.verify_chain():
-            raise ChainIntegrityError("tier-transition chain failed verification — refusing to read")
-        return self._current_state_unlocked(policy_id)
+        may have been tampered — the caller (gatekeeper) maps a raise to a blocking decision.
+
+        ABA-hardening: verify + head read run inside ONE ``_verified_read_snapshot`` (a locked ``BEGIN``),
+        so a concurrent delete/tamper committing BETWEEN the verify and the read can no longer yield a
+        spurious ``None`` (which the gatekeeper maps to ``SKIP_NEUTRAL`` — a fail-OPEN). A policy that
+        existed and verified is read from the SAME snapshot; a broken chain fails closed (raises)."""
+        with self._verified_read_snapshot():
+            return self._current_state_unlocked(policy_id)
 
     def head_hash(self) -> str:
         """The current chain head — pinned into the signed snapshot (survivable fallback)."""

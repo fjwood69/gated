@@ -173,12 +173,12 @@ def _enforce_if_oracle_current(
     eval drift is caught POST-run by ``admit_run_result``'s ``SUBJECT_DRIFT`` (the measured composite,
     off the authoritative engine return, must equal the dispatched target the plan minted from THIS
     attestation) — not by a spoofable pre-run declaration."""
-    # CP2: read the SINGLE chain-verified snapshot ``(set_id, bound_head, subject, ICV)`` — the same row the
-    # AuthorizedRunPlan mints from, so the oracle check and the mint share ONE governance view.
+    # CP2: read the SINGLE chain-verified snapshot ``(set_id, bound_head, subject, ICV, generation)`` — the
+    # same row the AuthorizedRunPlan mints from, so the oracle check and the mint share ONE governance view.
     snap = store.current_attestation_snapshot(policy_id)
     if snap is None:
         return _unattestable("ENABLED policy has no calibration attestation to check the oracle head")
-    set_id, bound_head, bound_identity, icv = snap
+    set_id, bound_head, bound_identity, icv, generation = snap
     current_head = oracle_head_for(set_id)
     if current_head is None:
         return _unattestable(f"unknown calibration set membership for {set_id!r} — failing closed")
@@ -186,6 +186,21 @@ def _enforce_if_oracle_current(
         return _unattestable(
             f"oracle set {set_id!r} has grown since calibration (head {bound_head[:12]}.. -> "
             f"{current_head[:12]}..) — re-calibration pending"
+        )
+    # S3-completion — ABA close: the snapshot read and the (separate, non-atomic) oracle read above are two
+    # reads across two stores. ``set_head`` is a CURRENT-membership digest, so it can ABA (a deprecate→re-add
+    # returns an earlier head); a policy could have left ENABLED (an APPEND that moves its generation) while
+    # the set membership returned to ``bound_head``, and the oracle check would wrongly pass. Re-read the
+    # policy's MONOTONIC generation (``policy_head`` = record_hash of its head row; because the tier chain is
+    # APPEND-ONLY — no mutate/delete path — and ``record_hash`` is collision-resistant, a value never repeats
+    # once a new record is appended) AFTER the oracle read: if it is unchanged, no transition occurred across
+    # [snapshot, re-read], so the same ENABLED generation covered the bracketed oracle observation. A move ->
+    # UNATTESTABLE. (A direct-DB tail-truncation that reverts the generation is the deploy-tier adversary, out
+    # of the in-process model.)
+    if store.policy_head(policy_id) != generation:
+        return _unattestable(
+            f"policy {policy_id!r} generation {generation[:12]}.. was not stable across the oracle read — "
+            "the policy tier moved, so its currency cannot be confirmed; re-dispatch against fresh governance"
         )
     # mint the pre-run plan from the SAME snapshot: mint-coherence (target_subject == authorized_subject ==
     # the bound subject) holds BY CONSTRUCTION, and set/ICV come from the one row (no read-between-reads).

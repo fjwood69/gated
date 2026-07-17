@@ -6,7 +6,9 @@ before). Implements the seams the against-fakes increments defined:
 ``GitHubCheckClient`` (find/create/update Check Runs) — plus a streaming, byte-capped
 tarball download and the startup branch-protection fetch.
 
-PyJWT is isolated to this module + ``github_auth`` (Fork-2 ruling); the rest of the
+PyJWT is isolated to this module + ``github_auth`` (Fork-2 ruling), and imported LAZILY inside
+``RealJwtSigner.sign_rs256`` so importing this module (and ``gate.live_app`` through it) needs no
+third-party dep beyond PyNaCl — the CI unit-test contract. The rest of the
 gate stays stdlib. Every outbound call has a hard timeout + bounded backoff on 5xx /
 secondary-rate-limit, and threads the ``X-RateLimit-Remaining`` header into an optional
 ``RateLimitBudget`` so the receiver can shed load before the quota wedges.
@@ -18,8 +20,6 @@ import time
 import urllib.error
 import urllib.request
 from typing import Any, Mapping
-
-import jwt  # type: ignore[import-not-found]
 
 from .checkrun import CheckConclusion, CheckOutput, CheckRunError, CheckStatus
 from .github_auth import AppJwtClaims, InstallationToken, InstallationTokenProvider
@@ -37,6 +37,11 @@ class RealJwtSigner:
     """Sign App-JWT claims RS256 with PyJWT (proven accepted by real GitHub)."""
 
     def sign_rs256(self, claims: AppJwtClaims, private_key_pem: bytes) -> str:
+        # Deferred import: PyJWT is loaded only when a JWT is actually signed, so importing this module
+        # (and gate.live_app through it) stays stdlib+PyNaCl-only — the CI unit-test contract. A unit test
+        # importing _ProductionAdmissionGovernanceView from live_app must not require PyJWT.
+        import jwt  # type: ignore[import-not-found]
+
         return str(
             jwt.encode(
                 {"iat": claims.iat, "exp": claims.exp, "iss": claims.iss},

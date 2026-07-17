@@ -330,10 +330,26 @@ class CalibrationStore:
         append to set X moves set_head(X) and NOTHING else, so a fixture change invalidates only the
         policies calibrated against X — never a global wedge. A policy binds the set_head it was
         calibrated against; enforcement compares that to the current set_head and blocks (UNATTESTABLE)
-        on mismatch. Fails CLOSED on a broken chain."""
-        if not self.verify_chain():
-            raise ChainIntegrityError("calibration chain failed verification — refusing to read")
-        return self._compute_set_head(set_id)
+        on mismatch. Fails CLOSED on a broken chain.
+
+        S3-completion (torn-read fix): ``verify_chain`` + ``_compute_set_head`` now run inside ONE
+        ``BEGIN DEFERRED`` snapshot (mirroring ``seal_set``; lock-free — the connection is per-thread
+        (``threading.local``) and WAL gives that connection a stable read view for the transaction's
+        duration). Previously the two were separate reads, so a concurrent append/tamper committing
+        BETWEEN them could return a membership digest NOT covered by the successful verification. The
+        callers (``recal_relay``, ``recal_worker``, ``live_app.oracle_head_for``) do not hold an open
+        transaction on this thread's connection, so the ``BEGIN`` cannot nest."""
+        conn = self._conn()
+        conn.execute("BEGIN DEFERRED")  # verify + compute see ONE consistent membership instant
+        try:
+            if not self.verify_chain():
+                raise ChainIntegrityError("calibration chain failed verification — refusing to read")
+            head = self._compute_set_head(set_id)
+            conn.execute("COMMIT")
+            return head
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def _compute_set_head(self, set_id: str) -> str:
         """The set-scoped head from the CURRENT chain rows (no verify — callers that need fail-closed

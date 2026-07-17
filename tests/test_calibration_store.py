@@ -11,6 +11,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from core.calibration import FixtureLabel
 from gate.authority import Authority, GovernanceApproval
@@ -134,6 +135,34 @@ class TamperEvidenceTests(unittest.TestCase):
     def test_store_reuses_core_chain_primitive(self) -> None:
         src = (Path(__file__).resolve().parent.parent / "gate" / "calibration_store.py").read_text()
         self.assertIn("from core.chain import", src)  # reuses, does not rebuild
+
+
+class SetHeadAtomicityTests(unittest.TestCase):
+    def test_set_head_survives_a_concurrent_append_mid_read(self) -> None:
+        # S3-completion (torn-read fix): set_head now runs verify_chain + _compute_set_head inside ONE
+        # BEGIN DEFERRED snapshot. A concurrent append to the SAME set committing AFTER the reader's snapshot is
+        # fixed (after verify_chain's first read) must NOT tear the digest: set_head returns the membership
+        # digest COVERED by the successful verification (the PRE-append head). Under the OLD verify-then-compute
+        # (two separate autocommit reads) the compute took a FRESH snapshot and saw the appended row — a head
+        # NOT covered by the verify. FAILS on the old impl, PASSES on the atomic one.
+        path = Path(tempfile.mkdtemp(prefix="mv-atomic-sethead-")) / "c.db"
+        reader = CalibrationStore(path)
+        reader.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_dual(), fixture_id="b1",
+                      set_id="S", label=FixtureLabel.KNOWN_BAD, payload=b"x")
+        pre_head = reader.set_head("S")
+        writer = CalibrationStore(path)                   # a SECOND connection on the same DB (WAL)
+        real_verify = reader.verify_chain
+
+        def racing_verify() -> bool:
+            ok = real_verify()                            # establishes the reader's WAL read snapshot
+            writer.append(ChangeOp.ADD_KNOWN_BAD, admission=_ADMIT_CAP, approval=_dual(), fixture_id="b2",
+                          set_id="S", label=FixtureLabel.KNOWN_BAD, payload=b"y")  # moves membership
+            return ok
+
+        with mock.patch.object(reader, "verify_chain", side_effect=racing_verify):
+            head_mid = reader.set_head("S")
+        self.assertEqual(head_mid, pre_head)                       # the digest the verify covered (pre-append)
+        self.assertNotEqual(reader.set_head("S"), pre_head)        # a fresh read sees the appended member
 
 
 if __name__ == "__main__":

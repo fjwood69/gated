@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Union
 
 from core import Verdict
 from gate.checkrun import CheckConclusion, verdict_to_conclusion
@@ -83,7 +84,7 @@ class InfrastructureFailure:
 
 # The closed publication union. A bare ``Verdict`` / ``EngineRunResult`` is deliberately NOT a member — the
 # Executor runtime-rejects anything else (see ``account``).
-JobResult = AdmittedRunResult | BlockingRefusal | NonRunDecision | InfrastructureFailure
+JobResult = Union[AdmittedRunResult, BlockingRefusal, NonRunDecision, InfrastructureFailure]  # noqa: UP007  # runtime alias: PEP 604 `|` fails on py 3.9 (CI matrix floor)
 
 
 @dataclass(frozen=True)

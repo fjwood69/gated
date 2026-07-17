@@ -234,6 +234,27 @@ class Cp2PlanMintTests(unittest.TestCase):
         self.assertEqual(d.source, "unattestable")
         self.assertIsNone(d.plan)
 
+    def test_generation_move_during_oracle_read_blocks_the_mint(self) -> None:
+        # S3-completion ABA close (gatekeeper seam): the attestation snapshot (ENABLED@G1) and the separate
+        # oracle read are two reads across two stores, and set_head is a CURRENT-membership digest that can ABA
+        # back to the bound head. Inject the race deterministically: oracle_head_for is called BETWEEN the
+        # snapshot and the generation re-read, so make it commit an ENABLED->DEGRADED transition (moving the
+        # policy's monotonic generation) and return the ORIGINAL bound head so the set-head check PASSES. The
+        # generation re-read (policy_head) must catch the move -> UNATTESTABLE. Under the OLD code (no
+        # generation bracket) the matching set head MINTS a plan (RUN_ENFORCING) for a policy that already left
+        # ENABLED, so this asserts BLOCK_ACTION_REQUIRED + no plan and FAILS pre-fix.
+        s = _store()
+        _enable(s, "P", detector="det-1", set_id="default", head="fx-head")
+
+        def racing_oracle(set_id: str) -> str:
+            s.transition("P", PolicyState.DEGRADED, approval=_appr("gov1", "gov2", op="P-degrade"))
+            return "fx-head"                                  # the bound head — set-head check passes (the ABA)
+
+        d = _resolve(s, "P", oracle_head_for=racing_oracle)
+        self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)  # generation moved -> unattestable
+        self.assertEqual(d.source, "unattestable")
+        self.assertIsNone(d.plan)                            # NO enforcement plan minted for a moved policy
+
 
 class Done1_UnattestableBlocksTests(unittest.TestCase):
     def test_live_enabled_runs_enforcing(self) -> None:

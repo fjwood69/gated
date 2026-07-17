@@ -12,6 +12,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from core.chain import chain_hash
 from gate.authority import GovernanceApproval
@@ -70,11 +71,14 @@ class CurrentAttestationSnapshotTests(unittest.TestCase):
     gatekeeper mints the AuthorizedRunPlan from — a superset of current_attestation (+ICV), read in ONE
     chain-verified transaction."""
 
-    def test_enabled_snapshot_carries_set_head_subject_and_icv(self) -> None:
+    def test_enabled_snapshot_carries_set_head_subject_icv_and_generation(self) -> None:
         s = _store()
         _enable(s, head="v1")
-        self.assertEqual(s.current_attestation_snapshot("p1"), ("X", "v1", "det-1", 1))
-        # the snapshot's (set, subject, ICV) is exactly what current_attestation returns + the ICV.
+        # 5-tuple: (set, bound_head, subject, ICV, generation). generation = the ENABLED head's record_hash,
+        # captured ATOMICALLY in the snapshot — equal to policy_head (same query, same row) when unchanged.
+        self.assertEqual(
+            s.current_attestation_snapshot("p1"), ("X", "v1", "det-1", 1, s.policy_head("p1")))
+        # the snapshot's (set, subject, ICV) is exactly what current_attestation returns + the ICV + generation.
         self.assertEqual(s.current_attestation("p1"), ("X", "v1", "det-1"))
 
     def test_not_enabled_is_none(self) -> None:
@@ -82,6 +86,59 @@ class CurrentAttestationSnapshotTests(unittest.TestCase):
         s.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="p1-1"))
         self.assertIsNone(s.current_attestation_snapshot("p1"))          # CALIBRATING, not ENABLED
         self.assertIsNone(s.current_attestation_snapshot("absent"))      # no policy at all
+        # CP2 final-dissent: current_attestation now DELEGATES to the atomic snapshot, so it is None too.
+        self.assertIsNone(s.current_attestation("p1"))
+        self.assertIsNone(s.current_attestation("absent"))
+
+    def test_atomic_snapshot_survives_a_concurrent_commit_mid_read(self) -> None:
+        # LOAD-BEARING ATOMICITY regression (final-dissent): the delegation put verify_chain + the row read +
+        # the pass-exact-match inside ONE deferred-BEGIN WAL snapshot. A concurrent ENABLED->DEGRADED commit
+        # that lands AFTER the reader's snapshot is established (after verify_chain's first read) must NOT tear
+        # the read: current_attestation returns the COHERENT PRE-transition ENABLED tuple. Under the OLD
+        # verify-then-read (lock-free verify_chain in autocommit, then a SEPARATE autocommit row read) the row
+        # read would take a FRESH snapshot and see the committed DEGRADED row -> return None, a torn read that
+        # disagrees with what verify_chain validated. So this FAILS on the old implementation, PASSES on the
+        # atomic one. (Weaker acceptable alternative: assert current_attestation delegates to the snapshot —
+        # test_current_attestation_delegates_to_the_atomic_snapshot below.)
+        path = Path(tempfile.mkdtemp(prefix="mv-atomic-")) / "t.db"
+        reader = PolicyStore(path)
+        _enable(reader, head="v1")
+        writer = PolicyStore(path)                       # a SECOND connection/instance on the same DB (WAL)
+        real_verify = reader.verify_chain
+
+        def racing_verify() -> bool:
+            ok = real_verify()  # runs INSIDE the open BEGIN; its first read fixes the reader's WAL snapshot
+            # a concurrent writer commits ENABLED -> DEGRADED AFTER the snapshot is fixed:
+            writer.transition("p1", PolicyState.DEGRADED, approval=_appr("g1", "g2", op="p1-degrade"))
+            return ok
+
+        with mock.patch.object(reader, "verify_chain", side_effect=racing_verify):
+            att = reader.current_attestation("p1")
+        self.assertEqual(att, ("X", "v1", "det-1"))       # coherent PRE-transition read (one WAL snapshot)
+        self.assertIsNone(reader.current_attestation("p1"))  # a FRESH read sees the committed DEGRADED
+
+    def test_current_attestation_delegates_to_the_atomic_snapshot(self) -> None:
+        # the weaker-but-explicit acceptance: current_attestation is the atomic snapshot minus the ICV, not a
+        # second verify-then-read. Proven by delegation: patching the snapshot changes current_attestation.
+        s = _store()
+        _enable(s, head="v1")
+        with mock.patch.object(
+                s, "current_attestation_snapshot", return_value=("SET", "HEAD", "SUBJ", 1, "GEN")):
+            self.assertEqual(s.current_attestation("p1"), ("SET", "HEAD", "SUBJ"))   # 5-tuple minus ICV+gen
+        with mock.patch.object(s, "current_attestation_snapshot", return_value=None):
+            self.assertIsNone(s.current_attestation("p1"))
+
+    def test_transition_out_of_enabled_makes_atomic_attestation_none(self) -> None:
+        # FINAL-DISSENT seam (S3 x S5): a policy ENABLED at plan-mint that TRANSITIONS OUT (ENABLED ->
+        # DEGRADED, "lost attestation") before the post-run read -> current_attestation (now the ATOMIC S2
+        # snapshot, one locked txn) returns None once the transition is COMMITTED -> live admission fail-closes
+        # LIVE_ATTESTATION_UNAVAILABLE. Proves the continuity is enforced by the ENABLED status gate through the
+        # atomic read, not a racy window.
+        s = _store()
+        _enable(s, head="v1")
+        self.assertEqual(s.current_attestation("p1"), ("X", "v1", "det-1"))   # ENABLED -> the bound tuple
+        s.transition("p1", PolicyState.DEGRADED, approval=_appr("g1", "g2", op="p1-degrade"))  # committed
+        self.assertIsNone(s.current_attestation("p1"))                        # atomic read: no longer ENABLED
 
     def test_broken_chain_fails_closed(self) -> None:
         s = _store()
@@ -90,6 +147,50 @@ class CurrentAttestationSnapshotTests(unittest.TestCase):
                           "WHERE policy_id='p1' AND new_state='enabled'")
         with self.assertRaises(ChainIntegrityError):
             s.current_attestation_snapshot("p1")
+
+    def test_current_state_survives_a_concurrent_commit_mid_read(self) -> None:
+        # S3-completion ABA-hardening: current_state now runs verify_chain + the head read inside ONE
+        # _verified_read_snapshot. A concurrent ENABLED->DEGRADED commit landing AFTER the reader's WAL snapshot
+        # is fixed must NOT tear the read: current_state returns the COHERENT pre-transition ENABLED. Under the
+        # OLD verify-then-read the separate autocommit read took a FRESH snapshot and saw the committed change
+        # (and a concurrent DELETE would yield None -> SKIP_NEUTRAL, a fail-OPEN authorization decision). FAILS
+        # on the old impl, PASSES on the atomic one.
+        path = Path(tempfile.mkdtemp(prefix="mv-atomic-state-")) / "t.db"
+        reader = PolicyStore(path)
+        _enable(reader, head="v1")
+        writer = PolicyStore(path)                       # a SECOND connection on the same DB (WAL)
+        real_verify = reader.verify_chain
+
+        def racing_verify() -> bool:
+            ok = real_verify()                            # establishes the reader's WAL read snapshot
+            writer.transition("p1", PolicyState.DEGRADED, approval=_appr("g1", "g2", op="p1-degrade"))
+            return ok
+
+        with mock.patch.object(reader, "verify_chain", side_effect=racing_verify):
+            state = reader.current_state("p1")
+        self.assertIs(state, PolicyState.ENABLED)                        # coherent pre-transition snapshot
+        self.assertIs(reader.current_state("p1"), PolicyState.DEGRADED)  # a fresh read sees the commit
+
+    def test_current_authorized_context_survives_a_concurrent_commit_mid_read(self) -> None:
+        # S3-completion ABA-hardening: current_authorized_context is now atomic, so its documented
+        # locked-snapshot guarantee is finally TRUE. Same racing_verify: an ENABLED->DEGRADED commit after the
+        # snapshot must not tear the read. Pre -> the bound (set, subject, ICV); a fresh read -> None (not
+        # ENABLED). FAILS on the old verify-then-read, PASSES on the atomic one.
+        path = Path(tempfile.mkdtemp(prefix="mv-atomic-ctx-")) / "t.db"
+        reader = PolicyStore(path)
+        _enable(reader, head="v1")
+        writer = PolicyStore(path)
+        real_verify = reader.verify_chain
+
+        def racing_verify() -> bool:
+            ok = real_verify()
+            writer.transition("p1", PolicyState.DEGRADED, approval=_appr("g1", "g2", op="p1-degrade"))
+            return ok
+
+        with mock.patch.object(reader, "verify_chain", side_effect=racing_verify):
+            ctx = reader.current_authorized_context("p1")
+        self.assertEqual(ctx, ("X", "det-1", 1))                            # coherent pre-transition snapshot
+        self.assertIsNone(reader.current_authorized_context("p1"))          # a fresh read: no longer ENABLED
 
 
 class ReAttestPrimitiveTests(unittest.TestCase):

@@ -67,13 +67,19 @@ class _FakeGovernance:
 
     def __init__(self, *, set_id: str = _SET, bound_head: str = _HEAD, subject: str = _SUBJECT,
                  attestation_none: bool = False, live_head: str | None = _HEAD,
-                 raise_attn: bool = False, raise_head: bool = False) -> None:
-        self._attn = None if attestation_none else (set_id, bound_head, subject)
+                 raise_attn: bool = False, raise_head: bool = False,
+                 generation: str = "gen-1", live_generation: str | None = None,
+                 raise_gen: bool = False) -> None:
+        self._attn = None if attestation_none else (set_id, bound_head, subject, generation)
         self._live_head = live_head
         self._raise_attn = raise_attn
         self._raise_head = raise_head
+        # default: the generation is UNCHANGED across the ABA bracket (re-read == captured) so the fake admits;
+        # move ``live_generation`` to model an ENABLED->... transition racing the oracle read.
+        self._live_generation = generation if live_generation is None else live_generation
+        self._raise_gen = raise_gen
 
-    def current_attestation(self, policy_id: str) -> tuple[str, str, str] | None:
+    def current_attestation(self, policy_id: str) -> tuple[str, str, str, str] | None:
         if self._raise_attn:
             raise RuntimeError("tier-transition chain failed verification")
         return self._attn
@@ -82,6 +88,11 @@ class _FakeGovernance:
         if self._raise_head:
             raise RuntimeError("calibration store unreachable")
         return self._live_head
+
+    def current_generation(self, policy_id: str) -> str | None:
+        if self._raise_gen:
+            raise RuntimeError("policy store unreachable")
+        return self._live_generation
 
 
 def _admit(plan: AuthorizedRunPlan, report: TrialReport,
@@ -213,6 +224,30 @@ class LiveCurrencyRefusalTests(unittest.TestCase):
         assert isinstance(res, BlockingRefusal)
         self.assertIs(res.reason, RunAdmissionRefusal.AUTHORIZED_SUBJECT_MOVED)
 
+    def test_policy_generation_moved_fail_closed(self) -> None:
+        # S3-completion ABA close (admission seam): every other live check matches (set, head, subject) — the
+        # set_head even ABA'd back to the bound head — but the policy's MONOTONIC generation re-read AFTER the
+        # set-head check differs from the one captured atomically with the attestation: an ENABLED->...
+        # transition (an APPEND) raced the oracle read, so the policy was never both ENABLED and oracle-current
+        # across the window. Fail-closed. FAILS pre-fix (no generation bracket existed).
+        res = _admit(_plan(), _report(), _FakeGovernance(generation="gen-1", live_generation="gen-2"))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.POLICY_GENERATION_MOVED)
+
+    def test_policy_generation_reread_raises_fail_closed(self) -> None:
+        # the post-oracle generation re-read raising (store unreachable) fails closed, never a silent admit.
+        res = _admit(_plan(), _report(), _FakeGovernance(raise_gen=True))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.POLICY_GENERATION_MOVED)
+
+    def test_generation_bracket_ordered_after_set_head(self) -> None:
+        # ordering: a stale set head is reported as SET_HEAD_STALE even if the generation ALSO moved — the
+        # set-head check runs first, so the oracle observation stays bracketed between the two generation reads.
+        res = _admit(_plan(), _report(),
+                     _FakeGovernance(bound_head="old-head", live_head="new-head", live_generation="gen-2"))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.SET_HEAD_STALE)
+
     def test_set_continuity_checked_before_head(self) -> None:
         # a moved set is reported as AUTHORIZED_SET_MOVED even if the head also differs (ordering).
         res = _admit(_plan(set_id=_SET), _report(),
@@ -240,6 +275,7 @@ class EveryRefusalBlocksTests(unittest.TestCase):
             _admit(_plan(set_id=_SET), _report(), _FakeGovernance(set_id="set-2")),
             _admit(_plan(), _report(), _FakeGovernance(bound_head="a", live_head="b")),
             _admit(_plan(), _report(), _FakeGovernance(subject="other")),
+            _admit(_plan(), _report(), _FakeGovernance(live_generation="gen-2")),  # POLICY_GENERATION_MOVED
         ):
             assert isinstance(res, BlockingRefusal)
             self.assertIs(res.verdict.status, VerdictType.ERROR)
@@ -331,6 +367,99 @@ class TypestateTests(unittest.TestCase):
         un = UnadmittedRunResult(plan=_plan(),
                                  result=EngineRunResult(trial_report=_report(rpd="RP", tpd="TP", gpd="GP")))
         self.assertEqual(un.measured_coordinates(), ("RP", "TP", "GP", _EID))
+
+
+class ProductionViewContinuityTests(unittest.TestCase):
+    """FINAL-DISSENT seam (S3 x S5, whole-arc integration): a plan is minted PRE-run under ENABLED; the
+    policy can transition OUT of ENABLED (fixture append -> CALIBRATING, or DEGRADED) while the engine runs.
+    The composition is CLOSED by the status gate: ``PolicyStore.current_attestation`` returns None for ANY
+    non-ENABLED policy (policy_store.py: ``new_state != ENABLED -> None``; a CALIBRATING policy -> None is
+    also proven by test_reattest), so the PRODUCTION governance view returns None and ``admit_run_result``
+    fail-closes LIVE_ATTESTATION_UNAVAILABLE — the transition is caught by the ENABLED gate, NOT left to the
+    set-head check. This exercises the REAL ``_ProductionAdmissionGovernanceView`` (not the fake), so the
+    admit path cannot silently ignore the live attestation status."""
+
+    def test_production_view_over_a_non_enabled_policy_fails_closed(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from gate.calibration_store import CalibrationStore
+        from gate.live_app import _ProductionAdmissionGovernanceView
+        from gate.policy_store import PolicyStore
+        policy_store = PolicyStore(Path(tempfile.mkdtemp(prefix="mv-cont-p-")) / "p.db")
+        calibration_store = CalibrationStore(Path(tempfile.mkdtemp(prefix="mv-cont-c-")) / "c.db")
+        view = _ProductionAdmissionGovernanceView(policy_store, calibration_store)
+        # the policy is NOT ENABLED (never enabled here; identically None for CALIBRATING/DEGRADED per the
+        # ENABLED-only gate) -> the real view's current_attestation is None.
+        self.assertIsNone(view.current_attestation("p1"))
+        # admit a real-shaped run under that view: the status gate fail-closes, regardless of any set-head.
+        res = admit_run_result(
+            UnadmittedRunResult(plan=_plan(), result=EngineRunResult(trial_report=_report())),
+            governance=view)
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.LIVE_ATTESTATION_UNAVAILABLE)
+
+    def test_production_view_real_set_head_aba_blocked_by_generation(self) -> None:
+        # GENUINE real-store ABA (dissent item 1) — a REAL CalibrationStore whose set_head actually ABAs, no
+        # stubbed head. Seed set _SET with fixture b0 -> the REAL bound head H; ENABLE p1 bound to (_SET, H,
+        # _SUBJECT). During admission's oracle read (a deterministic hook overriding oracle_head_for): append
+        # b1 -> real set_head moves to H1; transition p1 OUT of ENABLED (generation G1 -> G2); DEPRECATE b1 ->
+        # real set_head RETURNS to H (the genuine ABA). The hook returns the REAL set_head (== H), so
+        # AUTHORIZED_SET_MOVED + SET_HEAD_STALE + subject-currency all PASS on the real ABA and ONLY the
+        # generation bracket can catch it -> POLICY_GENERATION_MOVED. Pre-fix (no bracket) this ADMITS a run
+        # for a policy that already left ENABLED. Proves the production view carries the generation atomically
+        # in current_attestation AND re-reads it via current_generation, over a REAL set_head round-trip.
+        import tempfile
+        from pathlib import Path
+        from core.calibration import FixtureLabel
+        from gate.authority import GovernanceApproval
+        from gate.calibration_store import AdmissionCapability, CalibrationStore, ChangeOp
+        from gate.live_app import _ProductionAdmissionGovernanceView
+        from gate.policy_state import PolicyState
+        from gate.policy_store import PolicyStore
+
+        def _appr(*p: str, op: str) -> GovernanceApproval:
+            return GovernanceApproval(principals=p, purpose="t", rationale="r", operation_id=op)
+
+        ps = PolicyStore(Path(tempfile.mkdtemp(prefix="mv-realaba-p-")) / "p.db")
+        cs = CalibrationStore(Path(tempfile.mkdtemp(prefix="mv-realaba-c-")) / "c.db")
+        cap = AdmissionCapability()
+        icv = IDENTITY_CONTRACT_VERSION
+        # seed set _SET with b0 -> the REAL bound head H (a genuine, non-empty membership digest)
+        cs.append(ChangeOp.ADD_KNOWN_BAD, admission=cap, approval=_appr("g1", "g2", op="b0"),
+                  fixture_id="b0", set_id=_SET, label=FixtureLabel.KNOWN_BAD, payload=b"seed")
+        H = cs.set_head(_SET)
+        # ENABLE p1 bound to (_SET, H, _SUBJECT) so plan/report coordinates match the attestation.
+        ps.transition("p1", PolicyState.PENDING_CALIBRATION, approval=_appr("g1", op="p1-1"))
+        ps.enter_calibrating("p1", approval=_appr("g1", op="p1-2"), set_id=_SET, pinned_set_version=H,
+                             detector_id=_SUBJECT, expected_profile_digest="pd",
+                             expected_trust_policy_digest="tp", expected_guard_policy_digest="gp",
+                             identity_contract_version=icv)
+        ps.record_calibration_pass("cal-p1", policy_id="p1", pinned_set_version=H, detector_identity=_SUBJECT,
+                                   set_id=_SET, identity_contract_version=icv)
+        ps.transition("p1", PolicyState.ENABLED, approval=_appr("g1", op="p1-3"),
+                      calibration_result_ref="cal-p1", set_id=_SET, pinned_set_version=H,
+                      detector_identity=_SUBJECT, identity_contract_version=icv)
+        g1 = ps.policy_head("p1")
+
+        class _RealAbaView(_ProductionAdmissionGovernanceView):
+            def oracle_head_for(self, set_id: str) -> str | None:
+                # the REAL ABA, straddling the policy transition — all inside the oracle-read window:
+                cs.append(ChangeOp.ADD_KNOWN_BAD, admission=cap, approval=_appr("g1", "g2", op="b1"),
+                          fixture_id="b1", set_id=_SET, label=FixtureLabel.KNOWN_BAD, payload=b"churn")
+                moved = cs.set_head(_SET)                       # membership genuinely moved to H1
+                ps.transition("p1", PolicyState.DEGRADED, approval=_appr("g1", "g2", op="p1-degrade"))
+                cs.append(ChangeOp.DEPRECATE_KNOWN_BAD, approval=_appr("g1", "g2", op="dep-b1"),
+                          fixture_id="b1", set_id=_SET)
+                back = super().oracle_head_for(set_id)          # REAL set_head — now back to H (the ABA)
+                assert moved != H and back == H, "test setup: set_head must ABA H -> H1 -> H"
+                return back
+
+        res = admit_run_result(
+            UnadmittedRunResult(plan=_plan(), result=EngineRunResult(trial_report=_report())),
+            governance=_RealAbaView(ps, cs))
+        assert isinstance(res, BlockingRefusal)
+        self.assertIs(res.reason, RunAdmissionRefusal.POLICY_GENERATION_MOVED)
+        self.assertNotEqual(ps.policy_head("p1"), g1)          # generation genuinely moved (G2 != G1)
 
 
 if __name__ == "__main__":

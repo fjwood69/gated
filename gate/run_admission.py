@@ -24,16 +24,23 @@ MEASURED ≠ DECLARED, in two dimensions:
 
 LIVE READS (CP1). Admission reads, POST-run, via an injected ``AdmissionGovernanceView`` (admission's OWN
 read, fail-closed on None/exception):
-  * ``current_attestation(policy_id)`` → ``(set_id, bound_oracle_head, subject)`` — ONE row-snapshot of the
-    policy's current ENABLED calibration binding (a non-None return internally GUARANTEES ICV==constant +
-    a matching persisted pass). This ALONE carries subject + bound head + the ICV guarantee — reading the
-    sibling ``current_authorized_context`` too would add no information (same row, same gates) and would
-    reintroduce a subject-vs-head read-then-read race.
+  * ``current_attestation(policy_id)`` → ``(set_id, bound_oracle_head, subject, generation)`` — ONE atomic
+    row-snapshot of the policy's current ENABLED calibration binding (a non-None return internally GUARANTEES
+    ICV==constant + a matching persisted pass). ``generation`` is the policy's monotonic head ``record_hash``
+    captured IN THE SAME snapshot — the baseline the ABA bracket revalidates. This ALONE carries subject +
+    bound head + generation + the ICV guarantee — reading the sibling ``current_authorized_context`` too would
+    add no information (same row, same gates) and would reintroduce a subject-vs-head read-then-read race.
   * ``oracle_head_for(set_id)`` → the LIVE ``set_head`` — a SEPARATE read of the calibration store.
-    ``current_attestation`` + ``set_head`` are NOT an atomic cross-store snapshot; a set can move between
-    them. That window is fail-closed + self-correcting (a drift visible at read time is refused
-    SET_HEAD_STALE; a drift between the two reads is caught on the NEXT PR event) — the same posture
-    ``_enforce_if_oracle_current`` already runs pre-run.
+  * ``current_generation(policy_id)`` → the policy's monotonic head ``record_hash``, re-read AFTER the oracle
+    read. ``current_attestation`` + ``set_head`` are NOT an atomic cross-store snapshot, and ``set_head`` is a
+    CURRENT-membership digest that can ABA (a deprecate→re-add returns an EARLIER head). The generation
+    bracket closes that window: because the policy tier chain is APPEND-ONLY (no mutate/delete path) and
+    ``record_hash`` is collision-resistant (a value never repeats once a new record is appended), a
+    ``generation`` unchanged across ``[attestation-snapshot, re-read]`` establishes that no policy transition
+    occurred DURING the bracketed oracle observation — so an ENABLED→… move that raced a ``set_head`` ABA back
+    to ``bound_head`` is caught (POLICY_GENERATION_MOVED) rather than admitted. A move committing strictly
+    AFTER the re-read is a fresh event caught by the NEXT PR — the same fail-closed posture
+    ``_enforce_if_oracle_current`` runs pre-run.
 
 Why set currency matters (dissent premise corrected): a non-None ``current_attestation`` does NOT prove the
 set is current — between a fixture-append (which moves ``set_head``) and the re-cal worker transitioning the
@@ -119,24 +126,36 @@ class RunAdmissionRefusal(Enum):
     AUTHORIZED_SET_MOVED = "authorized_set_moved"    # plan's authorized set != the live attestation's set (a different-set rebind)
     SET_HEAD_STALE = "set_head_stale"                # bound oracle_head != live set_head (the set drifted since calibration)
     AUTHORIZED_SUBJECT_MOVED = "authorized_subject_moved"  # dispatched target != the live-authorized subject (governance moved the subject)
+    POLICY_GENERATION_MOVED = "policy_generation_moved"  # the policy's monotonic generation moved during the oracle read (an ENABLED->... transition raced the set-head check — closes the set_head ABA)
 
 
 class AdmissionGovernanceView(Protocol):
-    """Admission's OWN read surface onto live governance (never caller-asserted). Both reads may RAISE (a
+    """Admission's OWN read surface onto live governance (never caller-asserted). All reads may RAISE (a
     broken chain / unreachable store) — ``admit_run_result`` catches and fails closed. Structurally
-    satisfied by the production ``PolicyStore.current_attestation`` + a ``set_head`` wrapper; tests inject a
-    fake. No write surface — admission never mutates governance state (this is a read-only validation
-    point, not a policy commit point)."""
+    satisfied by the production ``_ProductionAdmissionGovernanceView`` (backed by
+    ``PolicyStore.current_attestation_snapshot`` + ``CalibrationStore.set_head`` + ``PolicyStore.policy_head``);
+    tests inject a fake. No write surface — admission never mutates governance state (this is a read-only
+    validation point, not a policy commit point)."""
 
-    def current_attestation(self, policy_id: str) -> tuple[str, str, str] | None:
-        """``(set_id, bound_oracle_head, subject)`` for the policy's CURRENT ENABLED calibration binding,
-        or None if the policy is not ENABLED / has no matching pass. A non-None return GUARANTEES the
-        binding is under the current identity contract (an internal gate)."""
+    def current_attestation(self, policy_id: str) -> tuple[str, str, str, str] | None:
+        """``(set_id, bound_oracle_head, subject, generation)`` for the policy's CURRENT ENABLED calibration
+        binding, or None if the policy is not ENABLED / has no matching pass. A non-None return GUARANTEES the
+        binding is under the current identity contract (an internal gate). ``generation`` is the policy's
+        MONOTONIC generation (its head record_hash) captured ATOMICALLY with the rest of the binding — the
+        baseline the ABA bracket revalidates via ``current_generation`` after the oracle read."""
         ...
 
     def oracle_head_for(self, set_id: str) -> str | None:
         """The LIVE ``set_head`` of ``set_id`` (the current sealed membership digest), or None if it cannot
         be resolved (fail-closed convention)."""
+        ...
+
+    def current_generation(self, policy_id: str) -> str | None:
+        """The policy's CURRENT monotonic generation (its head record_hash), or None if it cannot be read.
+        Re-read AFTER the oracle observation to close the ``set_head`` ABA: if it differs from the generation
+        captured in ``current_attestation``, a policy transition raced the oracle read — fail closed. A plain
+        head read (NOT chain-verified) is sufficient: it detects an APPENDED transition, and the append-only
+        property is structural (the policy store has no mutate/delete path)."""
         ...
 
 
@@ -414,7 +433,10 @@ def admit_run_result(
       * bound oracle_head != live set_head → SET_HEAD_STALE (the set drifted since calibration);
       * dispatched target != the live-authorized subject → AUTHORIZED_SUBJECT_MOVED (governance moved the
         subject; since measured == target from the structural pass, this is the single non-dead subject
-        currency check).
+        currency check);
+      * live generation != the generation bound at the attestation snapshot → POLICY_GENERATION_MOVED (the
+        policy tier moved during the oracle read, so its currency cannot be confirmed — closes the ``set_head``
+        ABA; re-read AFTER the set-head check so the oracle observation is bracketed).
 
     On success, an ``AdmittedRunResult`` (proof-gated) carrying the report's aggregate verdict + the scoped
     admission metadata (``admitted_set_id`` + ``bound_oracle_head`` + measured subject)."""
@@ -438,7 +460,7 @@ def admit_run_result(
             RunAdmissionRefusal.LIVE_ATTESTATION_UNAVAILABLE,
             f"{plan.policy_id!r} has no current ENABLED attestation — not admissible (fail-closed)",
             sub_reason="attestation_absent")
-    live_set_id, bound_head, live_subject = attestation
+    live_set_id, bound_head, live_subject, bound_generation = attestation
 
     # set continuity FIRST — BEFORE the oracle query — so a moved set + an unavailable oracle is classified
     # as AUTHORIZED_SET_MOVED, not ORACLE_UNAVAILABLE (forensic ordering). The plan's authorized set must be
@@ -475,6 +497,30 @@ def admit_run_result(
             RunAdmissionRefusal.AUTHORIZED_SUBJECT_MOVED,
             f"dispatched target {plan.target_subject[:12]}.. != the live-authorized subject "
             f"{live_subject[:12]}.. — governance moved the authorized subject since the plan was minted")
+
+    # ABA close (the cross-store hole ``set_head`` alone cannot cover): the attestation read and the oracle
+    # read above are TWO reads, and ``set_head`` is a CURRENT-membership digest that can ABA (deprecate→re-add
+    # returns an earlier head). Re-read the policy's MONOTONIC generation AFTER the set-head check: if it moved
+    # since the attestation snapshot, an ENABLED->... transition (an APPEND) landed across the oracle read, so
+    # the generation was NOT stable over the oracle observation and the policy's currency cannot be confirmed —
+    # even if the set head ABA'd back to ``bound_head``. (append-only tier chain + collision-resistant
+    # record_hash => an unchanged generation proves no transition across the bracket; a move committing strictly
+    # AFTER this re-read is a fresh event for the next PR.) Ordered strictly AFTER the set-head check so the
+    # oracle observation is bracketed between ``bound_generation`` and this re-read. Fail-closed on None/exc.
+    try:
+        live_generation = governance.current_generation(plan.policy_id)
+    except Exception as exc:
+        return BlockingRefusal(
+            RunAdmissionRefusal.POLICY_GENERATION_MOVED,
+            f"policy generation re-read failed for {plan.policy_id!r} ({type(exc).__name__}) — fail-closed",
+            sub_reason="store_unreachable")
+    if live_generation != bound_generation:
+        return BlockingRefusal(
+            RunAdmissionRefusal.POLICY_GENERATION_MOVED,
+            f"policy {plan.policy_id!r} generation {str(bound_generation)[:12]}.. moved to "
+            f"{str(live_generation)[:12]}.. across the oracle read — the same policy generation was not "
+            "stable over the oracle observation, so its currency cannot be confirmed (a set_head ABA cannot "
+            "mask a policy transition); fail-closed")
 
     # every live check passed — mint a FRESH result-bound proof carrying the live-read values AND bound to
     # the exact plan + report (P1-B), and derive the admitted metadata from it (no caller-supplied metadata).

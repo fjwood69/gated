@@ -149,22 +149,32 @@ def require_distinct_db_paths(queue_db: Path, policy_db: Path, calibration_db: P
 
 class _ProductionAdmissionGovernanceView:
     """The production ``AdmissionGovernanceView`` (CP2 S5, board D2): admission's OWN post-run governance
-    read. ``current_attestation`` is backed DIRECTLY by ``PolicyStore.current_attestation`` — which already
-    gates ICV == the current identity contract AND the hash-chained pass exact-match IN-STORE, returning the
-    ``(set_id, oracle_head, subject)`` 3-tuple — so there is NO view-side ICV gate to duplicate (a store
-    invariant belongs in the store, not re-implemented per consumer). ``oracle_head_for`` is
-    ``CalibrationStore.set_head``. Both reads may RAISE (a broken chain / unreachable store);
-    ``admit_run_result`` catches and fails closed. Read-only — admission never mutates governance state."""
+    read. ``current_attestation`` is backed by ``PolicyStore.current_attestation_snapshot`` — which already
+    gates ICV == the current identity contract AND the hash-chained pass exact-match IN-STORE inside ONE
+    atomic snapshot — repackaged to the ``(set_id, oracle_head, subject, generation)`` 4-tuple admission needs
+    (the ICV gate stays a store invariant, not re-implemented here; the ``generation`` is the snapshot's own
+    monotonic head record_hash, so it is captured ATOMICALLY with the binding — the ABA-bracket baseline).
+    ``oracle_head_for`` is ``CalibrationStore.set_head``; ``current_generation`` is ``PolicyStore.policy_head``
+    (the post-oracle re-read that closes the ``set_head`` ABA). All reads may RAISE (a broken chain /
+    unreachable store); ``admit_run_result`` catches and fails closed. Read-only — admission never mutates
+    governance state."""
 
     def __init__(self, policy_store: PolicyStore, calibration_store: CalibrationStore) -> None:
         self._policy_store = policy_store
         self._calibration_store = calibration_store
 
-    def current_attestation(self, policy_id: str) -> tuple[str, str, str] | None:
-        return self._policy_store.current_attestation(policy_id)
+    def current_attestation(self, policy_id: str) -> tuple[str, str, str, str] | None:
+        snap = self._policy_store.current_attestation_snapshot(policy_id)
+        if snap is None:
+            return None
+        set_id, oracle_head, subject, _icv, generation = snap  # drop ICV (store-gated); carry generation
+        return (set_id, oracle_head, subject, generation)
 
     def oracle_head_for(self, set_id: str) -> str | None:
         return self._calibration_store.set_head(set_id)
+
+    def current_generation(self, policy_id: str) -> str | None:
+        return self._policy_store.policy_head(policy_id)
 
 
 def build(
