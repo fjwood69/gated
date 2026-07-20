@@ -453,7 +453,7 @@ They decide which "proven" claims are real.
   but it is NOT a fail-open risk]** `action_required` BLOCKS the merge; **(b) the
   install token refreshes mid-check** when a verdict computation runs longer than the
   refresh margin (~27s/run × N trials); **(c) the `iat` back-date (60s) absorbs real
-  gate-host↔GitHub clock skew** (works on the NUC where clocks are close; a deployment
+  gate-host↔GitHub clock skew** (works on a local machine where clocks are close; a deployment
   flake otherwise); **(d) the install-token cache invalidates on a 401 / App-uninstall**
   — TTL-based expiry doesn't cover a token that dies *early* by uninstall (key-rotation
   IS handled: the private key is re-read from the `KeySource` on every mint);

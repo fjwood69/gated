@@ -1,0 +1,9 @@
+gated
+Copyright 2026 Fred Wood
+
+This product includes software developed as the reference implementation of
+the PBGF Conformance Specification (https://moriapp.dev/pbgf-cs).
+
+Licensed under the Apache License, Version 2.0. See LICENSE for terms.
+Commercial offerings adjacent to this software are described in COMMERCIAL.md;
+nothing in that file modifies the Apache-2.0 grant.

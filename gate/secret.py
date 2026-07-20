@@ -8,7 +8,7 @@ so the deployment build swaps the source (Vault / sealed secret / cloud secret
 manager) WITHOUT changing the receiver — the same pluggable-backend discipline as
 the sandbox layer.
 
-    reference build  -> ``EnvSecretSource``   (env var; podman-on-NUC)
+    reference build  -> ``EnvSecretSource``   (env var; reference podman build)
     deployment       -> a secret-manager backend (deferred; not this tree's concern)
 """
 from __future__ import annotations

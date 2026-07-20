@@ -13,7 +13,7 @@ on:
 # security path: PyNaCl (libsodium Ed25519) — one does not roll one's own crypto
 # (see gate/signing.py). Podman-gated tests (OCI / observed / demo-regression)
 # self-skip when no runtime/image is present, so they are green-by-skip on hosted
-# runners; the boundary mechanism is verified on real podman on the NUC, not here.
+# runners; the boundary mechanism is verified on real podman on a self-hosted runner, not here.
 
 jobs:
   sterility:

@@ -1,7 +1,7 @@
 """Increment 1.3 OCISandbox (HERMETIC) tests — real podman required.
 
 Skipped entirely when no OCI runtime can run the base image hermetically (e.g. CI
-without podman). On the NUC: run from gated/ with `python3 -m unittest discover -s tests`.
+without podman). On a machine with podman: run from gated/ with `python3 -m unittest discover -s tests`.
 
 Base image must contain a Python interpreter (the artifacts run `python3 /artifact/main.py`).
 """

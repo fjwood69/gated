@@ -1,6 +1,6 @@
 """Increment 1.4 ObservedOCISandbox tests — real podman required.
 
-Skipped when no OCI runtime can run the base image hermetically. On the NUC:
+Skipped when no OCI runtime can run the base image hermetically. On a machine with an OCI runtime:
 run from gated/ with `python3 -m unittest tests.test_observed_sandbox`.
 """
 from __future__ import annotations
