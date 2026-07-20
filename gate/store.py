@@ -28,6 +28,13 @@ from typing import Callable
 from .queue import GatingEvent, SinkFull
 
 
+class OutboxInvariantError(RuntimeError):
+    """A gating row reached a terminal ``finalize`` WIN with no outbox RESET to bind its conclusion to —
+    terminal-without-publication, the v1 defect. finalize RAISES rather than silently skipping the
+    publication (which would leave the PR's required check permanently unpublished). A legacy row with no
+    reset must be terminalized by the startup migration, never laundered through finalize."""
+
+
 @dataclass(frozen=True)
 class PublicationJob:
     """A claimed publication the Publisher must drive onto the ACTUATOR (the GitHub Check Run). The
@@ -138,6 +145,27 @@ class GatingStore:
         if "gate_outcome" not in cols:
             conn.execute("ALTER TABLE gating ADD COLUMN gate_outcome TEXT")
         conn.commit()
+        # Increment A dissent (blocker 2): the UPGRADE path is a producer of stranded state. Rows that
+        # predate the publication outbox have NO reset row, so a queued legacy row is permanently
+        # unclaimable (the reset-gate) and a processing legacy row would drive finalize's raising invariant.
+        # Terminalize every legacy NONTERMINAL row (no outbox reset) explicitly, ONCE, at startup.
+        self._migrate_legacy_nonterminal(conn)
+
+    def _migrate_legacy_nonterminal(self, conn: sqlite3.Connection) -> None:
+        """Terminalize legacy nonterminal gating rows that have NO outbox RESET (pre-Increment-A rows) as
+        ``superseded`` with reason ``unmigratable_legacy``. Idempotent (a terminalized row no longer matches).
+        A synthesized reset would need the check-name identity coordinate, which legacy rows never persisted;
+        re-deriving it from live config would re-import the persisted-name defect the complete-binding fix
+        closed — so these rows are HONESTLY abandoned (audit reason) rather than migrated on a guessed
+        identity. A fresh Increment-A row is UNAFFECTED: enqueue arms its reset in the SAME atomic txn as the
+        gating insert, so a legit nonterminal row ALWAYS has a reset and never matches this sweep."""
+        conn.execute(
+            "UPDATE gating SET status='superseded', reason='unmigratable_legacy', updated_at=? "
+            "WHERE status IN ('queued','processing') AND NOT EXISTS "
+            "(SELECT 1 FROM publication p WHERE p.delivery_id=gating.delivery_id AND p.phase='reset')",
+            (self._clock(),),
+        )
+        conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
         conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
@@ -218,6 +246,22 @@ class GatingStore:
                     "WHERE repo_full_name=? AND head_sha=? AND check_name=? AND generation<? "
                     "AND state IN ('pending','published')",
                     (event.repo_full_name, event.head_sha, self._check_name, gen),
+                )
+                # Dissent blocker 1 — RETIRE superseded-while-queued deliveries IN THE SAME TXN. A prior
+                # delivery for this identity still in 'queued' (whether or not its reset ever published) can
+                # NEVER be claimed once this newer generation superseded its reset (the reset-gate requires
+                # state='published'), yet it would sit in 'queued' forever and count against capacity. Move it
+                # to the 'superseded' TERMINAL with its own audit reason, so queued_count excludes it and a
+                # reopen storm is VISIBLE in the record (not inferred from a capacity graph). Same atomic unit
+                # as the supersession — a sweeper would leave a window where a concurrent claim_next races the
+                # retirement. This delivery (the newest, event.delivery_id) is excluded. External surface: if a
+                # retired predecessor's reset already published, THIS generation's reset republishes the same
+                # identity at a newer generation (self-corrects by construction); if it never published, no
+                # external surface exists to correct.
+                conn.execute(
+                    "UPDATE gating SET status='superseded', reason='superseded_while_queued', updated_at=? "
+                    "WHERE repo_full_name=? AND head_sha=? AND status='queued' AND delivery_id!=?",
+                    (now, event.repo_full_name, event.head_sha, event.delivery_id),
                 )
             conn.execute("COMMIT")
         except Exception:
@@ -318,24 +362,32 @@ class GatingStore:
                 r = conn.execute(
                     "SELECT generation, repo_full_name, head_sha, check_name FROM publication "
                     "WHERE delivery_id=? AND phase='reset'", (delivery_id,)).fetchone()
-                if r is not None:  # the reset was armed at enqueue; without it there is nothing to bind to
-                    gen, repo, sha, cname = (int(r["generation"]), r["repo_full_name"],
-                                             r["head_sha"], r["check_name"])
-                    newer = conn.execute(
-                        "SELECT 1 FROM publication n WHERE n.repo_full_name=? AND n.head_sha=? "
-                        "AND n.check_name=? AND n.generation>? LIMIT 1",
-                        (repo, sha, cname, gen)).fetchone()
-                    pub_state = "superseded" if newer is not None else "pending"
-                    conn.execute(
-                        "INSERT INTO publication (delivery_id, generation, repo_full_name, head_sha,"
-                        " check_name, phase, status, conclusion, summary, state, attempts, next_at,"
-                        " created_at) VALUES (?,?,?,?,?, 'conclusion', 'completed', ?, ?, ?, 0, ?, ?) "
-                        "ON CONFLICT(delivery_id, phase) DO UPDATE SET generation=excluded.generation,"
-                        "  status='completed', conclusion=excluded.conclusion, summary=excluded.summary,"
-                        "  state=excluded.state, attempts=0, lease_until=NULL, next_at=excluded.next_at",
-                        (delivery_id, gen, repo, sha, cname,
-                         publish_conclusion, publish_summary, pub_state, now, now),
-                    )
+                if r is None:
+                    # Dissent blocker 2 — terminal-without-publication is FORBIDDEN (the v1 defect). A won
+                    # finalize with no outbox RESET has nothing to bind the conclusion to; skipping it
+                    # silently would leave the PR's required check permanently unpublished. RAISE (the except
+                    # ROLLS BACK the terminal UPDATE, so the row stays 'processing' and surfaces LOUDLY). A
+                    # legacy row with no reset must be terminalized by the startup migration, never here.
+                    raise OutboxInvariantError(
+                        f"finalize won for {delivery_id!r} but no outbox RESET exists to bind the conclusion "
+                        "to — terminal-without-publication is forbidden (migrate legacy rows at startup)")
+                gen, repo, sha, cname = (int(r["generation"]), r["repo_full_name"],
+                                         r["head_sha"], r["check_name"])
+                newer = conn.execute(
+                    "SELECT 1 FROM publication n WHERE n.repo_full_name=? AND n.head_sha=? "
+                    "AND n.check_name=? AND n.generation>? LIMIT 1",
+                    (repo, sha, cname, gen)).fetchone()
+                pub_state = "superseded" if newer is not None else "pending"
+                conn.execute(
+                    "INSERT INTO publication (delivery_id, generation, repo_full_name, head_sha,"
+                    " check_name, phase, status, conclusion, summary, state, attempts, next_at,"
+                    " created_at) VALUES (?,?,?,?,?, 'conclusion', 'completed', ?, ?, ?, 0, ?, ?) "
+                    "ON CONFLICT(delivery_id, phase) DO UPDATE SET generation=excluded.generation,"
+                    "  status='completed', conclusion=excluded.conclusion, summary=excluded.summary,"
+                    "  state=excluded.state, attempts=0, lease_until=NULL, next_at=excluded.next_at",
+                    (delivery_id, gen, repo, sha, cname,
+                     publish_conclusion, publish_summary, pub_state, now, now),
+                )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")

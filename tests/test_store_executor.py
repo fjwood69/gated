@@ -12,6 +12,7 @@ and an error-requeue mints a fresh generation (never a wedged, unpublishable que
 """
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -30,7 +31,7 @@ from gate.job_result import JobResult, NonRunDecision
 from gate.policy_state import Disposition
 from gate.queue import GatingEvent, SinkFull
 from gate.run_admission import AdmittedRunResult
-from gate.store import GatingStore, StoreBackedGatingSink
+from gate.store import GatingStore, OutboxInvariantError, StoreBackedGatingSink
 from tests.test_run_admission import _FakeGovernance, _admit, _plan, _report
 
 
@@ -359,7 +360,7 @@ class ExecutorTests(unittest.TestCase):
     def test_non_jobresult_return_is_unaccounted_result_not_worker_fault(self) -> None:
         # board C2: a runner that RETURNS a non-JobResult (a bare Verdict) is UNACCOUNTED_RESULT, DISTINCT
         # from a worker exception (WORKER_FAULT). account() rejects it OUTSIDE the runner try.
-        self._run("d1", lambda e: Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS))  # type: ignore[arg-type,return-value]
+        self._run("d1", lambda e: Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS))  # noqa: E501 -- NOT a JobResult (runtime-rejected)
         _status, _v, reason, _u, _g = self._row("a" * 40)
         self.assertEqual(reason, "unaccounted_result")
         self.assertEqual(self.client.surface("acme/widgets", "a" * 40),
@@ -594,6 +595,127 @@ class PublicationOutboxTests(unittest.TestCase):
         assert job is not None and job.phase == "reset" and job.delivery_id == "d1"  # NOT wedged
         self.assertTrue(self.store.mark_publication_published("d1", "reset"))
         self.assertIsNotNone(self.store.claim_next())     # d1 (re-delivered) can now run
+
+
+class PublicationLivenessTests(unittest.TestCase):
+    """Whole-arc dissent remediation — the STRANDED-STATE class (correctness held, liveness lost). Blocker 1:
+    a superseded-while-queued delivery must be RETIRED (never left counting against capacity). Blocker 2: the
+    upgrade path must not strand legacy nonterminal rows, and finalize must RAISE (never silently terminalize)
+    without an outbox record. Bound: Publisher.drain_once cannot starve the executor under sustained ingress."""
+
+    _REPO = "acme/widgets"
+
+    def setUp(self) -> None:
+        self.store, self.clk, self.dir = _store()
+        self.client = _FakeCheckClient()
+        self.publisher = Publisher(self.store, self.client)
+
+    def _reason(self, store: GatingStore, delivery_id: str) -> str | None:
+        row = store._conn().execute(
+            "SELECT reason FROM gating WHERE delivery_id=?", (delivery_id,)).fetchone()
+        return None if row is None else row["reason"]
+
+    # ---- Blocker 1: reopen storm leaves no unclaimable residue -----------
+
+    def test_reopen_storm_returns_to_steady_state_no_unclaimable_residue(self) -> None:
+        sha = "c" * 40
+        # leg A — the FIRST delivery's reset is PUBLISHED, then superseded by the storm.
+        self.store.enqueue(_event("d0", sha=sha))
+        self.publisher.drain_once()                       # d0 reset PUBLISHED
+        self.assertEqual(self.client.surface(self._REPO, sha), (CheckStatus.IN_PROGRESS, None))
+        # leg B — every subsequent delivery's reset is NEVER published before the next supersedes it.
+        for i in range(1, 25):
+            self.store.enqueue(_event(f"d{i}", sha=sha))
+        # steady state: exactly ONE claimable-queued delivery (the newest); all priors RETIRED.
+        self.assertEqual(self.store.queued_count(), 1)
+        self.assertEqual(self.store.status_of("d0"), "superseded")   # leg A retired
+        self.assertEqual(self.store.status_of("d1"), "superseded")   # leg B retired
+        self.assertEqual(self.store.status_of("d24"), "queued")      # the newest survives
+        # audit visibility: the retirement reason is recorded (a storm is visible in the record).
+        self.assertEqual(self._reason(self.store, "d0"), "superseded_while_queued")
+        self.assertEqual(self._reason(self.store, "d1"), "superseded_while_queued")
+        # the newest still runs to completion end-to-end (no residue blocks it).
+        self.publisher.drain_once()                       # publish d24 reset
+        ev = self.store.claim_next()
+        assert ev is not None and ev.delivery_id == "d24"
+
+    def test_retired_superseded_row_is_non_participating_in_the_classifier(self) -> None:
+        from gate.ledger import OutcomeKind, VerdictRow, classify_merge
+        sha = "c" * 40
+        self.store.enqueue(_event("d0", sha=sha))
+        self.publisher.drain_once()
+        self.store.enqueue(_event("d1", sha=sha))         # retires d0 as superseded-while-queued
+        # a retired 'superseded' row coexisting with a clean done verdict must NOT change the outcome.
+        rows = [VerdictRow(status=s, verdict=v, reason=r, updated_at=u, gate_outcome=g)
+                for (s, v, r, u, g) in self.store.verdicts_for_sha(sha)]
+        rows.append(VerdictRow(status="done", verdict="pass", reason="UNANIMOUS_PASS", updated_at=99.0,
+                               gate_outcome="run_verdict"))
+        self.assertTrue(any(r.status == "superseded" for r in rows))   # it IS in the audit trail
+        self.assertIs(classify_merge(rows).kind, OutcomeKind.NO_OVERRIDE)  # but does not skew the verdict
+
+    # ---- Blocker 2: upgrade migration + finalize invariant ---------------
+
+    def test_upgrade_migration_terminalizes_all_legacy_nonterminal_shapes(self) -> None:
+        # a fixture DB seeded (via raw SQL, bypassing enqueue) with the three legacy shapes that predate the
+        # publication outbox — NONE has a reset row. A fresh GatingStore's startup migration must terminalize
+        # every one (never leave a permanently-unclaimable queued row, nor a processing row that would drive
+        # finalize's raising invariant).
+        db = self.dir / "legacy.db"
+        seed = GatingStore(db, clock=self.clk)             # create schema
+        raw = sqlite3.connect(str(db))
+        raw.executescript(
+            "INSERT INTO gating (delivery_id, repo_full_name, head_sha, installation_id, action, status,"
+            " enqueued_at, updated_at) VALUES"
+            " ('leg-queued-payload','acme/w','a','1','opened','queued',1,1),"
+            " ('leg-queued-bare','acme/w','b','1','opened','queued',1,1),"
+            " ('leg-processing','acme/w','c','1','opened','processing',1,1);")
+        raw.commit()
+        raw.close()
+        del seed
+        migrated = GatingStore(db, clock=self.clk)         # __init__ runs the migration
+        self.assertEqual(migrated.queued_count(), 0)       # no stranded nonterminal residue
+        for did in ("leg-queued-payload", "leg-queued-bare", "leg-processing"):
+            self.assertEqual(migrated.status_of(did), "superseded")
+            self.assertEqual(self._reason(migrated, did), "unmigratable_legacy")
+        # a fresh Increment-A delivery on the SAME upgraded DB is unaffected (arms its own reset).
+        migrated.enqueue(_event("fresh", sha="f" * 40))
+        self.assertEqual(migrated.status_of("fresh"), "queued")
+
+    def test_finalize_without_outbox_reset_raises_never_silently_terminalizes(self) -> None:
+        # terminal-without-publication is the v1 defect: a won finalize with no RESET must RAISE, and the
+        # raise must ROLL BACK the terminal UPDATE (the row stays 'processing', surfacing loudly).
+        db = self.dir / "noreset.db"
+        store = GatingStore(db, clock=self.clk)            # migration runs on the empty DB -> no-op
+        raw = sqlite3.connect(str(db))                     # seed a processing row with NO reset AFTER migration
+        raw.execute(
+            "INSERT INTO gating (delivery_id, repo_full_name, head_sha, installation_id, action, status,"
+            " enqueued_at, updated_at) VALUES ('p','acme/w','a','1','opened','processing',1,1)")
+        raw.commit()
+        raw.close()
+        with self.assertRaises(OutboxInvariantError):
+            store.finalize("p", "done", verdict="pass", reason="R", gate_outcome="run_verdict",
+                           publish_conclusion="success", publish_summary="s")
+        self.assertEqual(store.status_of("p"), "processing")  # rolled back — surfaces loudly, not laundered
+
+    # ---- Bound: sustained ingress cannot starve the executor -------------
+
+    def test_drain_once_bounded_by_max_items(self) -> None:
+        pub = Publisher(self.store, self.client, max_items=3)
+        for i in range(10):
+            self.store.enqueue(_event(f"d{i}", sha=f"{i:040d}"))   # 10 distinct identities, all claimable
+        self.assertEqual(pub.drain_once(), 3)                       # BOUNDED — did not drain all 10
+        self.assertEqual(pub.drain_once(), 3)                       # remaining work drains on later calls
+        self.assertGreater(self.store.queued_count(), 0)            # executor still has claimable work between
+
+    def test_drain_once_bounded_by_wall_clock(self) -> None:
+        ticks = [0.0, 0.0, 9.0, 9.0, 9.0]                           # start=0; after 1 item the clock passes 5s
+        pub = Publisher(self.store, self.client, max_seconds=5.0,
+                        clock=lambda: ticks.pop(0) if ticks else 9.0)
+        for i in range(10):
+            self.store.enqueue(_event(f"d{i}", sha=f"{i:040d}"))
+        published = pub.drain_once()
+        self.assertLessEqual(published, 1)                          # wall-clock budget stopped it early
+        self.assertGreater(self.store.queued_count(), 5)           # the loop did NOT monopolise the tick
 
 
 class BackpressureTests(unittest.TestCase):

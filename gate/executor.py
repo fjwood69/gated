@@ -27,6 +27,7 @@ external message broker (open-core purity).
 from __future__ import annotations
 
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
@@ -263,23 +264,40 @@ class Publisher:
         *,
         lease_seconds: float = 300.0,
         backoff_seconds: float = 30.0,
+        max_items: int = 64,
+        max_seconds: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
         lifecycle: LifecycleSink | None = None,
     ) -> None:
         self._store = store
         self._client = client
         self._lease = lease_seconds
         self._backoff = backoff_seconds
+        # Dissent bound: a DUAL per-call budget (items AND wall-clock). The Publisher runs BEFORE the executor
+        # in the sole poll loop, so an UNBOUNDED drain under sustained ingress (or a slow GitHub API turning a
+        # generous item budget into a time sink) would defer executor progress indefinitely — the classic
+        # single-loop starvation. The budget guarantees drain_once RETURNS so executor.drain() runs; remaining
+        # work drains on the next tick. Both bounds needed: items alone starves on a slow actuator; time alone
+        # lets a fast actuator monopolise the loop.
+        self._max_items = max_items
+        self._max_seconds = max_seconds
+        self._clock = clock
         self._lifecycle = lifecycle if lifecycle is not None else LoggingLifecycleSink()
 
     def drain_once(self) -> int:
-        """Drive every currently-claimable publication onto the actuator. Returns the number newly published.
-        Bounded: each iteration either publishes (progress) or re-arms the finite current-max-generation set,
-        which then drains — never an unbounded spin."""
+        """Drive claimable publications onto the actuator up to a DUAL budget (``max_items`` claims OR
+        ``max_seconds`` wall-clock), then return the number newly published. Remaining work drains on the next
+        call — so sustained publication ingress cannot indefinitely defer the executor sharing the poll loop.
+        Within the budget: each iteration either publishes (progress) or re-arms the finite current-max
+        generation set, which then drains — never an unbounded spin."""
         published = 0
-        while True:
+        processed = 0
+        start = self._clock()
+        while processed < self._max_items and (self._clock() - start) < self._max_seconds:
             job = self._store.claim_publication(lease_seconds=self._lease)
             if job is None:
                 break
+            processed += 1
             try:
                 self._drive(job)
             except CheckRunError as exc:

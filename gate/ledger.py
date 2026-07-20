@@ -145,6 +145,13 @@ def classify_merge(rows: Sequence[VerdictRow]) -> MergeOutcome:
       3. no ``done`` rows but ``error`` rows -> UNVERIFIABLE/INFRA_ERROR (F3: infra, not verdict).
       4. no rows at all                      -> UNVERIFIABLE/NEVER_EVALUATED.
     """
+    # Increment A dissent (blocker 1): a delivery RETIRED as 'superseded' (superseded-while-queued, or an
+    # unmigratable legacy row) is a NON-PARTICIPATING duplicate — it never ran and carries no verdict/gate
+    # outcome. It stays in verdicts_for_sha for AUDIT visibility (its reason records the storm/legacy), but it
+    # must not influence the merge verdict. Drop it explicitly here (skip, don't misread) rather than relying
+    # on it happening to match none of the status branches below.
+    rows = [r for r in rows if r.status != "superseded"]
+
     if any(r.status == "processing" for r in rows):
         return MergeOutcome(OutcomeKind.UNVERIFIABLE, sub_reason=UnverifiableReason.EVALUATION_IN_FLIGHT)
 
