@@ -37,6 +37,12 @@ MARKERS: list[tuple[str, str]] = [
     (r"\bmoriverse\b", "pre-extraction project name (de-baptise to 'gated')"),
     (r"MORIVERSE_", "pre-extraction env prefix (de-baptise to 'GATED_')"),
     (r"\bbifrost\b", "private-stack component"),
+    # homelab hosts / users the high-signal set above misses (bare forms). NOTE: 'mori' is NOT blocked —
+    # it is the project's genesis name and appears deliberately (moriapp.dev, the reference image, etc.).
+    (r"\bNUC\b", "homelab host shorthand (genericise to 'a self-hosted runner' / 'a machine with podman')"),
+    (r"\bnucadmin\b", "homelab username"),
+    (r"\bpiadmin\b", "homelab username"),
+    (r"\bjadmin\b", "homelab username"),
 ]
 
 # Files where an internal reference is intentional and reviewed.

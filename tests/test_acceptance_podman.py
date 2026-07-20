@@ -1,4 +1,4 @@
-"""3.5 job-4 UAT Phase 2 — the acceptance anchor on REAL podman. Run on the NUC:
+"""3.5 job-4 UAT Phase 2 — the acceptance anchor on REAL podman. Run on a machine with podman:
 python3 -m unittest discover -s tests   (self-skips where no OCI runtime can run the image)
 
 The board's UAT Phase 2: the two-sided anchor run against a REAL HERMETIC sandbox, not the NoOp. It uses

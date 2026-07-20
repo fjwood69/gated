@@ -3,7 +3,7 @@
 Zero-dependency (Apache-core purity): the receiver logic lives in ``webhook.py``;
 this only reads the raw request bytes + headers, applies the transport-layer guards
 (body-size cap, per-source rate limit), and maps ``ReceiverResult`` to an HTTP
-response. A reference server for the podman-on-NUC build — a production deployment may
+response. A reference server for the reference podman build — a production deployment may
 front the same ``WebhookReceiver`` with any WSGI/ASGI stack.
 
 Run:  python3 -m gate.http_server   (needs GATED_WEBHOOK_SECRET,
@@ -87,7 +87,7 @@ def _handler_factory(
 
 
 def build_reference_receiver() -> WebhookReceiver:
-    """Wire a receiver from env for the reference (podman-on-NUC) run. Gating events
+    """Wire a receiver from env for the reference (podman) run. Gating events
     land in an in-memory sink (2.1 has no consumer yet — the executor is 2.3)."""
     app_id = int(os.environ["GATED_APP_ID"])
     installs = frozenset(
