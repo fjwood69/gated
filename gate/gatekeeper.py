@@ -28,6 +28,7 @@ C3-event -> tier-write path (a done-test asserts the absent import).
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from typing import Callable
@@ -61,10 +62,19 @@ from gate.snapshot import (
     verify_snapshot,
 )
 
+_log = logging.getLogger(__name__)
+
 # Exceptions that mean "the tier store could not be reached" (vs "the chain is tampered", which is
 # ChainIntegrityError and always blocks). A networked/locked store surfaces these; the gatekeeper
 # then falls to the signed snapshot. Unreachable is a TRANSIENT availability condition — it appends
 # no durable state.
+#
+# Increment B / F4 amendment (ruling): this BROAD tuple is used ONLY by ``resolve_disposition``'s
+# PRE-read ``current_state`` (its historical, sealed behaviour). The ENABLED-path reads in
+# ``_enforce_if_oracle_current`` use the NARROWER catch ``sqlite3.OperationalError`` alone — a bare
+# ``OSError`` there (EACCES/ENOENT/ENOSPC/EIO) is a deploy/disk/machinery fault and must PROPAGATE to
+# WORKER_FAULT, not be relabelled UNATTESTABLE. ``_enforce`` is now the CORRECT reference; a deferred
+# follow-up narrows ``current_state`` (a typed StoreUnreachableError + errno adapter) to MATCH it.
 _UNREACHABLE = (sqlite3.OperationalError, OSError)
 
 
@@ -108,6 +118,21 @@ def _unattestable(reason: str) -> GateDecision:
     durable DEGRADED (no record is written); a formerly-enabled check blocks rather than
     silent-neutral or stale-enforce (#1). Durable DEGRADED is 3.5."""
     return GateDecision(Disposition.BLOCK_ACTION_REQUIRED, None, reason, "unattestable")
+
+
+def _blocked_read(read_name: str, policy_id: str, exc: Exception) -> GateDecision:
+    """Increment B / F4: a live ENABLED-path store read failed with an EXPECTED, fail-closed cause — a
+    tampered/unverifiable tier-or-calibration chain (``ChainIntegrityError``) or an unreachable/locked
+    store (``sqlite3.OperationalError``). Map to UNATTESTABLE — a DISPATCH-time
+    ``BLOCK_ACTION_REQUIRED`` non-run (the engine has NOT run, so this is NOT an admission
+    ``BlockingRefusal``) — logging the mapped cause at WARNING for diagnosability. A bare ``OSError`` or
+    any other exception is NOT routed here: it PROPAGATES to WORKER_FAULT (a deploy/disk/machinery fault
+    is a worker fault, not transient unattestability — the amended-ruling narrowing)."""
+    what = ("tier/calibration chain failed verification" if isinstance(exc, ChainIntegrityError)
+            else "tier store unreachable")
+    _log.warning("gate: _enforce_if_oracle_current read %r: %s for policy %r: %r",
+                 read_name, what, policy_id, exc)
+    return _unattestable(f"{read_name}: {what} — cannot confirm oracle currency (fail-closed)")
 
 
 def resolve_disposition(
@@ -175,11 +200,17 @@ def _enforce_if_oracle_current(
     attestation) — not by a spoofable pre-run declaration."""
     # CP2: read the SINGLE chain-verified snapshot ``(set_id, bound_head, subject, ICV, generation)`` — the
     # same row the AuthorizedRunPlan mints from, so the oracle check and the mint share ONE governance view.
-    snap = store.current_attestation_snapshot(policy_id)
+    try:
+        snap = store.current_attestation_snapshot(policy_id)
+    except (ChainIntegrityError, sqlite3.OperationalError) as exc:  # F4: expected fail-closed cause
+        return _blocked_read("current_attestation_snapshot", policy_id, exc)
     if snap is None:
         return _unattestable("ENABLED policy has no calibration attestation to check the oracle head")
     set_id, bound_head, bound_identity, icv, generation = snap
-    current_head = oracle_head_for(set_id)
+    try:
+        current_head = oracle_head_for(set_id)
+    except (ChainIntegrityError, sqlite3.OperationalError) as exc:  # F4: set_head store/chain failure
+        return _blocked_read("set_head", policy_id, exc)
     if current_head is None:
         return _unattestable(f"unknown calibration set membership for {set_id!r} — failing closed")
     if current_head != bound_head:
@@ -197,7 +228,11 @@ def _enforce_if_oracle_current(
     # [snapshot, re-read], so the same ENABLED generation covered the bracketed oracle observation. A move ->
     # UNATTESTABLE. (A direct-DB tail-truncation that reverts the generation is the deploy-tier adversary, out
     # of the in-process model.)
-    if store.policy_head(policy_id) != generation:
+    try:
+        live_generation = store.policy_head(policy_id)
+    except (ChainIntegrityError, sqlite3.OperationalError) as exc:  # F4: generation-reread store/chain fail
+        return _blocked_read("policy_head", policy_id, exc)
+    if live_generation != generation:
         return _unattestable(
             f"policy {policy_id!r} generation {generation[:12]}.. was not stable across the oracle read — "
             "the policy tier moved, so its currency cannot be confirmed; re-dispatch against fresh governance"
