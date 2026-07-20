@@ -44,6 +44,16 @@ class SafeExtractError(RuntimeError):
     whole archive (never a partial, possibly-escaped extraction)."""
 
 
+class ArtifactFetchError(RuntimeError):
+    """The artifact could not be ACQUIRED (Increment B / F3): a live fetch/network/token-exchange
+    failure at the artifact-source boundary — the acquisition peer of ``SafeExtractError`` (extraction)
+    and ``ArtifactHashMismatchError`` (integrity). Normalised at the LIVE artifact source from the
+    GitHub adapter's ``CheckRunError`` (and an ``OSError`` on the local tar WRITE), so a genuine fetch
+    failure is a typed blocking ``ARTIFACT_FETCH_FAILED`` — never a misclassified ``WORKER_FAULT``.
+    Deliberately NARROW: only acquisition-stage failures raise it; extraction is ``SafeExtractError``
+    and any unrelated filesystem fault stays a worker fault (fail-closed but honestly classified)."""
+
+
 @dataclass(frozen=True)
 class ExtractLimits:
     max_total_bytes: int = 100 * 1024 * 1024  # 100 MiB extracted

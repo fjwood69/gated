@@ -281,6 +281,56 @@ class GatedRoutingTests(unittest.TestCase):
         assert isinstance(result, InfrastructureFailure)
         self.assertIs(result.reason, InfraFailureReason.ARTIFACT_FETCH_FAILED)
 
+    def test_acquisition_fetch_error_is_artifact_fetch_failed(self) -> None:
+        # Increment B / F3: an ArtifactFetchError (a live fetch/network/token-exchange failure, normalised
+        # at the artifact-source boundary) -> InfrastructureFailure(ARTIFACT_FETCH_FAILED), never a
+        # misclassified WORKER_FAULT.
+        from gate.artifact import ArtifactFetchError
+
+        def source(_e: GatingEvent, ws: Path) -> ArtifactSpec:
+            return ArtifactSpec(path=ws, tree_hash="sha256:unused")
+
+        runner = make_gated_job_runner(
+            lambda _e: _enforce(_plan()), source, policy_id=_POLICY, governance=_FakeGovernance(),
+            image=_IMAGE, resolve=_RESOLVE_BUNDLE, detector_id=_DETECTOR_ID)
+        with mock.patch("gate.pipeline._run_engine_check", side_effect=ArtifactFetchError("404")):
+            result = runner(_event())
+        self.assertIsInstance(result, InfrastructureFailure)
+        assert isinstance(result, InfrastructureFailure)
+        self.assertIs(result.reason, InfraFailureReason.ARTIFACT_FETCH_FAILED)
+
+    def test_non_acquisition_oserror_is_not_relabelled_fetch_failure(self) -> None:
+        # F3 no-over-catch (mirror of F4): a bare OSError from EXTRACTION or an unrelated fs op is NOT
+        # caught by the acquisition/extract handlers -> it PROPAGATES (the executor maps it to
+        # WORKER_FAULT), never relabelled ARTIFACT_FETCH_FAILED. The fetch normalisation cannot reach
+        # past acquisition.
+        def source(_e: GatingEvent, ws: Path) -> ArtifactSpec:
+            return ArtifactSpec(path=ws, tree_hash="sha256:unused")
+
+        runner = make_gated_job_runner(
+            lambda _e: _enforce(_plan()), source, policy_id=_POLICY, governance=_FakeGovernance(),
+            image=_IMAGE, resolve=_RESOLVE_BUNDLE, detector_id=_DETECTOR_ID)
+        with mock.patch("gate.pipeline._run_engine_check",
+                        side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(OSError):
+                runner(_event())
+
+    def test_resolve_decision_oserror_propagates_to_worker_fault(self) -> None:
+        # F4 end-to-end confinement: a store outage surfacing as a bare OSError from resolve_decision (the
+        # pre-run tier read, OUTSIDE the runner's try) is NOT laundered -> it propagates so the executor
+        # classifies it WORKER_FAULT (a disk/permission fault is a worker fault, not unattestability).
+        def _raising_decision(_e: GatingEvent) -> GateDecision:
+            raise OSError(13, "Permission denied")
+
+        def source(_e: GatingEvent, ws: Path) -> ArtifactSpec:
+            return ArtifactSpec(path=ws, tree_hash="sha256:unused")
+
+        runner = make_gated_job_runner(
+            _raising_decision, source, policy_id=_POLICY, governance=_FakeGovernance(),
+            image=_IMAGE, resolve=_RESOLVE_BUNDLE, detector_id=_DETECTOR_ID)
+        with self.assertRaises(OSError):
+            runner(_event())
+
     def test_dispatch_invariant_rejects_a_non_run_decision_carrying_a_plan(self) -> None:
         # dissent P1: the OTHER direction of the biconditional. A (forged) non-RUN decision that CARRIES a
         # plan must be refused, NOT silently returned as a NonRunDecision. GateDecision.__post_init__ forbids
@@ -292,6 +342,58 @@ class GatedRoutingTests(unittest.TestCase):
         with self.assertRaises(GateDecisionError):
             runner(_event())
         self.assertEqual(touched, [])  # never reached the engine
+
+
+class Increment_B_F3_AcquisitionBoundaryTests(unittest.TestCase):
+    """Increment B / F3 (boundary): the LIVE artifact_source's acquisition helper ``_acquire_head_tarball``
+    normalises a GitHub-adapter ``CheckRunError`` (token exchange / fetch / HTTP / 404 / oversized) and an
+    ``OSError`` on the local tar WRITE into a typed ``ArtifactFetchError``. POSITIONAL: only acquisition is
+    guarded — the caller's separate ``extract_to_spec`` keeps its own ``SafeExtractError`` path."""
+
+    def _event_ws(self) -> "tuple[GatingEvent, Path]":
+        import tempfile
+        return _event(), Path(tempfile.mkdtemp(prefix="mv-acq-"))
+
+    def test_token_exchange_checkrunerror_normalised(self) -> None:
+        from gate.artifact import ArtifactFetchError
+        from gate.checkrun import CheckRunError
+        from gate.live_app import _acquire_head_tarball
+
+        class _P:
+            def get_valid_token(self, _iid: int) -> str:
+                raise CheckRunError("token exchange gave no token")
+
+        ev, ws = self._event_ws()
+        with self.assertRaises(ArtifactFetchError):
+            _acquire_head_tarball(_P(), ev, ws, fork_fetch=False)  # type: ignore[arg-type]
+
+    def test_download_checkrunerror_normalised(self) -> None:
+        from gate.artifact import ArtifactFetchError
+        from gate.checkrun import CheckRunError
+        from gate.live_app import _acquire_head_tarball
+
+        class _P:
+            def get_valid_token(self, _iid: int) -> str:
+                return "tok"
+
+        ev, ws = self._event_ws()
+        with mock.patch("gate.live_app.download_tarball", side_effect=CheckRunError("404 not found")):
+            with self.assertRaises(ArtifactFetchError):
+                _acquire_head_tarball(_P(), ev, ws, fork_fetch=False)  # type: ignore[arg-type]
+
+    def test_download_oserror_write_normalised(self) -> None:
+        from gate.artifact import ArtifactFetchError
+        from gate.live_app import _acquire_head_tarball
+
+        class _P:
+            def get_valid_token(self, _iid: int) -> str:
+                return "tok"
+
+        ev, ws = self._event_ws()
+        with mock.patch("gate.live_app.download_tarball",
+                        side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(ArtifactFetchError):
+                _acquire_head_tarball(_P(), ev, ws, fork_fetch=False)  # type: ignore[arg-type]
 
 
 class RunEngineCheckPlumbingTests(unittest.TestCase):

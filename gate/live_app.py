@@ -21,7 +21,9 @@ from typing import Callable
 from core import ArtifactSpec
 from engine.runner import TrialReport
 
+from .artifact import ArtifactFetchError
 from .calibration_store import CalibrationStore
+from .checkrun import CheckRunError
 from .dedup import InMemoryDeliveryLog
 from .executor import Executor, Watchdog
 from .gatekeeper import GateDecision, resolve_disposition
@@ -78,6 +80,28 @@ LEDGER_DB = os.environ.get("GATED_LEDGER_DB")            # default: alongside th
 # SHA-bound; works for PUBLIC forks with the base token; a private fork needs an App install
 # on the fork). repo_full_name stays BASE regardless — only the fetch source changes.
 FORK_FETCH = os.environ.get("GATED_FORK_FETCH", "0") not in ("0", "false", "no", "")
+
+
+def _acquire_head_tarball(
+    provider: InstallationTokenProvider, event: GatingEvent, ws: Path, *, fork_fetch: bool,
+) -> None:
+    """Increment B / F3: the ACQUISITION stage (token exchange + tarball fetch/write) in isolation, so a
+    GitHub-adapter ``CheckRunError`` (404 / oversized / HTTP / network) or an ``OSError`` on the local tar
+    WRITE is normalised to a typed ``ArtifactFetchError`` -> ``ARTIFACT_FETCH_FAILED`` — never a
+    misclassified ``WORKER_FAULT``. Deliberately NARROW + POSITIONAL: only these acquisition calls are
+    guarded; extraction is the CALLER's separate ``extract_to_spec`` (its own ``SafeExtractError`` path),
+    and any unrelated filesystem fault stays a worker fault. PRIMARY: base repo by SHA (TOCTOU-proof; the
+    base store mirrors the fork head). CONTINGENCY (GATED_FORK_FETCH=1): same SHA from the fork repo —
+    only if base-by-SHA 404s live; the SHA (what we attest) is identical either way."""
+    try:
+        token = provider.get_valid_token(event.installation_id)
+        fetch_repo = event.repo_full_name
+        if fork_fetch and event.head_repo_full_name:
+            fetch_repo = event.head_repo_full_name
+        download_tarball(fetch_repo, event.head_sha, str(ws / "head.tar"), token)
+    except (CheckRunError, OSError) as exc:
+        raise ArtifactFetchError(
+            f"artifact acquisition failed for {event.head_sha}: {exc!r}") from exc
 # CP2 S5: the SINGLE policy this deployed check enforces (D1: one policy per deployed check; a per-event
 # policy resolver is a named-next increment). Fail boot closed if unset (see required_policy_id).
 POLICY_ID = os.environ.get("GATED_POLICY_ID")
@@ -230,14 +254,12 @@ def build(
     )
 
     def artifact_source(event: GatingEvent, ws: Path) -> ArtifactSpec:
-        token = provider.get_valid_token(event.installation_id)
-        # PRIMARY: base repo by SHA (TOCTOU-proof; the base store mirrors the fork head).
-        # CONTINGENCY (GATED_FORK_FETCH=1): same SHA, fetched from the fork repo — only
-        # if base-by-SHA 404s live. The SHA (what we attest) is identical either way.
-        fetch_repo = event.repo_full_name
-        if FORK_FETCH and event.head_repo_full_name:
-            fetch_repo = event.head_repo_full_name
-        download_tarball(fetch_repo, event.head_sha, str(ws / "head.tar"), token)
+        # Increment B / F3: acquisition (token exchange + tarball fetch/write) is confined to
+        # ``_acquire_head_tarball`` — a CheckRunError / acquisition OSError there is normalised to a typed
+        # ArtifactFetchError -> ARTIFACT_FETCH_FAILED, never a misclassified WORKER_FAULT. ``extract_to_spec``
+        # is a SEPARATE step OUTSIDE that guard, so an EXTRACTION failure keeps its own SafeExtractError path
+        # and an unrelated fs OSError stays a worker fault (positional confinement, per the ruling).
+        _acquire_head_tarball(provider, event, ws, fork_fetch=FORK_FETCH)
         return extract_to_spec(ws / "head.tar", ws)
 
     # C4: the engine's trial report is DIAGNOSTIC logging only. The authoritative Check Run summary is

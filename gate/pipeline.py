@@ -34,7 +34,13 @@ from engine.calibration import BundleResolver, DetectorResolver
 from engine.retry import RetryCheck
 from engine.runner import TrialReport, TrialReportSink, run_check
 
-from .artifact import SafeExtractError, build_artifact_spec, extraction_workspace, safe_extract_tarball
+from .artifact import (
+    ArtifactFetchError,
+    SafeExtractError,
+    build_artifact_spec,
+    extraction_workspace,
+    safe_extract_tarball,
+)
 from .backends import guarded_backend
 from .trust_policy import resolve_trust_policy
 from .detector_registry import (
@@ -263,12 +269,20 @@ def make_gated_job_runner(
             return InfrastructureFailure(
                 InfraFailureReason.ARTIFACT_INTEGRITY_MISMATCH,
                 detail=f"artifact tree hash mismatch for {event.head_sha}")
+        except ArtifactFetchError:
+            # Increment B / F3: the artifact could not be ACQUIRED (a live fetch/network/token-exchange
+            # failure normalised at the artifact-source boundary) -> a typed blocking acquisition failure,
+            # never a misclassified WORKER_FAULT and never a pass. Same bucket as the extract failure below
+            # (the reason already reads "fetch/extract"); the detail distinguishes acquisition from extract.
+            return InfrastructureFailure(
+                InfraFailureReason.ARTIFACT_FETCH_FAILED,
+                detail=f"artifact acquisition (fetch) failed for {event.head_sha}")
         except SafeExtractError:
             # the artifact could not be safely fetched/extracted (a malformed / path-traversing / oversized
             # tarball rejected by safe_extract_tarball) -> a typed blocking acquisition failure, never a pass.
             return InfrastructureFailure(
                 InfraFailureReason.ARTIFACT_FETCH_FAILED,
-                detail=f"artifact fetch/extract failed for {event.head_sha}")
+                detail=f"artifact extract failed for {event.head_sha}")
         except DetectorResolutionError:
             # the enforced detector is unregistered or DRIFTED from the accepted identity -> block, never
             # enforce an unauthorized / rolled-back detector.

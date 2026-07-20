@@ -42,7 +42,7 @@ from gate.gatekeeper import (
 )
 from gate.preflight import ConfigurationError
 from gate.policy_state import Disposition, PolicyState
-from gate.policy_store import PolicyStore
+from gate.policy_store import ChainIntegrityError, PolicyStore
 from gate.run_admission import AuthorizedRunPlan
 from gate.snapshot import (
     SNAPSHOT_SCHEMA_V2,
@@ -485,6 +485,80 @@ class Done5_NoC3PathTests(unittest.TestCase):
             self.assertNotIn("from gate.ledger", src, f"{mod} must not import the C3 ledger")
             self.assertNotIn("import gate.ledger", src)
             self.assertNotIn("from .ledger", src)
+
+
+def _plain_enabled(pid: str = "P") -> PolicyStore:
+    s = PolicyStore(Path(tempfile.mkdtemp(prefix="mv-gk-f4p-")) / "tier.db")
+    _enable(s, pid)
+    return s
+
+
+class _EnabledReadRaises(PolicyStore):
+    """A normally-ENABLED store whose ONE named ENABLED-path read raises — ARMED only AFTER ``_enable``
+    completes, so the enable transitions' own reads do not trip the injection (F4 test harness)."""
+
+    def __init__(self, path: Path, *, read: str, exc: Exception) -> None:
+        super().__init__(path)
+        self._read, self._exc, self._armed = read, exc, False
+
+    def arm(self) -> None:
+        self._armed = True
+
+    def current_attestation_snapshot(self, policy_id: str):  # type: ignore[override,no-untyped-def]
+        if self._armed and self._read == "current_attestation_snapshot":
+            raise self._exc
+        return super().current_attestation_snapshot(policy_id)
+
+    def policy_head(self, policy_id: str) -> str:  # type: ignore[override]
+        if self._armed and self._read == "policy_head":
+            raise self._exc
+        return super().policy_head(policy_id)
+
+
+class Increment_B_F4_EnabledPathStoreOutageTests(unittest.TestCase):
+    """Increment B / F4 (amended NARROW ruling): a store outage (``sqlite3.OperationalError``) or a chain
+    failure (``ChainIntegrityError``) during ``_enforce_if_oracle_current``'s ENABLED-path reads
+    (``current_attestation_snapshot`` / ``set_head`` / ``policy_head``) is a fail-closed UNATTESTABLE /
+    ``BLOCK_ACTION_REQUIRED`` non-run — NOT a ``WORKER_FAULT``. A bare ``OSError`` (a deploy/disk fault:
+    EACCES/ENOSPC/EIO) is NOT laundered to unattestable — it PROPAGATES so the executor classifies it a
+    worker fault. Every path is a block; none mints a run plan (no move toward a PASS)."""
+
+    def _decide(self, read: str, exc: Exception):  # type: ignore[no-untyped-def]
+        if read == "set_head":
+            # the set_head read is the injected ``oracle_head_for`` callable, not a store method.
+            def _raiser(_set_id: str) -> str:
+                raise exc
+            return _resolve(_plain_enabled(), "P", oracle_head_for=_raiser)
+        s = _EnabledReadRaises(
+            Path(tempfile.mkdtemp(prefix="mv-gk-f4-")) / "tier.db", read=read, exc=exc)
+        _enable(s, "P")
+        s.arm()
+        return _resolve(s, "P")
+
+    def test_operational_error_each_read_blocks_unattestable(self) -> None:
+        for read in ("current_attestation_snapshot", "set_head", "policy_head"):
+            with self.subTest(read=read):
+                d = self._decide(read, sqlite3.OperationalError("database is locked"))
+                self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
+                self.assertEqual(d.source, "unattestable")
+                self.assertIsNone(d.plan)  # never mints a run plan — no move toward a PASS
+
+    def test_chain_integrity_error_each_read_blocks_unattestable(self) -> None:
+        for read in ("current_attestation_snapshot", "set_head", "policy_head"):
+            with self.subTest(read=read):
+                d = self._decide(read, ChainIntegrityError("tier/calibration chain failed verification"))
+                self.assertIs(d.disposition, Disposition.BLOCK_ACTION_REQUIRED)
+                self.assertEqual(d.source, "unattestable")
+                self.assertIsNone(d.plan)
+
+    def test_bare_oserror_propagates_not_laundered_to_unattestable(self) -> None:
+        # ENOSPC-flavoured bare OSError = a disk/deploy fault. The NARROW catch must NOT swallow it: it
+        # propagates out of resolve_disposition (the job runner's resolve_decision is OUTSIDE the try ->
+        # the executor maps the raise to WORKER_FAULT). This is the F4 confinement (amended ruling).
+        for read in ("current_attestation_snapshot", "set_head", "policy_head"):
+            with self.subTest(read=read):
+                with self.assertRaises(OSError):
+                    self._decide(read, OSError(28, "No space left on device"))
 
 
 if __name__ == "__main__":
