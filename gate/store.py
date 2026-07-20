@@ -21,10 +21,28 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from .queue import GatingEvent, SinkFull
+
+
+@dataclass(frozen=True)
+class PublicationJob:
+    """A claimed publication the Publisher must drive onto the ACTUATOR (the GitHub Check Run). The
+    payload is COMPLETE (Increment A complete-binding): identity (repo/head_sha/check_name) + the phase
+    (``status``: in_progress reset | completed conclusion) + the rendered conclusion/summary — the
+    Publisher needs no live config and no typed JobResult."""
+
+    delivery_id: str
+    phase: str               # "reset" | "conclusion" — the durable outbox phase (identifies the row)
+    repo_full_name: str
+    head_sha: str
+    check_name: str
+    status: str              # "in_progress" (reset) | "completed" (conclusion)
+    conclusion: str | None   # the CheckConclusion for a completed publication; None for a reset
+    summary: str | None
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS gating (
@@ -47,6 +65,39 @@ CREATE INDEX IF NOT EXISTS idx_gating_status ON gating(status, enqueued_at);
 -- SHA (opened+reopened), so this is NOT a key lookup — the index makes the scan efficient
 -- and updated_at is the tie-breaker for "effective at merge".
 CREATE INDEX IF NOT EXISTS idx_gating_head_sha ON gating(head_sha, updated_at);
+
+-- Increment A (publication outbox): decouple DB-terminal from GitHub-publication. The ACTUATOR (the
+-- Check Run) is the enforcement surface branch-protection reads; the Publisher drives it from this
+-- durable outbox. Each (re)enqueue MINTS a fresh per-identity monotonic GENERATION (MAX(generation)+1
+-- over the identity (repo, head_sha, check_name)) — NOT the gating rowid: an error-requeue keeps the
+-- SAME rowid (ON CONFLICT UPDATE), so a rowid generation would leave a re-delivered delivery BELOW a
+-- newer sibling forever (its reset never max-gen -> never publishes -> the delivery wedges in 'queued').
+-- Two DISTINCT DURABLE ROWS per delivery keyed by (delivery_id, phase): a RESET (in_progress, armed at
+-- enqueue, published BEFORE the job runs so a prior stale conclusion is cleared and the fail-closed
+-- posture is pending-blocks) and a CONCLUSION (completed, armed at finalize). finalize NEVER touches the
+-- reset row; repair re-arms the RESET; a generation's CONCLUSION may not publish while its RESET is
+-- unpublished (phase ordering = part of the fence).
+CREATE TABLE IF NOT EXISTS publication (
+    id              INTEGER PRIMARY KEY,
+    delivery_id     TEXT NOT NULL,
+    generation      INTEGER NOT NULL,   -- per-identity monotonic; minted MAX(gen)+1 at each (re)enqueue
+    repo_full_name  TEXT NOT NULL,
+    head_sha        TEXT NOT NULL,
+    check_name      TEXT NOT NULL,      -- persisted identity (complete-binding; never live config)
+    phase           TEXT NOT NULL,      -- reset | conclusion
+    status          TEXT NOT NULL,      -- in_progress (reset) | completed (conclusion)
+    conclusion      TEXT,               -- the CheckConclusion for a conclusion; NULL for a reset
+    summary         TEXT,
+    state           TEXT NOT NULL,      -- pending | published | superseded
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    lease_until     REAL,
+    next_at         REAL,
+    created_at      REAL NOT NULL,
+    UNIQUE(delivery_id, phase)
+);
+CREATE INDEX IF NOT EXISTS idx_publication_identity
+    ON publication(repo_full_name, head_sha, check_name, generation);
+CREATE INDEX IF NOT EXISTS idx_publication_pending ON publication(state, next_at);
 """
 
 
@@ -64,9 +115,14 @@ def _to_event(row: sqlite3.Row) -> GatingEvent:
 class GatingStore:
     """Durable, thread-safe (connection-per-thread) gating store."""
 
-    def __init__(self, path: Path, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, path: Path, *, clock: Callable[[], float] = time.time,
+                 check_name: str = "gate") -> None:
         self._path = str(path)
         self._clock = clock
+        # Increment A: the deployed check NAME is persisted into each delivery's publication payload at
+        # enqueue (complete-binding — the Publisher never re-derives identity from live config). Defaults
+        # for tests that do not exercise publication; live_app passes the configured name.
+        self._check_name = check_name
         self._local = threading.local()
         # initialise schema + WAL on a bootstrap connection
         conn = self._conn()
@@ -110,27 +166,64 @@ class GatingStore:
         So: a delivery in 'error' is re-queued; one already 'done'/'processing'/'queued'
         is an idempotent no-op (never re-run a live or completed job)."""
         now = self._clock()
-        cur = self._conn().execute(
-            "INSERT INTO gating "
-            "(delivery_id, repo_full_name, head_sha, installation_id, action, status,"
-            " head_repo_full_name, enqueued_at, updated_at) VALUES (?,?,?,?,?, 'queued', ?, ?, ?) "
-            "ON CONFLICT(delivery_id) DO UPDATE SET "
-            "  status='queued', enqueued_at=excluded.enqueued_at,"
-            "  updated_at=excluded.updated_at, claimed_at=NULL,"
-            "  check_run_id=NULL, verdict=NULL, reason=NULL "
-            "WHERE gating.status='error'",
-            (
-                event.delivery_id,
-                event.repo_full_name,
-                event.head_sha,
-                event.installation_id,
-                event.action,
-                event.head_repo_full_name,
-                now,
-                now,
-            ),
-        )
-        return cur.rowcount == 1
+        conn = self._conn()
+        # Increment A: enqueue + publication arming + supersession are ONE atomic BEGIN IMMEDIATE txn, so
+        # the identity fence "a newer generation exists from the instant it is enqueued" is TRUE (not
+        # usually-true): a crash cannot leave a new generation that superseded nothing, or a supersession
+        # with no successor row.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "INSERT INTO gating "
+                "(delivery_id, repo_full_name, head_sha, installation_id, action, status,"
+                " head_repo_full_name, enqueued_at, updated_at) VALUES (?,?,?,?,?, 'queued', ?, ?, ?) "
+                "ON CONFLICT(delivery_id) DO UPDATE SET "
+                "  status='queued', enqueued_at=excluded.enqueued_at,"
+                "  updated_at=excluded.updated_at, claimed_at=NULL,"
+                "  check_run_id=NULL, verdict=NULL, reason=NULL "
+                "WHERE gating.status='error'",
+                (event.delivery_id, event.repo_full_name, event.head_sha, event.installation_id,
+                 event.action, event.head_repo_full_name, now, now),
+            )
+            requeued = cur.rowcount == 1
+            if requeued:
+                # MINT a fresh per-identity monotonic generation (NOT the gating rowid — a requeue keeps the
+                # rowid, which would leave a re-delivered delivery below a newer sibling forever). MAX(gen)+1
+                # over the identity means a re-delivery is the NEWEST generation (later event wins), so its
+                # reset is max-gen and CAN publish. Computed from the EXISTING publication rows before the
+                # reset upsert (which writes =gen, so the supersede `< gen` never hits this delivery's reset).
+                gen = int(conn.execute(
+                    "SELECT COALESCE(MAX(generation), 0) + 1 AS g FROM publication "
+                    "WHERE repo_full_name=? AND head_sha=? AND check_name=?",
+                    (event.repo_full_name, event.head_sha, self._check_name)).fetchone()["g"])
+                # arm (or re-arm, on an error re-queue) THIS generation's RESET publication — a distinct
+                # durable row; the CONCLUSION row (if any prior) is cleared and re-created only at finalize.
+                conn.execute(
+                    "INSERT INTO publication (delivery_id, generation, repo_full_name, head_sha,"
+                    " check_name, phase, status, conclusion, summary, state, attempts, next_at, created_at)"
+                    " VALUES (?,?,?,?,?, 'reset', 'in_progress', NULL, NULL, 'pending', 0, ?, ?) "
+                    "ON CONFLICT(delivery_id, phase) DO UPDATE SET generation=excluded.generation,"
+                    "  state='pending', status='in_progress', conclusion=NULL, summary=NULL, attempts=0,"
+                    "  lease_until=NULL, next_at=excluded.next_at",
+                    (event.delivery_id, gen, event.repo_full_name, event.head_sha, self._check_name,
+                     now, now),
+                )
+                conn.execute(
+                    "DELETE FROM publication WHERE delivery_id=? AND phase='conclusion'",
+                    (event.delivery_id,))
+                # supersede EVERY older-generation publication (any phase/state) for the identity — no
+                # stale conclusion may drive the actuator; this generation's reset re-drives the surface.
+                conn.execute(
+                    "UPDATE publication SET state='superseded' "
+                    "WHERE repo_full_name=? AND head_sha=? AND check_name=? AND generation<? "
+                    "AND state IN ('pending','published')",
+                    (event.repo_full_name, event.head_sha, self._check_name, gen),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return requeued
 
     def queued_count(self) -> int:
         row = self._conn().execute(
@@ -151,8 +244,14 @@ class GatingStore:
             # one SHA (e.g. opened + reopened) then serialise, and the second re-uses the
             # first's Check Run via the idempotent upsert — no duplicate, independent of
             # worker count (stronger than relying on the concurrency semaphore alone).
+            # Increment A — the RESET GATE: a delivery is claimable ONLY once its RESET publication is
+            # PUBLISHED (the actuator shows in_progress), so a prior stale conclusion is cleared BEFORE
+            # this job runs and can produce a verdict. If the reset cannot publish (GitHub down), the
+            # delivery waits in 'queued' — fail-closed (no premature verdict; the surface is not green).
             row = conn.execute(
-                "SELECT * FROM gating q WHERE q.status='queued' AND NOT EXISTS ("
+                "SELECT * FROM gating q WHERE q.status='queued' "
+                "  AND EXISTS (SELECT 1 FROM publication r WHERE r.delivery_id=q.delivery_id "
+                "    AND r.phase='reset' AND r.state='published') AND NOT EXISTS ("
                 "  SELECT 1 FROM gating p WHERE p.status='processing'"
                 "    AND p.repo_full_name=q.repo_full_name AND p.head_sha=q.head_sha"
                 ") ORDER BY q.enqueued_at LIMIT 1"
@@ -181,22 +280,67 @@ class GatingStore:
         verdict: str | None = None,
         reason: str | None = None,
         gate_outcome: str | None = None,
+        publish_conclusion: str | None = None,
+        publish_summary: str | None = None,
     ) -> bool:
         """POST-ONCE guard: move processing -> terminal, but ONLY if still processing.
-        Returns True iff this caller won the finalize (and may therefore post the one
-        terminal Check Run update); False means another worker/watchdog already did.
+        Returns True iff this caller won the finalize (and may therefore arm the terminal publication);
+        False means another worker/watchdog already did.
 
         ``gate_outcome`` (CP2 closure 1) persists the closed gate-outcome discriminator INDEPENDENTLY of the
         engine ``verdict``, so the override classifier can tell a merge-past-a-blocking-non-run from a clean
-        merge without a fabricated verdict."""
+        merge without a fabricated verdict.
+
+        Increment A: the winner ARMS the CONCLUSION publication generation (completed + the rendered
+        conclusion/summary) in the SAME atomic UPDATE — but publish_state is FENCED: if a NEWER delivery
+        (higher rowid) exists for this identity the conclusion is born 'superseded' (never drives a stale
+        conclusion onto the actuator); otherwise 'pending' for the Publisher to drive."""
         if status not in ("done", "error"):
             raise ValueError(f"terminal status must be done|error, got {status!r}")
-        cur = self._conn().execute(
-            "UPDATE gating SET status=?, check_run_id=?, verdict=?, reason=?, gate_outcome=?, updated_at=? "
-            "WHERE delivery_id=? AND status='processing'",
-            (status, check_run_id, verdict, reason, gate_outcome, self._clock(), delivery_id),
-        )
-        return cur.rowcount == 1
+        now = self._clock()
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE gating SET status=?, check_run_id=?, verdict=?, reason=?, gate_outcome=?, "
+                "updated_at=? WHERE delivery_id=? AND status='processing'",
+                (status, check_run_id, verdict, reason, gate_outcome, now, delivery_id),
+            )
+            won = cur.rowcount == 1
+            if won:
+                # arm the delivery's CONCLUSION publication as a DISTINCT durable row (never overwrite the
+                # RESET row — phase collapse would leave repair unable to re-drive the surface to pending).
+                # COMPLETE-BINDING: derive generation + identity (repo, head_sha, check_name) from THIS
+                # delivery's PERSISTED RESET row — NOT self._check_name (live config) — so a restart /
+                # config change between RESET and finalize cannot split the two phases across identities
+                # (which _RESET_READY, keyed only on delivery_id, would silently accept). Born 'superseded'
+                # if a NEWER generation already exists for that same identity; else 'pending'.
+                r = conn.execute(
+                    "SELECT generation, repo_full_name, head_sha, check_name FROM publication "
+                    "WHERE delivery_id=? AND phase='reset'", (delivery_id,)).fetchone()
+                if r is not None:  # the reset was armed at enqueue; without it there is nothing to bind to
+                    gen, repo, sha, cname = (int(r["generation"]), r["repo_full_name"],
+                                             r["head_sha"], r["check_name"])
+                    newer = conn.execute(
+                        "SELECT 1 FROM publication n WHERE n.repo_full_name=? AND n.head_sha=? "
+                        "AND n.check_name=? AND n.generation>? LIMIT 1",
+                        (repo, sha, cname, gen)).fetchone()
+                    pub_state = "superseded" if newer is not None else "pending"
+                    conn.execute(
+                        "INSERT INTO publication (delivery_id, generation, repo_full_name, head_sha,"
+                        " check_name, phase, status, conclusion, summary, state, attempts, next_at,"
+                        " created_at) VALUES (?,?,?,?,?, 'conclusion', 'completed', ?, ?, ?, 0, ?, ?) "
+                        "ON CONFLICT(delivery_id, phase) DO UPDATE SET generation=excluded.generation,"
+                        "  status='completed', conclusion=excluded.conclusion, summary=excluded.summary,"
+                        "  state=excluded.state, attempts=0, lease_until=NULL, next_at=excluded.next_at",
+                        (delivery_id, gen, repo, sha, cname,
+                         publish_conclusion, publish_summary, pub_state, now, now),
+                    )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return won
 
     def sweep_stale(self, older_than_seconds: float) -> list[GatingEvent]:
         """Deliveries stuck in 'processing' past the deadline — the watchdog's input."""
@@ -212,6 +356,97 @@ class GatingStore:
             "SELECT status FROM gating WHERE delivery_id=?", (delivery_id,)
         ).fetchone()
         return None if row is None else str(row["status"])
+
+    # ---- publication outbox (Increment A) --------------------------------
+
+    # a publication is the CURRENT generation for its identity iff no higher-generation publication
+    # exists for the same (repo, head_sha, check_name). Aliased ``p`` in the queries below.
+    _IS_MAX_GEN = (
+        "NOT EXISTS (SELECT 1 FROM publication n WHERE n.repo_full_name=p.repo_full_name "
+        "AND n.head_sha=p.head_sha AND n.check_name=p.check_name AND n.generation > p.generation)"
+    )
+    # phase ordering (part of the fence): a CONCLUSION may publish ONLY after its OWN generation's RESET
+    # is published — else a repair race could land conclusion-then-stale-reset one layer down.
+    _RESET_READY = (
+        "(p.phase='reset' OR EXISTS (SELECT 1 FROM publication r WHERE r.delivery_id=p.delivery_id "
+        "AND r.phase='reset' AND r.state='published'))"
+    )
+
+    def _job_from_row(self, row: sqlite3.Row) -> PublicationJob:
+        return PublicationJob(
+            delivery_id=str(row["delivery_id"]), phase=str(row["phase"]),
+            repo_full_name=str(row["repo_full_name"]), head_sha=str(row["head_sha"]),
+            check_name=str(row["check_name"]), status=str(row["status"]),
+            conclusion=row["conclusion"], summary=row["summary"])
+
+    def claim_publication(self, *, lease_seconds: float = 300.0) -> PublicationJob | None:
+        """Atomically claim the oldest DUE, unleased publication that is the CURRENT generation for its
+        identity AND phase-ready (a conclusion only after its reset published), leasing it (a crashed
+        publisher's lease expires -> reclaimable). RESET before CONCLUSION within a generation. Only the
+        MAX generation is claimable, so a stale older payload is never published. None if nothing due."""
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            now = self._clock()
+            row = conn.execute(
+                "SELECT * FROM publication p WHERE p.state='pending' "
+                "AND (p.next_at IS NULL OR p.next_at<=?) "
+                "AND (p.lease_until IS NULL OR p.lease_until<?) "
+                f"AND {self._IS_MAX_GEN} AND {self._RESET_READY} "
+                "ORDER BY p.generation, (p.phase='conclusion') LIMIT 1",
+                (now, now),
+            ).fetchone()
+            if row is None:
+                conn.execute("COMMIT")
+                return None
+            conn.execute(
+                "UPDATE publication SET lease_until=? WHERE id=? AND state='pending'",
+                (now + lease_seconds, row["id"]),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return self._job_from_row(row)
+
+    def mark_publication_published(self, delivery_id: str, phase: str) -> bool:
+        """No-regression CAS: record 'published' ONLY if this publication is STILL the current generation
+        for its identity. Returns True iff won. False means a newer generation landed during the publish
+        window — the just-written external bytes may be stale, so the caller MUST trigger
+        ``repair_publication`` (the ledger is honest, but the ACTUATOR needs re-driving to the true
+        head)."""
+        cur = self._conn().execute(
+            "UPDATE publication AS p SET state='published', lease_until=NULL "
+            f"WHERE p.delivery_id=? AND p.phase=? AND p.state='pending' AND {self._IS_MAX_GEN}",
+            (delivery_id, phase),
+        )
+        return cur.rowcount == 1
+
+    def repair_publication(self, repo_full_name: str, head_sha: str, check_name: str) -> None:
+        """DURABLE repair (ruling): re-arm the CURRENT-max-generation's publications for the identity as
+        'pending' + due-now + unleased, so the Publisher re-drives the actuator to the TRUE head. Both
+        phases are re-armed; the phase-ordering fence (``_RESET_READY``) republishes the RESET first
+        (returning the surface to pending) THEN the CONCLUSION. A durable DB write drained by the normal
+        loop — a crash or a failed immediate retry cannot lose it (a one-shot repair would recreate the
+        outage hole). Idempotent: re-arming an already-correct head is one idempotent re-upsert."""
+        self._conn().execute(
+            "UPDATE publication SET state='pending', next_at=?, lease_until=NULL "
+            "WHERE repo_full_name=? AND head_sha=? AND check_name=? AND state IN ('pending','published') "
+            "AND generation=(SELECT MAX(generation) FROM publication "
+            "  WHERE repo_full_name=? AND head_sha=? AND check_name=?)",
+            (self._clock(), repo_full_name, head_sha, check_name,
+             repo_full_name, head_sha, check_name),
+        )
+
+    def release_publication(self, delivery_id: str, phase: str, *, backoff_seconds: float) -> None:
+        """A publish attempt failed (CheckRunError): ++attempts, back off, drop the lease -> retried
+        durably on the next sweep (UNBOUNDED — a stuck actuator keeps the check pending/blocking, never a
+        false green; the attempts count drives backoff + alerting, never give-up)."""
+        self._conn().execute(
+            "UPDATE publication SET attempts=attempts+1, next_at=?, lease_until=NULL "
+            "WHERE delivery_id=? AND phase=?",
+            (self._clock() + backoff_seconds, delivery_id, phase),
+        )
 
     def verdicts_for_sha(
         self, head_sha: str

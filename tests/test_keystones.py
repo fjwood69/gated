@@ -29,7 +29,7 @@ from core import ArtifactSpec, Reason, Verdict, VerdictType
 from engine.runner import EngineRunResult
 from gate.attestation import IDENTITY_CONTRACT_VERSION, calibrated_subject_identity
 from gate.checkrun import CheckConclusion, CheckRunLifecycle, CheckStatus, verdict_to_conclusion
-from gate.executor import Executor, Watchdog
+from gate.executor import Executor, LifecycleEvent, Transition, Watchdog
 from gate.gatekeeper import GateDecision
 from gate.job_result import (
     GateOutcome,
@@ -74,6 +74,22 @@ _NAME = "gated/retry"
 def _event(delivery_id: str = "d1", sha: str = "a" * 40) -> GatingEvent:
     return GatingEvent(delivery_id=delivery_id, repo_full_name="acme/widgets", head_sha=sha,
                        action="opened", installation_id=9001)
+
+
+def _flush_resets(store: GatingStore) -> None:
+    """Increment A test helper: mark every pending RESET publication published (simulating a successful
+    Publisher drive of the actuator to in_progress) so the ``claim_next`` reset-gate admits the delivery.
+    Must be called BEFORE any finalize (asserts only reset rows are pending)."""
+    while True:
+        job = store.claim_publication()
+        if job is None:
+            break
+        assert job.phase == "reset", "call _flush_resets before any finalize (only resets should be pending)"
+        store.mark_publication_published(job.delivery_id, "reset")
+
+
+def _summ(_result: object) -> str:  # a trivial JobSummarizer for executor/watchdog unit construction
+    return "summary"
 
 
 class _FakeCheckClient:
@@ -281,8 +297,9 @@ class K12a_UnaccountedResultRejected(unittest.TestCase):
     def test_guard_present_bare_verdict_return_is_unaccounted(self) -> None:
         store = self._store()
         ex = Executor(store, lambda e: Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS),  # type: ignore[arg-type]
-                      lambda e, r: None)
+                      _summ)
         store.enqueue(_event("d1"))
+        _flush_resets(store)
         store.claim_next()
         ex.process_claimed(_event("d1"))
         status, verdict, reason, _u, gate_outcome = store.verdicts_for_sha("a" * 40)[0]
@@ -295,8 +312,9 @@ class K12a_UnaccountedResultRejected(unittest.TestCase):
         # refuses it as UNACCOUNTED (the guard-present arm), so the closed-union type gate is load-bearing.
         store = self._store()
         ex = Executor(store, lambda e: Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS),  # type: ignore[arg-type]
-                      lambda e, r: None)
+                      _summ)
         store.enqueue(_event("d1"))
+        _flush_resets(store)
         store.claim_next()
         with mock.patch("gate.executor.account", _unsafe_account):
             ex.process_claimed(_event("d1"))
@@ -369,11 +387,29 @@ class K2b_IncompleteCoordinatesStructural(unittest.TestCase):
         self.assertIsInstance(res, AdmittedRunResult)                   # forbidden-if-guard-absent: admitted
 
 
+class _Recorder:
+    def __init__(self) -> None:
+        self.events: list[LifecycleEvent] = []
+
+    def record(self, event: LifecycleEvent) -> None:
+        self.events.append(event)
+
+    def terminals(self) -> list[Transition]:
+        # a "terminal post" is now: the finalize WINNER arms the CONCLUSION publication + emits its terminal
+        # transition (the Publisher later drains it). The loser emits POST_SKIPPED. Exactly one winner = one post.
+        posted = {Transition.COMPLETED, Transition.ERRORED, Transition.WATCHDOG_FORCED}
+        return [e.transition for e in self.events if e.transition in posted]
+
+
 class K14_PostOnce(unittest.TestCase):
-    """K14: a wedged worker + the watchdog can NEVER both post a terminal Check Run — the store's finalize is
-    POST-ONCE (``UPDATE ... WHERE status='processing'``, True to exactly one caller). NATIVE forbidden outcome:
-    a DOUBLE terminal post (two conflicting conclusions for one delivery). Counterfactual: an unsafe finalize
-    double (no WHERE guard, always 'won') -> BOTH post."""
+    """K14: a wedged worker + the watchdog can NEVER both drive a terminal outcome for one delivery — the
+    store's finalize is POST-ONCE (``UPDATE ... WHERE status='processing'``, True to exactly one caller), so
+    exactly ONE of them arms the conclusion publication + emits a terminal transition; the loser is
+    POST_SKIPPED. NATIVE forbidden outcome: BOTH treat themselves as the terminal writer (two conflicting
+    conclusions for one delivery). Counterfactual: an unsafe finalize double (no WHERE guard, always 'won')
+    -> BOTH emit a terminal transition. (Increment A: the executor/watchdog no longer post inline — the
+    finalize ``won`` boolean gates BOTH the publication-arming AND the terminal transition, so the transition
+    IS the post-once observable.)"""
 
     def _store_and_clock(self):  # type: ignore[no-untyped-def]
         clock = [1000.0]
@@ -382,30 +418,30 @@ class K14_PostOnce(unittest.TestCase):
 
     def test_guard_present_worker_and_watchdog_post_once(self) -> None:
         store, clock = self._store_and_clock()
-        posts: list[str] = []
-        updater = lambda e, r: posts.append(e.delivery_id)  # noqa: E731
-        ex = Executor(store, lambda e: _admit(_plan(), _report(), _FakeGovernance()), updater)
-        wd = Watchdog(store, updater, timeout_seconds=900.0)
+        life = _Recorder()
+        ex = Executor(store, lambda e: _admit(_plan(), _report(), _FakeGovernance()), _summ, lifecycle=life)
+        wd = Watchdog(store, _summ, timeout_seconds=900.0, lifecycle=life)
         store.enqueue(_event("d1"))
+        _flush_resets(store)
         store.claim_next()
         clock[0] += 10_000                                 # make the claim stale
-        self.assertEqual(wd.sweep_once(), 1)               # watchdog force-completes (ONE post)
+        self.assertEqual(wd.sweep_once(), 1)               # watchdog force-completes (ONE terminal)
         ex.process_claimed(_event("d1"))                   # the wedged worker un-wedges -> POST_SKIPPED
-        self.assertEqual(len(posts), 1)                    # EXACTLY one terminal post
+        self.assertEqual(len(life.terminals()), 1)         # EXACTLY one terminal writer
 
     def test_counterfactual_unsafe_finalize_double_posts(self) -> None:
         store, clock = self._store_and_clock()
-        posts: list[str] = []
-        updater = lambda e, r: posts.append(e.delivery_id)  # noqa: E731
-        ex = Executor(store, lambda e: _admit(_plan(), _report(), _FakeGovernance()), updater)
-        wd = Watchdog(store, updater, timeout_seconds=900.0)
+        life = _Recorder()
+        ex = Executor(store, lambda e: _admit(_plan(), _report(), _FakeGovernance()), _summ, lifecycle=life)
+        wd = Watchdog(store, _summ, timeout_seconds=900.0, lifecycle=life)
         store.enqueue(_event("d1"))
+        _flush_resets(store)
         store.claim_next()
         clock[0] += 10_000
         with mock.patch.object(store, "finalize", return_value=True):  # unsafe: no POST-ONCE guard
             wd.sweep_once()
             ex.process_claimed(_event("d1"))
-        self.assertEqual(len(posts), 2)                    # forbidden: BOTH the watchdog AND the worker posted
+        self.assertEqual(len(life.terminals()), 2)         # forbidden: BOTH the watchdog AND the worker posted
 
 
 # =====================================================================================================

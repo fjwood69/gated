@@ -25,7 +25,7 @@ from .artifact import ArtifactFetchError
 from .calibration_store import CalibrationStore
 from .checkrun import CheckRunError
 from .dedup import InMemoryDeliveryLog
-from .executor import Executor, Watchdog
+from .executor import Executor, Publisher, Watchdog
 from .gatekeeper import GateDecision, resolve_disposition
 from .github_auth import FileKeySource, InstallationTokenProvider
 from .github_live import RealGitHubCheckClient, RealJwtSigner, RealTokenFetcher, download_tarball
@@ -39,8 +39,8 @@ from .pipeline import (
     assert_detector_registered,
     default_detector_registry,
     extract_to_spec,
-    make_check_updater,
     make_gated_job_runner,
+    make_job_summarizer,
 )
 from .policy_store import PolicyStore
 from .preflight import ConfigurationError
@@ -203,7 +203,7 @@ class _ProductionAdmissionGovernanceView:
 
 def build(
     db_path: Path,
-) -> tuple[WebhookReceiver, Executor, Watchdog, InstallationTokenProvider, Callable[[], int]]:
+) -> tuple[WebhookReceiver, Executor, Watchdog, Publisher, InstallationTokenProvider, Callable[[], int]]:
     accepted_profile_digest = required_accepted_profile_digest()  # P1-3: fail boot if unset (no self-compute)
     policy_id = required_policy_id()  # CP2 S5 D1: fail boot if GATED_POLICY_ID unset
     # S7 (dissent): WIRE the enforced startup invariant — the engine applies the budget PER TRIAL, so the
@@ -232,7 +232,10 @@ def build(
     policy_db = Path(POLICY_DB) if POLICY_DB else db_path.with_name("gated-policy.db")
     calibration_db = Path(CALIBRATION_DB) if CALIBRATION_DB else db_path.with_name("gated-calibration.db")
     require_distinct_db_paths(queue_db, policy_db, calibration_db)  # dissent P2: fail boot on a collision
-    store = GatingStore(queue_db)
+    # Increment A: persist the deployed check NAME into each publication payload at enqueue (complete-binding —
+    # the Publisher never re-derives identity from live config; a restart with a changed name cannot split a
+    # delivery's reset + conclusion across identities).
+    store = GatingStore(queue_db, check_name=CHECK_NAME)
     policy_store = PolicyStore(policy_db)
     calibration_store = CalibrationStore(calibration_db)
     governance = _ProductionAdmissionGovernanceView(policy_store, calibration_store)
@@ -293,10 +296,13 @@ def build(
         trials=TRIALS, first_fail=SHORT_CIRCUIT, report_sink=report_sink)
 
     client = RealGitHubCheckClient(provider, next(iter(installs)), budget=budget)
-    updater = make_check_updater(client, name=CHECK_NAME)
-
-    executor = Executor(store, job_runner, updater, max_workers=1)
-    watchdog = Watchdog(store, updater, timeout_seconds=WATCHDOG_TIMEOUT)
+    # Increment A: the executor + watchdog RENDER the summary and arm a durable publication at finalize; the
+    # Publisher is the SOLE writer of the actuator (draining the outbox). No inline GitHub call on a terminal
+    # row (the Finding-1 liveness defect is removed at the root).
+    summarize = make_job_summarizer(CHECK_NAME)
+    executor = Executor(store, job_runner, summarize, max_workers=1)
+    watchdog = Watchdog(store, summarize, timeout_seconds=WATCHDOG_TIMEOUT)
+    publisher = Publisher(store, client)
 
     def verdict_lookup(sha: str) -> list[VerdictRow]:
         return [
@@ -320,19 +326,27 @@ def build(
                                ev.delivery_id, ev.head_sha)
         return len(batch)
 
-    return receiver, executor, watchdog, provider, drain_overrides
+    return receiver, executor, watchdog, publisher, provider, drain_overrides
 
 
 def _poll_loop(
     executor: Executor,
     watchdog: Watchdog,
+    publisher: Publisher,
     drain_overrides: Callable[[], int],
     stop: threading.Event,
 ) -> None:
     while not stop.is_set():
         try:
+            # Increment A ordering: PUBLISH first — a freshly-armed RESET must reach the actuator (surface ->
+            # in_progress, blocking) BEFORE the executor may claim that delivery (the claim_next reset-gate is
+            # the load-bearing fail-closed guard; this ordering only reduces latency). Then run the executor +
+            # watchdog (which arm CONCLUSION publications), then publish again so those conclusions drain the
+            # same tick. A GitHub outage leaves resets unpublished -> deliveries wait in 'queued' (fail-closed).
+            publisher.drain_once()
             n = executor.drain()
             watchdog.sweep_once()
+            publisher.drain_once()
             drain_overrides()  # C3: merged-PR captures -> override ledger (own error surface)
             if n:
                 _log.info("processed %d delivery(ies)", n)
@@ -344,11 +358,11 @@ def _poll_loop(
 def serve(host: str = "127.0.0.1", port: int = 8975) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     db = Path(tempfile.gettempdir()) / "gated-gate.db"
-    receiver, executor, watchdog, _, drain_overrides = build(db)
+    receiver, executor, watchdog, publisher, _, drain_overrides = build(db)
 
     stop = threading.Event()
     poller = threading.Thread(
-        target=_poll_loop, args=(executor, watchdog, drain_overrides, stop), daemon=True
+        target=_poll_loop, args=(executor, watchdog, publisher, drain_overrides, stop), daemon=True
     )
     poller.start()
 

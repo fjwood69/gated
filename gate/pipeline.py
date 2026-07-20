@@ -335,6 +335,20 @@ def _render_job_summary(result: JobResult, name: str) -> str:
         "JobResult (a bare Verdict/EngineRunResult is rejected)")
 
 
+def make_job_summarizer(name: str) -> Callable[[JobResult], str]:
+    """Increment A: the executor + watchdog RENDER the Check Run summary string BEFORE ``finalize``
+    (deterministic, in-process) and PERSIST it into the publication outbox — they no longer make the GitHub
+    call themselves (the ``Publisher`` drains the outbox onto the actuator; the old unwrapped inline post on a
+    terminal row was the Finding-1 liveness defect). This closes over the deployed check ``name`` that
+    ``_render_job_summary`` needs, keeping the executor free of the check-name config. C4 is preserved: the
+    summary is rendered from the TYPED result only (detector/image ONLY from an ``AdmittedRunResult``)."""
+
+    def summarize(result: JobResult) -> str:
+        return _render_job_summary(result, name)
+
+    return summarize
+
+
 def make_check_updater(client: GitHubCheckClient, *, name: str) -> CheckUpdater:
     """Build the executor's ``updater``: drive the Check Run queued->in_progress->completed from the TYPED
     ``JobResult`` (CP2 S5). The conclusion is ``account(result).conclusion`` (fail-closed by construction,
@@ -364,6 +378,7 @@ __all__ = [
     "default_detector_registry",
     "assert_detector_registered",
     "make_gated_job_runner",
+    "make_job_summarizer",
     "make_check_updater",
     "CapturingTrialReportSink",
     "DEFAULT_ENGINE_BUDGET",
