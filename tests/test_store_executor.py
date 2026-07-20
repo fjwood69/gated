@@ -718,6 +718,102 @@ class PublicationLivenessTests(unittest.TestCase):
         self.assertGreater(self.store.queued_count(), 5)           # the loop did NOT monopolise the tick
 
 
+class IdentityStructuralClosureTests(unittest.TestCase):
+    """Dissent #5 — the partial-identity / unbound-reader defect, caught a fifth time (re-imported by the
+    remediation for the third). The STRUCTURAL closure: identity is derived through the single ``_reset_identity``
+    accessor; ``self._check_name`` (the partial coordinate) is read in exactly ONE place — enqueue's fresh mint.
+    A rename must not let a new delivery compute a wrong-identity generation nor retire another identity's row."""
+
+    def _store_file(self) -> Path:
+        return Path(__file__).resolve().parent.parent / "gate" / "store.py"
+
+    def test_check_name_read_only_in_enqueue_mint_fallback(self) -> None:
+        # STRUCTURAL guard: make the partial form unrepresentable. Every ``self._check_name`` Attribute-LOAD in
+        # store.py must live inside ``enqueue`` (the sole sanctioned config read); the assignment in __init__ is
+        # a Store ctx and is not flagged. A future retirement/generation query written by the next agent
+        # physically cannot scope by the partial coordinate — it would trip this test in CI.
+        import ast
+        tree = ast.parse(self._store_file().read_text())
+        offenders: list[tuple[str, int]] = []
+
+        class V(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.fn: list[str] = []
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                self.fn.append(node.name)
+                self.generic_visit(node)
+                self.fn.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+            def visit_Attribute(self, node: ast.Attribute) -> None:
+                if node.attr == "_check_name" and isinstance(node.ctx, ast.Load):
+                    where = self.fn[-1] if self.fn else "<module>"
+                    if where != "enqueue":
+                        offenders.append((where, node.lineno))
+                self.generic_visit(node)
+
+        V().visit(tree)
+        self.assertEqual(offenders, [], f"self._check_name read outside enqueue's mint: {offenders}")
+
+
+class RenameIdentityTests(unittest.TestCase):
+    """The two dissent-mandated rename scenarios — twins of the reopen-storm and complete-binding tests, one
+    actuator-identity level up. A deployed check-name RENAME is modelled by reopening the SAME DB with a
+    different ``check_name``."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix="mv-rename-"))
+        self.db = self.dir / "g.db"
+        self.clk = _Clock()
+
+    def _open(self, check_name: str) -> GatingStore:
+        return GatingStore(self.db, clock=self.clk, check_name=check_name)
+
+    def test_rename_then_new_same_sha_does_not_retire_old_identity(self) -> None:
+        sha = "c" * 40
+        old = self._open("old-name")
+        old.enqueue(_event("d-old", sha=sha))
+        _flush_resets(old)                                  # d-old reset PUBLISHED under "old-name"
+        # RENAME: reopen the same DB with a new deployed check name; a fresh same-SHA delivery arrives.
+        new = self._open("new-name")
+        new.enqueue(_event("d-new", sha=sha))
+        # d-old belongs to a DIFFERENT actuator identity — it must NOT be retired (both checks deserve a life).
+        self.assertEqual(new.status_of("d-old"), "queued")
+        self.assertEqual(new.status_of("d-new"), "queued")
+        # each reset kept its own persisted identity (write-once).
+        self.assertEqual(new._reset_identity(new._conn(), "d-old"), (  # type: ignore[comparison-overlap]
+            "acme/widgets", sha, "old-name", 1))
+        self.assertEqual(new._reset_identity(new._conn(), "d-new")[2], "new-name")  # type: ignore[index]
+        # NOT stranded: d-old's reset is already published, so it is claimable + runs (config-agnostic).
+        ev = new.claim_next()
+        assert ev is not None and ev.delivery_id == "d-old"
+
+    def test_rename_then_error_requeue_derives_identity_from_persisted_reset(self) -> None:
+        sha = "c" * 40
+        old = self._open("old-name")
+        old.enqueue(_event("d1", sha=sha))
+        _flush_resets(old)
+        old.claim_next()
+        old.finalize("d1", "error", reason="watchdog_timeout")   # d1 errored under "old-name", gen 1
+        old.enqueue(_event("d2", sha=sha))                        # a NEWER "old-name" sibling, gen 2
+        _flush_resets(old)
+        # RENAME, then ERROR-REQUEUE d1 under the new config. A live-config generation would compute MAX over
+        # "new-name" (=0)+1 = gen 1 < d2's gen 2 -> unpublishable wedge. Deriving from the persisted reset uses
+        # "old-name" (MAX=2)+1 = gen 3 -> the NEWEST for its identity -> publishable.
+        new = self._open("new-name")
+        self.assertTrue(new.enqueue(_event("d1", sha=sha)))       # error -> requeued
+        ident = new._reset_identity(new._conn(), "d1")
+        assert ident is not None
+        self.assertEqual(ident[2], "old-name")                    # identity PRESERVED across the rename
+        self.assertEqual(ident[3], 3)                             # fresh gen minted over the OLD identity
+        # publishable: claim_publication hands out d1's reset (max gen for "old-name"), NOT wedged.
+        job = new.claim_publication()
+        assert job is not None and job.delivery_id == "d1"
+        self.assertEqual(job.check_name, "old-name")
+
+
 class BackpressureTests(unittest.TestCase):
     def test_sink_full_at_capacity(self) -> None:
         store, _, _ = _store()

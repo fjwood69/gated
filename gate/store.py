@@ -167,6 +167,26 @@ class GatingStore:
         )
         conn.commit()
 
+    def _reset_identity(
+        self, conn: sqlite3.Connection, delivery_id: str
+    ) -> tuple[str, str, str, int] | None:
+        """The SINGLE sanctioned accessor for a delivery's ACTUATOR IDENTITY ``(repo, head_sha, check_name,
+        generation)``, read from its PERSISTED RESET row. ``None`` iff the delivery has no reset yet (a
+        genuinely fresh delivery, before its first arming).
+
+        This is the ONLY way store code obtains identity coordinates for an EXISTING delivery — ``self._check_name``
+        (live config) is read in exactly ONE place, the fresh-mint fallback in ``enqueue``. Everything else
+        (requeue generation, supersession, queued-retirement, finalize's conclusion binding) derives the FULL
+        triple from here, so a deployed-name RENAME cannot leak a PARTIAL identity (a config check_name paired
+        with row repo/sha, or vice versa) — the unbound-reader defect closed by STRUCTURE, not review. A guard
+        test asserts no other ``self._check_name`` read exists (see test_store_executor)."""
+        r = conn.execute(
+            "SELECT repo_full_name, head_sha, check_name, generation FROM publication "
+            "WHERE delivery_id=? AND phase='reset'", (delivery_id,)).fetchone()
+        if r is None:
+            return None
+        return (str(r["repo_full_name"]), str(r["head_sha"]), str(r["check_name"]), int(r["generation"]))
+
     def _conn(self) -> sqlite3.Connection:
         conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
         if conn is None:
@@ -215,6 +235,18 @@ class GatingStore:
             )
             requeued = cur.rowcount == 1
             if requeued:
+                # IDENTITY (dissent #5 — the partial-identity leak, closed by STRUCTURE): derive the FULL
+                # actuator triple from the delivery's PERSISTED RESET, NOT from live config. An error-requeue
+                # PRESERVES its original identity across a deployed-name rename (else it computes a generation
+                # over the wrong identity while the immutable reset keeps the old one -> an unpublishable
+                # generation). A genuinely-fresh delivery has no reset yet -> MINT from the event + the current
+                # check name — the ONE sanctioned self._check_name read (the guard test enforces it). Every
+                # scope below (gen / arm / supersede / retire) uses THIS identity, never (repo, sha) alone.
+                prior = self._reset_identity(conn, event.delivery_id)
+                if prior is not None:
+                    repo, sha, cname, _oldgen = prior
+                else:
+                    repo, sha, cname = event.repo_full_name, event.head_sha, self._check_name
                 # MINT a fresh per-identity monotonic generation (NOT the gating rowid — a requeue keeps the
                 # rowid, which would leave a re-delivered delivery below a newer sibling forever). MAX(gen)+1
                 # over the identity means a re-delivery is the NEWEST generation (later event wins), so its
@@ -223,9 +255,11 @@ class GatingStore:
                 gen = int(conn.execute(
                     "SELECT COALESCE(MAX(generation), 0) + 1 AS g FROM publication "
                     "WHERE repo_full_name=? AND head_sha=? AND check_name=?",
-                    (event.repo_full_name, event.head_sha, self._check_name)).fetchone()["g"])
+                    (repo, sha, cname)).fetchone()["g"])
                 # arm (or re-arm, on an error re-queue) THIS generation's RESET publication — a distinct
                 # durable row; the CONCLUSION row (if any prior) is cleared and re-created only at finalize.
+                # (On a requeue the ON CONFLICT preserves the immutable identity columns; the VALUES identity
+                # equals the derived one either way.)
                 conn.execute(
                     "INSERT INTO publication (delivery_id, generation, repo_full_name, head_sha,"
                     " check_name, phase, status, conclusion, summary, state, attempts, next_at, created_at)"
@@ -233,35 +267,34 @@ class GatingStore:
                     "ON CONFLICT(delivery_id, phase) DO UPDATE SET generation=excluded.generation,"
                     "  state='pending', status='in_progress', conclusion=NULL, summary=NULL, attempts=0,"
                     "  lease_until=NULL, next_at=excluded.next_at",
-                    (event.delivery_id, gen, event.repo_full_name, event.head_sha, self._check_name,
-                     now, now),
+                    (event.delivery_id, gen, repo, sha, cname, now, now),
                 )
                 conn.execute(
                     "DELETE FROM publication WHERE delivery_id=? AND phase='conclusion'",
                     (event.delivery_id,))
-                # supersede EVERY older-generation publication (any phase/state) for the identity — no
+                # supersede EVERY older-generation publication (any phase/state) for THIS identity — no
                 # stale conclusion may drive the actuator; this generation's reset re-drives the surface.
                 conn.execute(
                     "UPDATE publication SET state='superseded' "
                     "WHERE repo_full_name=? AND head_sha=? AND check_name=? AND generation<? "
                     "AND state IN ('pending','published')",
-                    (event.repo_full_name, event.head_sha, self._check_name, gen),
+                    (repo, sha, cname, gen),
                 )
-                # Dissent blocker 1 — RETIRE superseded-while-queued deliveries IN THE SAME TXN. A prior
-                # delivery for this identity still in 'queued' (whether or not its reset ever published) can
+                # Dissent blocker 1 + #5 — RETIRE superseded-while-queued deliveries of THIS ACTUATOR IDENTITY
+                # IN THE SAME TXN, via a JOIN THROUGH THE OUTBOX (scoped by the predecessor's OWN reset's full
+                # triple, NOT (repo, sha) alone). A prior delivery for this identity still in 'queued' can
                 # NEVER be claimed once this newer generation superseded its reset (the reset-gate requires
-                # state='published'), yet it would sit in 'queued' forever and count against capacity. Move it
-                # to the 'superseded' TERMINAL with its own audit reason, so queued_count excludes it and a
-                # reopen storm is VISIBLE in the record (not inferred from a capacity graph). Same atomic unit
-                # as the supersession — a sweeper would leave a window where a concurrent claim_next races the
-                # retirement. This delivery (the newest, event.delivery_id) is excluded. External surface: if a
-                # retired predecessor's reset already published, THIS generation's reset republishes the same
-                # identity at a newer generation (self-corrects by construction); if it never published, no
-                # external surface exists to correct.
+                # state='published'), yet it would sit in 'queued' forever against capacity -> move it to the
+                # 'superseded' TERMINAL with its audit reason (queued_count excludes it; the storm is visible
+                # in the record). Same atomic unit as the supersession — a sweeper would race claim_next. A
+                # predecessor of a DIFFERENT check_name (post-rename) or with NO reset is NOT matched: it keeps
+                # its own lifecycle (config-agnostic Publisher) or surfaces to the migration/invariant.
                 conn.execute(
                     "UPDATE gating SET status='superseded', reason='superseded_while_queued', updated_at=? "
-                    "WHERE repo_full_name=? AND head_sha=? AND status='queued' AND delivery_id!=?",
-                    (now, event.repo_full_name, event.head_sha, event.delivery_id),
+                    "WHERE status='queued' AND delivery_id!=? AND EXISTS (SELECT 1 FROM publication r "
+                    "  WHERE r.delivery_id=gating.delivery_id AND r.phase='reset' "
+                    "  AND r.repo_full_name=? AND r.head_sha=? AND r.check_name=?)",
+                    (now, event.delivery_id, repo, sha, cname),
                 )
             conn.execute("COMMIT")
         except Exception:
@@ -359,10 +392,11 @@ class GatingStore:
                 # config change between RESET and finalize cannot split the two phases across identities
                 # (which _RESET_READY, keyed only on delivery_id, would silently accept). Born 'superseded'
                 # if a NEWER generation already exists for that same identity; else 'pending'.
-                r = conn.execute(
-                    "SELECT generation, repo_full_name, head_sha, check_name FROM publication "
-                    "WHERE delivery_id=? AND phase='reset'", (delivery_id,)).fetchone()
-                if r is None:
+                # COMPLETE-BINDING via the single identity accessor: derive the FULL triple + generation from
+                # THIS delivery's PERSISTED RESET — never self._check_name — so a config change between RESET
+                # and finalize cannot split the phases across identities.
+                ident = self._reset_identity(conn, delivery_id)
+                if ident is None:
                     # Dissent blocker 2 — terminal-without-publication is FORBIDDEN (the v1 defect). A won
                     # finalize with no outbox RESET has nothing to bind the conclusion to; skipping it
                     # silently would leave the PR's required check permanently unpublished. RAISE (the except
@@ -371,8 +405,7 @@ class GatingStore:
                     raise OutboxInvariantError(
                         f"finalize won for {delivery_id!r} but no outbox RESET exists to bind the conclusion "
                         "to — terminal-without-publication is forbidden (migrate legacy rows at startup)")
-                gen, repo, sha, cname = (int(r["generation"]), r["repo_full_name"],
-                                         r["head_sha"], r["check_name"])
+                repo, sha, cname, gen = ident
                 newer = conn.execute(
                     "SELECT 1 FROM publication n WHERE n.repo_full_name=? AND n.head_sha=? "
                     "AND n.check_name=? AND n.generation>? LIMIT 1",
