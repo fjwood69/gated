@@ -29,9 +29,9 @@ transient failure the `except` returns a truthy placeholder, and the loop treats
 a truthy result as success. So it stops after one attempt. It does not retry. It
 gives up and returns, quietly.
 
-Its own tests pass. They mock the socket, simulate a 503 and then a 200, and
-check that a usable value comes back — which it does. They never check that a
-second attempt happened. Ruff and mypy pass too: there is nothing malformed
+Its own tests pass. They mock the socket, simulate a 503 and a 200, and check
+that a usable value comes back — which it does. They never check that a second
+attempt happened. Ruff and mypy pass too: there is nothing malformed
 about the file.
 
 In a sealed demonstration run by the companion harness
