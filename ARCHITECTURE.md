@@ -437,6 +437,10 @@ recalibration before authority resumes: an ENABLED attestation bound to the prev
 identity is no longer current, and the gate will correctly refuse as `UNATTESTABLE` until the policy
 is recalibrated. That is the system behaving as specified, not a regression — but it is an
 operational step for anyone upgrading past this commit, so it is stated here rather than discovered.
+**This tree's own state, so that it is not inferred from a golden diff:** the goldens were re-pinned
+and calibration was **not** re-run under the new identity. Nothing here holds authority established
+under `2a7f8953…`, and the honest label for tip is *UNATTESTABLE pending recalibration*. Accepting a
+new identity and re-establishing authority under it are separate acts; only the first has happened.
 Note for future changes: this coupling is a **content hash over file bytes**, so a call-graph impact
 analysis of the edited function reports it low-risk (2 symbols); the real blast radius appears only
 when the analysis targets `_OBSERVER_CONFIG_HASH` itself — CRITICAL, ~146 symbols, 41 flows.

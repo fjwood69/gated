@@ -186,6 +186,25 @@ differs between the **calibration/acceptance** path and the
 met; §4.1 is not built and §4.3 preregistration is absent. Claiming Level 1
 would be false, so this repository does not claim it.
 
+**Current state of this tree: recalibration pending.** The proxy/readiness fix
+in this history materially changed the measured observer identity — a
+coordinate of the attested `ExecutionIdentity` — and the identity goldens were
+re-pinned to match (`9e2b216a…` → `2a7f8953…`). **Calibration was not re-run
+under the new identity.** Re-pinning a golden accepts a new environment
+identity; it does not re-establish authority under it, and PBGF-CS §4.2(4)
+requires recalibration after a material change to the detector's environment
+before authority resumes. So any deployment that was ENABLED under the previous
+observer identity and upgrades past that commit is **UNATTESTABLE until
+recalibrated** — the specified behaviour rather than a regression, but stated
+here rather than left to be discovered. The mechanism is not advisory: an
+enforcement run under a changed observer recomputes a measured subject that no
+longer equals the authorized one, and admission refuses it.
+
+This is a different claim surface from the sealed UAT boards, which pin this
+engine at a commit predating the change and are historical under that pin. A
+board result is evidence about the environment it ran in, and is not carried
+forward across an identity change.
+
 One reading is deliberately declined. §4.3 requires preregistration "where the
 evaluation is scenario-based", and a promotion verdict on unknown real code is
 arguably not scenario-based — on which reading this repository's §4.3 position
