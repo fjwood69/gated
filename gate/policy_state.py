@@ -25,12 +25,20 @@ from gate.checkrun import CheckConclusion
 class PolicyState(Enum):
     """The lifecycle of one check-type's policy. A CLOSED enum — every state has an explicit
     disposition (see ``DISPOSITION``); there is no default/fall-through, so a new state cannot
-    be added without also deciding whether it enforces (fail-closed by construction)."""
+    be added without also deciding whether it enforces (fail-closed by construction).
+
+    VOCABULARY (do not conflate with PBGF-CS): these are POLICY LIFECYCLE states — §4.2 blocking
+    AUTHORITY, i.e. whether this policy may run and block at the boundary. They are NOT PBGF-CS
+    §4.1 property TIERS (ENFORCEABLE / VERIFIABLE-AT-PROMOTION / ADVISABLE), which classify a
+    PROPERTY by what a check can withstand and are produced by a recorded red-team procedure.
+    This repository emits no §4.1 tier records at all. In particular ``ADVISORY`` below is a
+    demotion state of a policy, NOT the §4.1 ``ADVISABLE`` tier — the names are adjacent and mean
+    different things."""
 
     PROPOSED = "proposed"                      # authored, awaiting human governance approval
     PENDING_CALIBRATION = "pending_calibration"  # approved, queued for the batch calibrator
     CALIBRATING = "calibrating"                # the 3.2 calibrator is running the fixtures
-    ENABLED = "enabled"                        # calibration passed -> ENFORCEABLE (runs + blocks)
+    ENABLED = "enabled"                        # calibration passed -> holds authority (runs + blocks)
     DEGRADED = "degraded"                      # was ENABLED, lost attestation -> blocks, no run
     ADVISORY = "advisory"                      # human-gated demote -> runs-not / non-blocking
     REJECTED = "rejected"                      # calibration failed (FN/FP) -> never enforces
