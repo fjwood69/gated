@@ -1,0 +1,11 @@
+# Voice-gate suppressions — reviewed, deliberate first-person-plural in published prose.
+#
+# Format:  <relpath>\t<pronoun>\t<justification>
+#
+# A GROWING FILE IS A SMELL. This project speaks as "I": a solo effort with advisory review, where
+# a corporate "we" implies an organisation that does not exist and launders individual
+# accountability into a collective one. Prefer rewriting to the first person singular, or
+# impersonally where the actor is genuinely not the point.
+#
+# (Blockquotes are skipped structurally by the gate — a quotation of someone else's plural voice
+# does not need an entry here.)

@@ -6,8 +6,8 @@ Everything in this repository is licensed under **Apache-2.0**, and that grant
 is unconditional. You may use, modify, and deploy gated — including
 commercially, in production, at any scale — without payment, registration, or
 notification. There is no per-seat, per-repo, or per-PR fee for anything in
-this repository, and there never will be: Apache-2.0 does not permit us to
-charge for it, and we chose the licence knowing that.
+this repository, and there never will be: Apache-2.0 does not permit charging
+for it, and the licence was chosen knowing that.
 
 This repository is the **reference implementation** of the PBGF Conformance
 Specification (https://moriapp.dev/pbgf-cs). It does **not** currently meet all
@@ -36,7 +36,7 @@ repository**:
    infrastructure, independent calibration ratification, interoperable
    attestation envelopes, and the operational machinery for PBGF-CS Level 2/3
    conformance claims. There is no hosted service: gated runs where your code
-   runs, and we do not take custody of your artifacts or your evidence.
+   runs, and no custody is taken of your artifacts or your evidence.
 
 Commercial licences for policy packs are offered **per organisation or per
 repository band**. They are deliberately **not** metered per promotion or
@@ -48,8 +48,8 @@ arrangement; enquiries to the address in *Contact* below.
 
 - If you build your own fixtures and calibrate your own detectors with this
   code: free, forever, no strings.
-- If you want the fixtures, calibration, and attestation machinery we
-  maintain: that is the product.
+- If you want the fixtures, calibration, and attestation machinery I maintain:
+  that is the product.
 
 Nothing in this file modifies, conditions, or narrows the Apache-2.0 licence
 on this repository's contents. If any statement here appears to conflict with
