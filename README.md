@@ -121,6 +121,35 @@ hash-chained** record is written — *"the gate verdict was FAIL; the PR merged
 anyway."* It records only what the gate itself can attest, never more. Every
 merge is then either gate-approved or consciously overridden, with a record.
 
+## Where to check the claims
+
+The demonstrations on this page were produced by a separate repository:
+**[gated-uat](https://github.com/fjwood69/gated-uat)**, an external harness that
+drives this engine and publishes what came out. It is deliberately not part of
+this tree — a gate should not be the only witness to its own behaviour.
+
+Published there:
+
+- **Sealed runs** — each board committed with its `board_id` **before** the run,
+  so a cherry-picked re-run would need a different published commitment and the
+  discard would be visible. Every cell carries signed receipts for the static,
+  own-tests, review and gate stages.
+- **The failures too.** One published board is a true negative: the reviewer
+  refused the request outright and every review cell is a signed `ERROR`. It was
+  published as it happened rather than re-run until it looked better.
+- **A post-hoc note on each sealed run** recording that these boards ran against
+  an engine commit predating a defect fixed here later, and the reasoning that
+  leaves their verdicts standing.
+
+Two things that harness does **not** establish, stated because the distinction is
+easy to lose. Its in-toto/DSSE attestations are **post-hoc projections over the
+published record, produced by the harness** — they describe boards that already
+happened and are not evidence of this engine's conformance to PBGF-CS; the
+conformance position is the table below, and this repository emits no such
+envelope itself. And a board is evidence about **the environment it ran in**: it
+pins an engine commit, and a result obtained under one measured environment does
+not carry across to another.
+
 ## Repository layout
 
 - `core/` — shared contracts and value types
