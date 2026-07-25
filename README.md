@@ -10,17 +10,49 @@ The reference implementation of the [PBGF Conformance Specification](https://mor
 behaviour at the network boundary, and publishes a required GitHub Check. Code
 that violates the accepted runtime invariant cannot merge.
 
-The canonical example: a helper that looks like it retries a failed request but
-silently swallows the failure. A reviewer reading the diff sees a retry. A
-linter sees valid code. The agent that wrote it will explain, fluently, why it
-is correct. `gated` runs it, watches the socket, counts the egress attempts,
-and sees the truth.
+The canonical example is a helper that looks like it retries a failed request
+but silently swallows the failure — it passes the linter, passes the type
+checker, and passes its own tests. The next section walks through exactly that
+case, in detail.
 
 > **Status:** reference implementation. The complete mechanism runs against real
 > Podman and real GitHub — it has blocked real merges end-to-end — and carries a
 > tamper-evident, append-only override ledger that records any merge past a
 > failing check. This repository is not a plug-and-play production service or a
 > security-complete sandbox. Merge-ready ≠ security-complete ≠ live-proven.
+
+## What this actually does
+
+Take code that is supposed to retry a flaky endpoint. The tempting example looks
+like a retry — there is a loop, and a `try`/`except` around the call. But on a
+transient failure the `except` returns a truthy placeholder, and the loop treats
+a truthy result as success. So it stops after one attempt. It does not retry. It
+gives up and returns, quietly.
+
+Its own tests pass. They mock the socket, simulate a 503 and then a 200, and
+check that a usable value comes back — which it does. They never check that a
+second attempt happened. Ruff and mypy pass too: there is nothing malformed
+about the file.
+
+In a sealed demonstration run by the companion harness
+([gated-uat](https://github.com/fjwood69/gated-uat)), a frontier model reviewing
+that same file asked for changes. On the clean counterpart, the same model hit
+its output-token limit and returned no verdict at all. On an earlier sealed
+board, the reviewer refused to review the request entirely. The review column is
+an opinion, and it varies.
+
+Then `gated` ran the real function — not under those mocks — in a container with
+no network route except a counting proxy, which the code can reach by one
+hard-wired name and cannot inspect or reconfigure. The endpoint fails once, then
+succeeds. The proxy counts connections.
+
+Code that retries makes two connections. Code that swallows makes one.
+
+The tempting example made one, and the check failed. The clean one made two, and
+passed.
+
+Your test asked whether a usable value came back — it did. `gated` asked whether
+the retry happened — it didn't.
 
 ## Why runtime, not static
 
