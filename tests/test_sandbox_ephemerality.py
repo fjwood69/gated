@@ -131,8 +131,73 @@ class ProxyCountAtAcceptTests(unittest.TestCase):
         port = _free_port()
         countfile = Path(tempfile.mkdtemp(prefix="mv-eph-cnt-")) / "count"
         threading.Thread(target=serve, args=(port, str(countfile), mode), daemon=True).start()
+        # The countfile is written AFTER listen(), so this wait is a readiness gate that
+        # actually establishes readiness (see test_countfile_implies_listening below).
         self.assertEqual(_wait_count(countfile, 0, within=2.0), 0, "proxy did not initialise its countfile")
         return port, countfile
+
+    def test_countfile_implies_listening(self) -> None:
+        """REGRESSION (readiness race): the countfile is the signal every caller polls before
+        starting the artifact — ``sandbox/observed.py`` waits for it, then runs the artifact against
+        the proxy. Before the fix it was written BEFORE ``bind``/``listen``, so it witnessed only
+        "the process got this far"; a caller could proceed and have its first connection REFUSED.
+        A refused connection is never ``accept()``ed, so it is never counted — and the count is the
+        gate's verdict input (``RetryCheck`` passes iff egress >= 2), so an uncounted attempt can
+        turn a PASS into a FAIL.
+
+        Asserted BEHAVIOURALLY, not structurally: a source-ordering check would still pass if a
+        refactor preserved the ordering but broke the property (listen backlog 0, bind on the wrong
+        interface). What callers depend on is "once the countfile exists, a connect succeeds", so
+        that is what is tested — the runtime-state-assertion pattern this project applies to
+        artifacts, applied to its own harness.
+
+        Uses a DEDICATED throwaway proxy: the probe connection is ``accept()``ed and therefore
+        counted, so it must never share an observer with a measurement assertion.
+
+        DETERMINISM MATTERS HERE. Simply connecting after the countfile appears does NOT reliably
+        detect the regression: in-process the racy window is microseconds wide, so the connect
+        usually wins it and the test passes even against the buggy ordering (verified — the first
+        version of this test did exactly that). A guard that only sometimes fires is the failure
+        mode this suite exists to catch, so the ordering is asserted as an OBSERVED EFFECT with no
+        race to win: ``listen`` is wrapped, and at the moment it is entered the readiness signal
+        must not yet exist."""
+        from observe import proxy as proxy_mod
+        port = _free_port()
+        countfile = Path(tempfile.mkdtemp(prefix="mv-eph-ready-")) / "count"
+
+        # (1) DETERMINISTIC, race-free: HOLD the port, so bind/listen is guaranteed to FAIL. If the
+        # readiness signal is published before listening, the countfile appears even though the
+        # proxy never served — which is precisely the defect. No monkeypatching (socket.listen is
+        # process-global and sibling daemon proxies pollute a spy) and no window to win.
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        taken_port = int(blocker.getsockname()[1])
+        dead_countfile = Path(tempfile.mkdtemp(prefix="mv-eph-dead-")) / "count"
+        try:
+            threading.Thread(target=proxy_mod.serve,
+                             args=(taken_port, str(dead_countfile), "fail_always"),
+                             daemon=True).start()
+            time.sleep(0.5)  # ample time for serve() to reach (and fail) bind/listen
+            self.assertFalse(
+                dead_countfile.exists(),
+                "the countfile appeared even though bind/listen FAILED — the readiness signal "
+                "witnesses 'the process got this far', not 'the proxy is serving'. A caller "
+                "polling it proceeds and its first connection is REFUSED; a refused connection is "
+                "never accept()ed, so it is never counted, and the count is the verdict input")
+        finally:
+            blocker.close()
+
+        # (2) the positive property callers depend on: once the countfile exists, a connect is
+        # accepted — proving the socket was genuinely serving, not merely bound.
+        threading.Thread(target=proxy_mod.serve,
+                         args=(port, str(countfile), "fail_always"), daemon=True).start()
+        self.assertEqual(_wait_count(countfile, 0, within=2.0), 0,
+                         "proxy did not publish its readiness countfile")
+        conn = socket.create_connection(("127.0.0.1", port), 3)
+        conn.close()
+        self.assertEqual(_wait_count(countfile, 1, within=2.0), 1,
+                         "countfile existed but the proxy was not accepting — readiness signal lied")
 
     def test_silent_client_counted_before_peek_timeout(self) -> None:
         port, countfile = self._serve()

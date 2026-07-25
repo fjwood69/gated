@@ -46,7 +46,12 @@ def serve(port: int, countfile: str, mode: str = "fail_always") -> None:
         with open(countfile, "w") as f:
             f.write(str(n))
 
-    write_count(0)
+    # NOTE: the initial write_count(0) is deliberately NOT here. The countfile is the READINESS
+    # SIGNAL every caller polls (sandbox/observed.py waits for it, then starts the artifact), so it
+    # must not appear until the socket is LISTENING — otherwise it witnesses "the process reached
+    # this line", not "the proxy is serving", and a caller proceeding on it can have its first
+    # connection REFUSED. A refused connection is never accept()ed, so it is never counted, and the
+    # count is this gate's verdict input. Written immediately after listen(), below.
 
     def handle(conn: socket.socket, n: int) -> None:
         # the connection was ALREADY counted at accept (n is this attempt's number); handle only reads the
@@ -74,6 +79,11 @@ def serve(port: int, countfile: str, mode: str = "fail_always") -> None:
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port))
     srv.listen(_MAX_INFLIGHT)
+    # READINESS, established not asserted: the countfile appears ONLY once the socket is listening,
+    # so "countfile exists" now entails "a connection will be accepted" — the property every caller
+    # actually depends on. A bind/listen failure therefore leaves NO countfile and the caller times
+    # out, rather than proceeding on a file that lied about readiness.
+    write_count(0)
     while True:
         conn, _ = srv.accept()
         # COUNT THE CONNECTION AT ACCEPT — before the concurrency gate and before any payload wait. The

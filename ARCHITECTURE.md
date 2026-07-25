@@ -395,6 +395,34 @@ They decide which "proven" claims are real.
 5. **"Proven" requires exercising the deployed call path.** A subsystem whose security logic the live app
    never invokes is *mechanism-proven*, not proven. Keep the three bars distinct — **merge-ready ≠
    security-complete ≠ live-proven** — and label reference-only mechanisms as such.
+6. **A readiness gate must causally establish the property it gates on, and the probe must not perturb
+   the measurement.** Waiting on a side-effect that merely *correlates* with readiness is not a gate: it
+   witnesses "the process got this far", and a caller proceeding on it can act before the property
+   holds. Make the entailment true by construction — publish the signal only *after* the property is
+   established — rather than asserting it in a comment. The second clause is equally load-bearing on a
+   measuring boundary: a probe that connects to a counting observer is itself counted, so a readiness
+   check can corrupt the quantity the gate reads. (Learned here: the proxy's countfile was written
+   before `bind`/`listen` while `sandbox/observed.py` polled it as "it is serving" — see the residual
+   below. The candidate fix "poll-connect until it answers" was **rejected for exactly the second
+   clause**.)
+
+**Named residual — proxy readiness race (fixed; disclosed because a verdict was reachable).**
+`observe/proxy.py` published its countfile *before* `bind`/`listen`, and `sandbox/observed.py` used that
+file as its readiness signal before starting the artifact. In that window an artifact's first egress
+attempt could be refused; a refused connection is never `accept()`ed, so it was **never counted** — and
+the count is a detector's verdict input. **Polarity (checked, and it is the benign direction):** the race
+can only *under*-count, and every current detector predicate is `>=` (`RetryCheck` passes iff
+`egress >= 2`), so the reachable failure mode is a **false FAIL — over-blocking, fail-closed — never a
+false PASS**. The escape probe does not read the count (it judges a subprocess result) and independently
+fails closed on an unreachable proxy, so the probe-then-restart path in `prepare()` was already covered;
+the exposed window was the *second* proxy start, which the artifact faces directly. **No false verdict
+has been identified, and that was checked rather than assumed:** the recorded egress evidence on every
+published gate cell matches its fixture's designed attempt count (the tempting fixture records
+`egress==1 — attempted once, gave up`; the clean fixture passes on `>= 2`), so no cell shows the
+under-count signature. Fixed by publishing the countfile only after `listen()`, with a race-free
+regression test that holds the port so `bind` fails and asserts the signal never appears. Remaining:
+readiness and measurement still share one artifact (the countfile) — decoupling behind a dedicated
+sentinel is a named follow-up, as is the `_free_port()` TOCTOU in the tests.
 
 ## Status
 
