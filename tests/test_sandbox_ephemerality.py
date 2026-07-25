@@ -158,9 +158,11 @@ class ProxyCountAtAcceptTests(unittest.TestCase):
         detect the regression: in-process the racy window is microseconds wide, so the connect
         usually wins it and the test passes even against the buggy ordering (verified — the first
         version of this test did exactly that). A guard that only sometimes fires is the failure
-        mode this suite exists to catch, so the ordering is asserted as an OBSERVED EFFECT with no
-        race to win: ``listen`` is wrapped, and at the moment it is entered the readiness signal
-        must not yet exist."""
+        mode this suite exists to catch. So the property is forced instead of raced: a blocker
+        socket HOLDS the port, ``bind``/``listen`` is guaranteed to fail, and the assertion is that
+        the readiness signal never appears for a proxy that never served. (A second rejected
+        version wrapped ``socket.listen`` to observe the ordering; that patch is process-global and
+        sibling tests' daemon proxies polluted it — flaky for a different reason.)"""
         from observe import proxy as proxy_mod
         port = _free_port()
         countfile = Path(tempfile.mkdtemp(prefix="mv-eph-ready-")) / "count"
@@ -174,11 +176,33 @@ class ProxyCountAtAcceptTests(unittest.TestCase):
         blocker.listen(1)
         taken_port = int(blocker.getsockname()[1])
         dead_countfile = Path(tempfile.mkdtemp(prefix="mv-eph-dead-")) / "count"
+        bind_error: list[BaseException] = []
+
+        def _serve_capturing() -> None:
+            try:
+                proxy_mod.serve(taken_port, str(dead_countfile), "fail_always")
+            except BaseException as exc:  # noqa: BLE001 — the premise this test asserts
+                bind_error.append(exc)
+
         try:
-            threading.Thread(target=proxy_mod.serve,
-                             args=(taken_port, str(dead_countfile), "fail_always"),
-                             daemon=True).start()
-            time.sleep(0.5)  # ample time for serve() to reach (and fail) bind/listen
+            threading.Thread(target=_serve_capturing, daemon=True).start()
+            # Poll-until-deadline rather than a fixed sleep: fail the moment the countfile appears,
+            # and stop as soon as the premise (bind raised) is established.
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                self.assertFalse(
+                    dead_countfile.exists(),
+                    "the countfile appeared even though bind/listen FAILED — the readiness signal "
+                    "witnesses 'the process got this far', not 'the proxy is serving'")
+                if bind_error:
+                    break
+                time.sleep(0.02)
+            # ASSERT THE TEST'S OWN PREMISE. If a platform ever let this bind succeed, the negative
+            # above would pass VACUOUSLY — a guard that guards nothing. Fail loudly instead.
+            self.assertTrue(
+                bind_error,
+                "serve() did not raise: the blocker failed to hold the port, so the negative "
+                "assertion above proved nothing on this platform (vacuous guard)")
             self.assertFalse(
                 dead_countfile.exists(),
                 "the countfile appeared even though bind/listen FAILED — the readiness signal "

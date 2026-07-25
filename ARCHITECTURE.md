@@ -424,6 +424,10 @@ regression test that holds the port so `bind` fails and asserts the signal never
 readiness and measurement still share one artifact (the countfile) — decoupling behind a dedicated
 sentinel is a named follow-up, as is the `_free_port()` TOCTOU in the tests.
 
+**Two halves, both required.** Publishing the countfile after `listen()` closes **lying readiness** (a signal that appeared before the socket served). Making the consumer **fail closed** closes **absent readiness**: `_start_proxy` previously returned the proxy IP even when the countfile never appeared within its 5s wait, so the artifact ran with no readiness evidence at all — refused connects, uncounted attempts, the same under-count with a different trigger. It now raises `NetworkIsolationError` instead of proceeding. Together they close the end-to-end under-count path from this class.
+
+**Not closed by this fix (separate, pre-existing):** a false PASS via *extra* accepted connections is a different residual belonging to the sealed-network threat model, not to this fix's polarity claim — the "can only under-count" statement above is scoped to the readiness race.
+
 **Upgrade consequence — this fix changes the observer identity, so recalibration is required.**
 `observe/proxy.py`'s source bytes feed `_OBSERVER_CONFIG_HASH`, a coordinate of the measured
 `ExecutionIdentity`. Editing the proxy therefore changes the execution identity and re-pins the
