@@ -332,12 +332,20 @@ class ObservedOCISandbox(BaseSandbox):
         ).stdout.strip()
         if not ip:
             raise NetworkIsolationError("proxy has no IP on the sealed network")
-        # readiness: wait until the proxy has written its count file (it is serving).
+        # READINESS — proceed ONLY on evidence, never on an exhausted wait. The proxy publishes the
+        # countfile immediately AFTER bind/listen, so its presence entails "a connection will be
+        # accepted"; waiting for it is therefore a real gate. Returning anyway when it never
+        # appeared would NOT be: the artifact would run against a proxy with no readiness evidence,
+        # its first egress attempts refused, and a refused connection is never accept()ed so never
+        # counted — under-counting the verdict input exactly as the pre-fix race did (same polarity,
+        # different trigger: signal never observed, rather than signal published too early).
         for _ in range(50):
             if self._read_count(name) is not None:
-                break
+                return ip
             time.sleep(0.1)
-        return ip
+        raise NetworkIsolationError(
+            f"proxy {name} never published its readiness countfile within 5s — refusing to run an "
+            f"artifact against a proxy that is not proven to be serving")
 
     def _escape_probe(self, network: str, proxy_ip: str, image_id: str) -> None:
         p = subprocess.run(
