@@ -2,7 +2,9 @@
 
 ![A dense field of marks crossing a single vertical threshold; one red mark stopped exactly at the line](docs/assets/boundary.svg)
 
-**A promotion gate that judges what your code *does*, not what it *says*.**
+**`gated` doesn't read your code. It runs it.**
+
+A promotion gate that judges what your code *does*, not what it *says*.
 
 The reference implementation of the [PBGF Conformance Specification](https://moriapp.dev/pbgf-cs) — a standard for promotion verdicts on machine-produced code.
 
