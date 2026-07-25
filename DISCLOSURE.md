@@ -3,11 +3,23 @@
 ## Purpose
 
 This document is a defensive publication. It establishes the conception and
-public-disclosure dates of the inventions embodied in this repository, to
-serve as prior art against any later-filed claims by third parties, and to
-preserve the maintainers' position with respect to their own filings.
+public-disclosure dates of the inventions disclosed here, to serve as prior art
+against any later-filed claims by third parties, and to preserve the
+maintainers' position with respect to their own filings.
+
+**Conceived and disclosed is not the same as currently implemented.** This
+document describes the subject matter as conceived, which is deliberately
+broader than what the reference implementation embodies today; disclosure scope
+is not an implementation claim, and nothing here should be read as asserting
+that a described element is built, complete, or conformant. For what the
+reference implementation actually covers — verified per requirement against the
+tree, including what is **not** built — see *Relationship to PBGF-CS* in
+[README.md](README.md).
 
 ## Subject matter
+
+*Items below are conceived subject matter; embodiment status is solely in the
+README table.*
 
 The system disclosed here comprises, in combination:
 

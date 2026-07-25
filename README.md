@@ -169,13 +169,49 @@ The precise claims and residual risks are documented in
 
 ## Relationship to PBGF-CS
 
-This repository implements the four conformance requirements of
-[PBGF-CS](https://moriapp.dev/pbgf-cs) — mechanical tier assignment, two-sided
-calibration of blocking authority, bound and preregistered verdicts, and
-fail-closed on absence of proof — through the path this repository runs.
-Operated as published, on your own evidence, it supports a **Level 1
-(self-attested)** conformance posture. Levels 2–3 (enforced separation,
-independent attestation) require the deployment hardening described above.
+[PBGF-CS](https://moriapp.dev/pbgf-cs) scopes conformance per artifact-boundary
+pair (§3), so a claim inheriting from it must name **which path** it covers.
+This repository does not yet meet all four requirements, and its coverage
+differs between the **calibration/acceptance** path and the
+**promotion-verdict** path. Verified against this tree, not asserted:
+
+| §4 requirement | Status in this repository |
+|---|---|
+| **§4.1** mechanical tier assignment | **Not built.** No per-property tier record exists — no candidate check, no transformation/evasion attempts with outcomes, no revalidation date. Tiers are not emitted at all. |
+| **§4.2** authority earned by two-sided calibration | **Demonstrated** on the calibration path. The signed measurement binds detector digest, corpus identity (`set_id` + `oracle_head` + `coverage_digest`), measured execution identity, and coverage and failure partitions covering **both** sides; authority is granted by a dual-principal governance approval recorded in an append-only chain. |
+| **§4.3** bound and preregistered verdicts | **Partial.** **Preregistration is absent** — no expectation is committed and signed before execution on either path. (For calibration only, ground-truth labels are sealed before the run and compared after: expectation-before-execution in substance, but not a preregistration record.) Binding, refutation-representability and admissibility comparison are demonstrated on the **calibration/acceptance** path (an Ed25519 coordinate-bound envelope); the **promotion-verdict** path is thinner — verdicts persist as store rows plus a Check Run, not as that envelope. Provenance is distinguished structurally as measured-subject versus reported-context, not as the specification's three-class typed vocabulary. |
+| **§4.4** absence of proof fails closed | **Partial.** `UNATTESTABLE` names the specific unestablished element (typed refusal reasons), is distinct from `FAIL`, and infrastructure failure is explicitly refused as evidence that enforcement occurred. But freshness bounds are declared for the snapshot input only, not per input across every consumed input, so the evidence clause is not fully met. |
+
+**Conformance posture: below Level 1.** Level 1 requires all four requirements
+met; §4.1 is not built and §4.3 preregistration is absent. Claiming Level 1
+would be false, so this repository does not claim it.
+
+One reading is deliberately declined. §4.3 requires preregistration "where the
+evaluation is scenario-based", and a promotion verdict on unknown real code is
+arguably not scenario-based — on which reading this repository's §4.3 position
+would improve. The strict reading is applied here instead: the specification's
+own authors should not raise their implementation's score by reinterpreting
+their own conditional, which is the shape of loosening a requirement from
+friction. The conditional is raised as a clarification question for a future
+minor version of the specification (§8), to be settled at arm's length.
+
+Where the evidence lives matters too. The calibration and governance records
+are signed and retained, but in operator-host stores with no export surface —
+queryable **by the operator**, not inspectable by a third party. That is the
+Level 1 versus Level 3 distinction, and it is not closed here. Level 2
+(enforced producer/judge separation, signing keys outside the evaluated
+workload) and Level 3 (an interoperable envelope, execution identity rooted
+outside the operator, a calibration record reproducible from a published corpus
+digest) require the deployment hardening described above; this repository emits
+no in-toto/DSSE envelope.
+
+### What a conforming verdict does not claim (§7)
+
+A conforming verdict does not claim that the artifact is free of defects; that
+harms outside the calibrated corpus were caught; that behaviour observable only
+after promotion was judged; or that the gate's own platform is beyond
+compromise. The specification's own position is that a gate which **states**
+these limits conforms, and one that claims their absence does not.
 
 ## Licence
 

@@ -10,8 +10,12 @@ this repository, and there never will be: Apache-2.0 does not permit us to
 charge for it, and we chose the licence knowing that.
 
 This repository is the **reference implementation** of the PBGF Conformance
-Specification (https://moriapp.dev/pbgf-cs). Running it as published supports
-self-attested conformance (PBGF-CS Level 1) on your own evidence.
+Specification (https://moriapp.dev/pbgf-cs). It does **not** currently meet all
+four §4 requirements — §4.1 (mechanical tier assignment) is not built, and §4.3
+preregistration is absent — so it sits **below Level 1**, and running it as
+published does not support a Level 1 conformance claim. The per-requirement
+status, verified against this tree, is in *Relationship to PBGF-CS* in
+[README.md](README.md).
 
 ## What is commercial
 
@@ -28,13 +32,17 @@ repository**:
    standards against the PBGF tier model ("your standards, scored by
    enforceability rung"), with a remediation map.
 
-3. **Enterprise attestation and operation** — hosted or supported deployment,
-   independent calibration ratification, interoperable attestation envelopes,
-   and the operational machinery for PBGF-CS Level 2/3 conformance claims.
+3. **Enterprise attestation and operation** — supported deployment on your own
+   infrastructure, independent calibration ratification, interoperable
+   attestation envelopes, and the operational machinery for PBGF-CS Level 2/3
+   conformance claims. There is no hosted service: gated runs where your code
+   runs, and we do not take custody of your artifacts or your evidence.
 
-Commercial licences for policy packs are offered **per repository or per
-governed promotion (per-PR)** — priced at the boundary the product exists to
-govern. Terms are by arrangement; enquiries to the address in *Contact* below.
+Commercial licences for policy packs are offered **per organisation or per
+repository band**. They are deliberately **not** metered per promotion or
+per-PR: usage metering would require telemetry from the boundary, and a gate
+that phones home about every promotion is a worse gate. Terms are by
+arrangement; enquiries to the address in *Contact* below.
 
 ## The boundary, stated plainly
 
