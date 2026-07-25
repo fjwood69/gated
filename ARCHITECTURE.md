@@ -424,6 +424,19 @@ regression test that holds the port so `bind` fails and asserts the signal never
 readiness and measurement still share one artifact (the countfile) — decoupling behind a dedicated
 sentinel is a named follow-up, as is the `_free_port()` TOCTOU in the tests.
 
+**Upgrade consequence — this fix changes the observer identity, so recalibration is required.**
+`observe/proxy.py`'s source bytes feed `_OBSERVER_CONFIG_HASH`, a coordinate of the measured
+`ExecutionIdentity`. Editing the proxy therefore changes the execution identity and re-pins the
+identity goldens — by design (the golden's own note: *a legitimate proxy change re-pins this
+golden*). Per the calibration contract a material change to the detector's **environment** requires
+recalibration before authority resumes: an ENABLED attestation bound to the previous observer
+identity is no longer current, and the gate will correctly refuse as `UNATTESTABLE` until the policy
+is recalibrated. That is the system behaving as specified, not a regression — but it is an
+operational step for anyone upgrading past this commit, so it is stated here rather than discovered.
+Note for future changes: this coupling is a **content hash over file bytes**, so a call-graph impact
+analysis of the edited function reports it low-risk (2 symbols); the real blast radius appears only
+when the analysis targets `_OBSERVER_CONFIG_HASH` itself — CRITICAL, ~146 symbols, 41 flows.
+
 ## Status
 
 - **1.1 — `core/` contracts** (board-ratified): `Sandbox` Protocol + value types;
