@@ -36,7 +36,7 @@ failure classes *this build actually produces*.
 6. **What's the dependency this increment's safety silently rests on?** Is it
    *recorded and gated* (a hard dependency), or assumed-and-forgotten?
    *(The "upsert is safe only via serialisation" class → closed in the store.)*
-7. **What did we defer, and is the deferral still safe?** Re-check every "→ later":
+7. **What was deferred, and is the deferral still safe?** Re-check every "→ later":
    still fail-closed, still pre-deployment-only, still blocked-by-a-hard-dependency?
 
 ## Disposition tags (every finding gets one)

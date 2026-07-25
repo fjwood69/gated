@@ -33,6 +33,13 @@ jobs:
       # execution-assurance / guarantee language survives in shipped code strings or key docs.
       - name: Overclaim lint (scripts/check-overclaim.py)
         run: python scripts/check-overclaim.py
+      # The published-voice guard: this is a solo project, so the prose says "I", never a corporate
+      # "we" — which implies an organisation that does not exist and launders individual
+      # accountability into a collective one. Published Markdown only; shipped code comments are
+      # engineering prose and a MANUAL-review surface, a boundary the script states rather than
+      # implies (so a green build is never read as "no first-person-plural anywhere").
+      - name: Voice gate (scripts/check-voice.py)
+        run: python scripts/check-voice.py
 
   lint:
     name: Lint (ruff)
