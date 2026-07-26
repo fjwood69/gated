@@ -373,12 +373,11 @@ an ICV bump is a BREAKING change requiring re-ratification of all ENABLED polici
      gone rather than restored, and a host that is deleting rows can suppress redelivery
      anyway. This is a property of hash chains, stated so the guarantee is not read wider than
      it is.
-  2. **The truncation defence is named but not wired.** `head_anchor()` and `head_hash()`
-     carry docstrings describing an out-of-band checkpoint that would make tail-truncation
-     detectable; no production code publishes or compares one. A reader who sees a method
-     naming a defence reasonably concludes the defence is in place, which is how this class of
-     gap survives review — so the accessors should be removed or made explicitly test-only
-     rather than left standing as though closure were pending.
+  2. **No out-of-band checkpoint exists, so tail-truncation goes undetected.** Nothing
+     publishes the chain head anywhere the gate host does not control, and nothing compares
+     against such a value on read. `head_hash()` exists to chain the next record, not to
+     defend the tail: read from the ledger itself it returns whatever the current tail says,
+     so a host that removed records returns the truncated head just as readily.
   3. **A capture can be lost after it is accepted.** Override capture is fed from the merged-PR
      webhook into an in-process queue and drained by the poll loop. Backpressure is handled —
      a full sink returns 503 and the delivery is retried — but once a delivery has been

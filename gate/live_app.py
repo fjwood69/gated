@@ -241,7 +241,9 @@ def build(
     governance = _ProductionAdmissionGovernanceView(policy_store, calibration_store)
     # C3: the override ledger lives out-of-band — a SEPARATE DB file, the gate's trusted
     # store, never the repo under test (NFR4). The in-memory capture sink is drained by the
-    # poll loop; loss on crash is safe (ledger idempotency + reconciliation).
+    # poll loop. A crash between accepting a delivery and draining it LOSES that capture:
+    # nothing re-derives merges from repository state, and GitHub does not re-deliver an
+    # event it already saw acknowledged (ARCHITECTURE.md, override-ledger integrity).
     ledger_path = Path(LEDGER_DB) if LEDGER_DB else db_path.with_name("gated-override-ledger.db")
     ledger = OverrideLedger(ledger_path)
     override_sink = InMemoryOverrideSink(max_depth=256)
@@ -313,8 +315,12 @@ def build(
     def drain_overrides() -> int:
         """Drain merged-PR captures -> the override ledger. Observational: NO engine call.
         A capture failure is the AUDIT mechanism failing — surface it, never swallow
-        (completeness P3; mirrors C1's sink isolation). The event is not re-queued: the
-        ledger is idempotent and reconciliation backfills a dropped capture."""
+        (completeness P3; mirrors C1's sink isolation).
+
+        The event is NOT re-queued and nothing backfills it. Idempotency makes a GitHub
+        re-delivery safe; it does not recover a capture lost here, because GitHub has already
+        been acknowledged and will not send that event again. A failure at this point means
+        the override goes unrecorded — which is why it is surfaced rather than swallowed."""
         batch = override_sink.drain()
         for ev in batch:
             try:
