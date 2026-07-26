@@ -361,6 +361,24 @@ an ICV bump is a BREAKING change requiring re-ratification of all ENABLED polici
   exist per policy, an older-but-valid one could be selected, so rollback protection must land with it.
 - **Runtime attestation** — TEE/TPM measured-boot + eBPF signed egress (the 6th) + netns isolation of the
   calibration host process (calibration-TCB half (a)).
+- **Durability of the audit stores — the override ledger has no backup or restore story.**
+  The ledger is the record of every merge that went past a non-`PASS` verdict, and it is
+  hash-chained precisely so that tampering is detectable. Nothing protects it from simply
+  *not being there*. `verify_chain()` answers "has this been altered", never "is this all of
+  it": deleting every row from a populated ledger leaves it returning `True` — checked against
+  the recovered live ledger, not assumed. An append-only chain that can be emptied wholesale
+  without its own verifier objecting is a weaker control than its name suggests, because the
+  attack it invites is deletion rather than edit. The path is
+  operator-chosen (`GATED_LEDGER_DB`, else beside the gate database), so the store inherits
+  whatever durability that location happens to have, and nothing currently tells an operator
+  that this file is the audit chain and must be backed up like one. **This is not
+  hypothetical:** the only copy of the genesis entry of this project's sole live override
+  demonstration was found in `/tmp`, on a host where `systemd-tmpfiles` clears that directory
+  on boot and ages files out at 30 days; it survived only because the machine had been up for
+  six weeks, and was recovered about two weeks before it would have been deleted. Closing this
+  needs a documented durable-path expectation, backup/restore guidance, and a way to detect
+  truncation rather than only mutation (a signed high-water mark, or continuity anchored
+  outside the store).
 
 ## The rule to hold — Apache-core purity
 
