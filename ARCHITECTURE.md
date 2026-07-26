@@ -361,6 +361,56 @@ an ICV bump is a BREAKING change requiring re-ratification of all ENABLED polici
   exist per policy, an older-but-valid one could be selected, so rollback protection must land with it.
 - **Runtime attestation** — TEE/TPM measured-boot + eBPF signed egress (the 6th) + netns isolation of the
   calibration host process (calibration-TCB half (a)).
+- **Override-ledger integrity — what the audit trail does and does not carry.** The ledger
+  records every merge that landed on a non-`PASS` verdict, hash-chained so that tampering is
+  detectable. Five things about it are true and are easier to discover here than by reading
+  the code:
+  1. **`verify_chain()` is scoped to what is still there.** It detects edits, reordering and
+     broken prev-links among *retained* records. It does not detect truncation, and it cannot
+     speak about events that were never inserted — deleting every row from a populated ledger
+     leaves it returning `True`. Idempotency does not rescue this: a re-delivery after a
+     deletion inserts a **new** row with a new `seq` and `record_hash`, so the original link is
+     gone rather than restored, and a host that is deleting rows can suppress redelivery
+     anyway. This is a property of hash chains, stated so the guarantee is not read wider than
+     it is.
+  2. **The truncation defence is named but not wired.** `head_anchor()` and `head_hash()`
+     carry docstrings describing an out-of-band checkpoint that would make tail-truncation
+     detectable; no production code publishes or compares one. A reader who sees a method
+     naming a defence reasonably concludes the defence is in place, which is how this class of
+     gap survives review — so the accessors should be removed or made explicitly test-only
+     rather than left standing as though closure were pending.
+  3. **A capture can be lost after it is accepted.** Override capture is fed from the merged-PR
+     webhook into an in-process queue and drained by the poll loop. Backpressure is handled —
+     a full sink returns 503 and the delivery is retried — but once a delivery has been
+     accepted, a crash before the drain loses that capture, and the merge is never recorded.
+     Nothing re-derives it from repository state.
+  4. **Durability of the file is the operator's.** The ledger lives at `GATED_LEDGER_DB`, or
+     beside the gate database by default, and inherits whatever durability that location has.
+     It is the audit chain and should be backed up as one; ephemeral locations such as `/tmp`
+     are not a supported home for it. This is deployment guidance rather than a property of
+     the code.
+  5. **Tail-truncation is not closable by a single operator.** The host holding the ledger also
+     holds any credential that could rewrite a checkpoint, so an anchor published by that host
+     to storage it controls does not constrain it — and a timestamp alone does not either,
+     since a host that has truncated can timestamp the truncated head. Detection requires an
+     integrity witness outside the operator's control. This is stated as a limit rather than a
+     plan, because a local checkpoint would look like closure without being it.
+- **Anchor comparator design — the shape it has to take, recorded before it is built.** If the
+  checkpoint above is ever published and compared, two things decide whether it works. **The
+  comparison is a classification, not a threshold**: ledger and anchor agreeing; agreeing on
+  position but not on hash; ledger ahead (ordinary publish lag); ledger behind (truncation *or*
+  a legitimate restore from backup); an empty ledger against a non-zero anchor; no anchor at
+  all; and an anchor ahead because a publish succeeded where the append did not. A naive
+  "behind means truncated" test gets four of those wrong — it fires on ordinary lag, accuses a
+  restored backup, passes silently when no anchor is configured, and reads a publish-before-append
+  orphan as an attack. **And publication must stay off the decision path**: the capture path is
+  observational by construction and cannot introduce a fail-open, so an inline publish would
+  break that invariant. Failing closed when a checkpoint store is unreachable would turn the
+  audit trail into a control and hand anyone who can break that store a way to stop merges;
+  failing open silently would lose the evidence it exists to keep. Asynchronous best-effort
+  publication with retry and alerting is the shape that fits, with "ledger ahead of anchor"
+  treated as normal. Candidate witnesses, per the limit above, are transparency-log style —
+  Rekor, Trillian, or a SCITT transparency service.
 
 ## The rule to hold — Apache-core purity
 
