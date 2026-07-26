@@ -196,7 +196,7 @@ class OverrideLedgerTests(unittest.TestCase):
         r2 = lg.append(delivery_id="d2", kind=OverrideKind.HUMAN_OVERRIDE,
                        repo_full_name="r", pr=2, sha="b" * 40, verdict="fail", reason="Y").record
         self.assertEqual(r2.prev_hash, r1.record_hash)  # linear chain
-        self.assertEqual(lg.head_anchor(), (r2.seq, r2.record_hash))
+        self.assertEqual(lg.head_hash(), r2.record_hash)
 
     def test_idempotent_on_delivery_id(self) -> None:
         # F4: at-least-once webhooks — a re-delivery must NOT double-stamp or fork the chain.

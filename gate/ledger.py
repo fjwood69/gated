@@ -263,9 +263,17 @@ class AppendResult:
 
 
 class OverrideLedger:
-    """Durable, append-only, hash-chained ledger. Out-of-band (NFR4): its own DB file, the
-    gate's trusted store — never the repo under test. Connection-per-thread; appends are
-    serialised by a lock so the chain stays linear under the poll loop + reconciliation."""
+    """Append-only, hash-chained ledger. Out-of-band (NFR4): its own DB file, the gate's
+    trusted store — never the repo under test. Connection-per-thread; appends are serialised
+    by a lock so the chain stays linear under concurrent drains.
+
+    Scope of the chain, stated because "append-only, hash-chained" is easily read wider than
+    it is: ``verify_chain`` detects edits, reordering and broken prev-links among the records
+    that are STILL PRESENT. It does not detect truncation, and it cannot speak about events
+    that were never inserted — an emptied ledger verifies clean. Idempotency does not cover
+    that either: a re-delivery after a deletion appends a NEW row with a new seq and hash
+    rather than restoring the original link. Durability of the file is the operator's (see
+    ARCHITECTURE.md)."""
 
     def __init__(self, path: Path, *, clock: Callable[[], float] = time.time) -> None:
         self._path = str(path)
@@ -347,20 +355,17 @@ class OverrideLedger:
             )
 
     def head_hash(self) -> str:
-        """The record_hash of the latest record, or GENESIS if empty — the chain head an
-        out-of-band anchor publishes so truncation (lop the tail + re-chain) is detectable."""
+        """The record_hash of the latest record, or GENESIS if empty — the link ``append``
+        chains the next record to.
+
+        It is NOT a truncation defence. Read from the ledger itself it is whatever the
+        current tail says it is, so a host that removed the tail returns the truncated head
+        here just as readily. Detecting that needs a checkpoint held where the gate host
+        cannot rewrite it, which this implementation does not have (ARCHITECTURE.md)."""
         row = self._conn().execute(
             "SELECT record_hash FROM override_ledger ORDER BY seq DESC LIMIT 1"
         ).fetchone()
         return GENESIS_HASH if row is None else str(row["record_hash"])
-
-    def head_anchor(self) -> tuple[int, str]:
-        """(seq, head_hash) — the checkpoint to publish out-of-band (mori-state) so the
-        chain's tail cannot be silently truncated. seq==0 => empty ledger."""
-        row = self._conn().execute(
-            "SELECT seq, record_hash FROM override_ledger ORDER BY seq DESC LIMIT 1"
-        ).fetchone()
-        return (0, GENESIS_HASH) if row is None else (int(row["seq"]), str(row["record_hash"]))
 
     def verify_chain(self) -> bool:
         """Walk the chain oldest->newest, recomputing each hash. Returns False if any record
@@ -402,7 +407,7 @@ def _row_to_record(row: sqlite3.Row) -> OverrideRecord:
     )
 
 
-# ---- the capture handler (poll-loop + reconciliation entry point) ------------
+# ---- the capture handler (drained by the poll loop) -------------------------
 
 # A read-only provider of the 2.3-store verdict rows for a SHA (dependency inversion: the
 # ledger does not import the store; the caller injects the lookup).

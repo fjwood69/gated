@@ -87,9 +87,13 @@ class OverrideSink(Protocol):
 
 
 class InMemoryOverrideSink:
-    """Bounded process-local capture queue. Loss on crash is tolerated by design — the
-    ledger's delivery_id UNIQUE constraint makes re-delivery safe, and reconciliation
-    backfills a dropped event. ``drain`` hands the batch to the capture handler."""
+    """Bounded process-local capture queue. ``drain`` hands the batch to the capture handler.
+
+    BACKPRESSURE is safe: a full sink raises ``SinkFull``, the receiver 503s, GitHub
+    re-delivers, and the ledger's delivery_id UNIQUE constraint stops a double-record.
+    A CRASH IS NOT: an event accepted here and lost before the drain is gone. GitHub has
+    already had its 2xx and will not re-deliver, and no reconciler re-derives the merge from
+    repository state — so that override is never recorded."""
 
     def __init__(self, *, max_depth: int = 256) -> None:
         self._events: list[OverrideCaptureEvent] = []
