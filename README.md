@@ -234,6 +234,10 @@ The precise claims and residual risks are documented in
 
 [PBGF-CS](https://moriapp.dev/pbgf-cs) scopes conformance per artifact-boundary
 pair (§3), so a claim inheriting from it must name **which path** it covers.
+The specification and this implementation share an author; how it is versioned,
+how to propose a change, and the stated trigger for moving it out of
+single-author control are at
+[moriapp.dev/pbgf-cs/governance](https://moriapp.dev/pbgf-cs/governance).
 This repository does not yet meet all four requirements, and its coverage
 differs between the **calibration/acceptance** path and the
 **promotion-verdict** path. Verified against this tree, not asserted:
@@ -248,6 +252,10 @@ differs between the **calibration/acceptance** path and the
 **Conformance posture: below Level 1.** Level 1 requires all four requirements
 met; §4.1 is not built and §4.3 preregistration is absent. Claiming Level 1
 would be false, so this repository does not claim it.
+
+The current position, and the ordered path from it, are in
+[CONFORMANCE.md](CONFORMANCE.md) — per requirement, with what is missing and
+what closing it would take.
 
 **Current state of this tree: recalibration pending.** The proxy/readiness fix
 in this history materially changed the measured observer identity — a
