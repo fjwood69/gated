@@ -66,6 +66,13 @@ _RUNTIMES = ("podman", "nerdctl", "docker")  # docker last — optional, never p
 ARTIFACT_MOUNT = "/artifact"  # verified tree, read-only
 WORK_DIR = "/work"            # writable tmpfs — scratch/audit only, NEVER graded
 
+# The name prefix every gated-created runtime resource carries. LOAD-BEARING, and shared: the
+# observed sandbox's ``reap_orphans`` selects orphans with ``--filter name=<this>``, so a container
+# whose name does not derive from it is one the reaper cannot see. It lived as a bare literal in both
+# modules, which meant the reaper's coverage of THIS module's containers rode on two independently
+# maintained strings happening to agree. Defined once here and imported by ``sandbox/observed.py``.
+RESOURCE_PREFIX = "moriverify-"
+
 
 def probe_existence(argv: list[str], name: str, *, timeout: float = 30.0) -> Existence:
     """Probe whether the runtime resource ``name`` is listed by ``argv`` — the SHARED, fail-CLOSED existence
@@ -193,7 +200,7 @@ class OCISandbox(BaseSandbox):
         # 3.5-close #1.1: resolve the IMMUTABLE image digest at the TOP of prepare(), ONCE, before
         # anything runs — run() then executes THIS digest, not the mutable tag (closes tag-remap).
         image_id = resolve_image_id(self._runtime, self.image)
-        snapshot = Path(tempfile.mkdtemp(prefix="moriverify-oci-"))
+        snapshot = Path(tempfile.mkdtemp(prefix=f"{RESOURCE_PREFIX}oci-"))
         try:
             if artifact.path.is_dir():
                 shutil.copytree(artifact.path, snapshot, dirs_exist_ok=True)
@@ -212,7 +219,7 @@ class OCISandbox(BaseSandbox):
             id=uuid.uuid4().hex,
             artifact_hash=artifact.tree_hash,
             snapshot=snapshot,
-            container=f"moriverify-{uuid.uuid4().hex[:16]}",
+            container=f"{RESOURCE_PREFIX}{uuid.uuid4().hex[:16]}",
             image_id=image_id,
         )
 
