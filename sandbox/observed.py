@@ -56,6 +56,7 @@ import shutil
 
 from sandbox.base import BaseSandbox
 from sandbox.oci import (
+    RESOURCE_PREFIX,
     OCIRuntimeUnavailable,
     _make_snapshot_readable,
     _selinux_enforcing,
@@ -94,7 +95,12 @@ sys.exit(0 if not leaks else ("LEAK:" + ",".join(leaks)))
 """
 
 
-_PREFIX = "moriverify-"
+# Imported, not restated: ``sandbox/oci.py`` names its own containers with the same prefix and the
+# reaper below filters on it, so the two must be one value rather than two that agree today.
+# SCOPE: ``sandbox/subprocess.py`` and ``gate/artifact.py`` still restate the literal for their own
+# temp DIRECTORIES. Those are host paths, not podman resources, so the reaper cannot see them either
+# way — out of scope here rather than overlooked.
+_PREFIX = RESOURCE_PREFIX
 
 # 3.5-close #1.1 (board amendment 4): the container IMAGE digest does NOT cover the host-mounted
 # observer — ``_PROXY_SRC`` is bind-mounted into the proxy as ``/proxy.py``, and the sealed-network
@@ -102,6 +108,36 @@ _PREFIX = "moriverify-"
 # OBSERVER DRIFT (a changed proxy, a loosened network, a weakened probe) is visible in the attested
 # execution identity even when the image digest is unchanged. Computed once from the on-disk observer.
 _SEALED_NETWORK_FLAGS = ("--internal", "--disable-dns")
+
+
+def network_create_argv(runtime: str, name: str) -> list[str]:
+    """The sealed-network create argv — the application site for the attested sealed-network flags.
+
+    ``_SEALED_NETWORK_FLAGS`` is EXPANDED here rather than restated as literals, so the value that
+    is *attested* (it is a member of ``_OBSERVER_CONFIG_HASH`` below) and the value that is *applied*
+    cannot diverge. Before this, editing the literals at the create site left the identity unchanged
+    while the posture moved — the identity attesting a network the container did not have — and
+    editing the constant forced a recalibration for a posture that had not moved. Neither direction
+    failed anything, which is what made it a defect rather than untidiness: a control that can lie,
+    inside the mechanism that grants blocking authority.
+
+    SEAM: kept as a free function returning the argv so the binding test asserts against an OUTPUT
+    rather than against ``_create_network``'s internals. A shared argv builder (a LATER increment —
+    no such builder exists in this module today; every other ``subprocess.run`` site here still
+    hand-builds its list) can absorb this without the test changing.
+
+    SCOPE OF THE GUARANTEE, because the word "the" above would otherwise overclaim. What is
+    test-enforced is that ``_create_network``'s executed argv FOLLOWS this constant. What is NOT
+    enforced is that this is the only expansion site: a second site re-expanding
+    ``*_SEALED_NETWORK_FLAGS`` would be byte-identical and every test would stay green. Nor is the
+    binding attested — ``_OBSERVER_CONFIG_HASH`` is computed ONCE AT IMPORT from the constant's
+    value, while this function reads the module global AT CALL TIME, so an in-process mutation or a
+    shadowed module attribute reproduces the original defect polarity with the identity unmoved. The
+    seal is a CI-time source-integrity control, not a runtime one.
+    """
+    return [runtime, "network", "create", *_SEALED_NETWORK_FLAGS, name]
+
+
 _OBSERVER_CONFIG_HASH = content_digest({
     "proxy_src_sha256": hashlib.sha256(_PROXY_SRC.read_bytes()).hexdigest(),
     "escape_probe_sha256": hashlib.sha256(_ESCAPE_SCRIPT.encode("utf-8")).hexdigest(),
@@ -112,25 +148,35 @@ _OBSERVER_CONFIG_HASH = content_digest({
 
 
 def reap_orphans(runtime: str = "podman") -> None:
-    """Startup reaper (GLM mandate): force-remove any orphaned gated containers
-    and networks by name prefix. RAII covers normal + partial-failure paths, but a
-    hard crash of the engine process itself can still orphan resources; run this on
-    engine startup for a guaranteed clean slate (no FD/IP-space exhaustion on CI).
+    """Force-remove orphaned gated containers and networks by name prefix. A TEST/OPS UTILITY —
+    **nothing invokes this at startup, and it does not guarantee a clean slate to anything.**
 
-    Fail CLOSED: the reaper PROMISES a clean slate, so a listing that cannot run (error / timeout / non-zero)
-    RAISES ``SandboxLeakError`` rather than reap nothing and report success — an unlistable runtime is exactly
-    the state where an orphaned container/network could persist unseen. Each removal is re-probed; a resource
-    not CONFIRMED gone raises."""
+    RAII covers the normal and partial-failure paths; a hard crash of the engine process itself can
+    still orphan resources, which is what this exists to clear when an operator or a test chooses to
+    run it. It is NOT wired into engine or App boot, so no caller may assume a clean slate on the
+    strength of its existence.
+
+    *This docstring previously promised a startup clean-slate guarantee that nothing delivered — the
+    only callers were tests. Wiring it at boot is a SEPARATE increment, because it would introduce
+    resource deletion at startup and, being fail-closed, would turn a briefly-unlistable runtime into
+    a refusal to start. It also selects by PREFIX rather than by instance, so on a host running two
+    gated instances a booting instance would reap the other's live sandboxes. Those are real design
+    questions, and they are not this increment's.*
+
+    Fail CLOSED **for its own callers**: a listing that cannot run (error / timeout / non-zero) RAISES
+    ``SandboxLeakError`` rather than reap nothing and report success — an unlistable runtime is exactly
+    the state where an orphaned container/network could persist unseen. Each removal is re-probed; a
+    resource not CONFIRMED gone raises."""
     def _names(args: list[str], what: str) -> list[str]:
         try:
             r = subprocess.run(args, capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.SubprocessError) as exc:
             raise SandboxLeakError(
-                f"startup reaper could not list orphan {what} ({exc!r}) — cannot guarantee a clean slate"
+                f"orphan reaper could not list {what} ({exc!r}) — cannot confirm a clean slate"
             ) from exc
         if r.returncode != 0:
             raise SandboxLeakError(
-                f"startup reaper list of orphan {what} returned {r.returncode} — cannot guarantee a clean slate")
+                f"orphan reaper list of {what} returned {r.returncode} — cannot confirm a clean slate")
         return r.stdout.split()
 
     def _rm(args: list[str]) -> None:
@@ -147,13 +193,13 @@ def reap_orphans(runtime: str = "podman") -> None:
         _rm([runtime, "rm", "-f", c])
         if probe_existence([runtime, "ps", "-a", "--filter", f"name=^{c}$", "--format", "{{.Names}}"],
                            c) is not Existence.ABSENT:
-            raise SandboxLeakError(f"startup reaper could not CONFIRM orphan container {c} destroyed")
+            raise SandboxLeakError(f"orphan reaper could not CONFIRM container {c} destroyed")
     for n in _names([runtime, "network", "ls", "--filter", f"name={_PREFIX}", "--format", "{{.Name}}"],
                     "networks"):
         _rm([runtime, "network", "rm", "-f", n])
         if probe_existence([runtime, "network", "ls", "--filter", f"name=^{n}$", "--format", "{{.Name}}"],
                            n) is not Existence.ABSENT:
-            raise SandboxLeakError(f"startup reaper could not CONFIRM orphan network {n} destroyed")
+            raise SandboxLeakError(f"orphan reaper could not CONFIRM network {n} destroyed")
 
 
 class NetworkIsolationError(Exception):
@@ -220,10 +266,12 @@ class ObservedOCISandbox(BaseSandbox):
         # artifact, proxy and escape-probe containers ALL execute this same digest (one consistent
         # snapshot — no swap between resolving the proxy and running the artifact).
         image_id = resolve_image_id(self._runtime, self.image)
-        snapshot = Path(tempfile.mkdtemp(prefix="moriverify-obs-"))
+        snapshot = Path(tempfile.mkdtemp(prefix=f"{_PREFIX}obs-"))
         rid = uuid.uuid4().hex[:16]
-        network = f"moriverify-net-{rid}"
-        proxy = f"moriverify-proxy-{rid}"
+        # _PREFIX is the SINGLE SOURCE: reap_orphans selects orphans by ``--filter name={_PREFIX}``,
+        # so a name that does not derive from it is a resource the reaper cannot see.
+        network = f"{_PREFIX}net-{rid}"
+        proxy = f"{_PREFIX}proxy-{rid}"
         try:
             if artifact.path.is_dir():
                 shutil.copytree(artifact.path, snapshot, dirs_exist_ok=True)
@@ -259,7 +307,7 @@ class ObservedOCISandbox(BaseSandbox):
             raise
         return ObservedHandle(
             id=uuid.uuid4().hex, artifact_hash=artifact.tree_hash, snapshot=snapshot,
-            container=f"moriverify-sbx-{rid}", network=network, proxy=proxy,
+            container=f"{_PREFIX}sbx-{rid}", network=network, proxy=proxy,
             proxy_ip=proxy_ip, baseline=baseline, image_id=image_id,
         )
 
@@ -315,8 +363,8 @@ class ObservedOCISandbox(BaseSandbox):
 
     # -- infra helpers -----------------------------------------------------------
     def _create_network(self, name: str) -> None:
-        subprocess.run([self._runtime, "network", "create", "--internal",
-                        "--disable-dns", name], capture_output=True, timeout=30, check=True)
+        subprocess.run(network_create_argv(self._runtime, name),
+                       capture_output=True, timeout=30, check=True)
 
     def _start_proxy(self, network: str, name: str, mode: str, image_id: str) -> str:
         subprocess.run(
