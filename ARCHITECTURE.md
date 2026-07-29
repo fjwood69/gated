@@ -490,9 +490,21 @@ operational step for anyone upgrading past this commit, so it is stated here rat
 and calibration was **not** re-run under the new identity. Nothing here holds authority established
 under `2a7f8953…`, and the honest label for tip is *UNATTESTABLE pending recalibration*. Accepting a
 new identity and re-establishing authority under it are separate acts; only the first has happened.
-Note for future changes: this coupling is a **content hash over file bytes**, so a call-graph impact
-analysis of the edited function reports it low-risk (2 symbols); the real blast radius appears only
-when the analysis targets `_OBSERVER_CONFIG_HASH` itself — CRITICAL, ~146 symbols, 41 flows.
+Note for future changes: this coupling is a **content hash over file bytes**, and a call-graph impact
+analysis cannot see it from *either* end. Analysing the edited function reports low risk (2 symbols);
+analysing `_OBSERVER_CONFIG_HASH` itself reports **nothing at all** — zero affected symbols, zero
+flows, labelled *exact*. The reason is structural, not a stale index: the constant's only consumer is
+a class-attribute default (`sandbox/observed.py:183`), and the value reaches the attested identity
+through `getattr(sandbox, "observer_config_hash", "")` (`engine/runner.py:85`) — a dynamic read that
+no call graph can resolve even in principle. A zero here is **absence of modelling, not absence of
+risk**: call-graph impact is **vacuous** for this coupling and must not be cited as evidence in
+either direction. What actually catches a change is the identity golden re-pinning and the
+recalibration it forces — not the graph.
+*Corrected 2026-07-29.* An earlier revision of this note recorded the second analysis as *CRITICAL,
+~146 symbols, 41 flows*. That figure does not reproduce: re-measured on this commit against a
+freshly built index, the target returns 0 affected symbols and 0 flows. The first figure (2 symbols)
+does reproduce exactly. The provenance of the withdrawn figure could not be reconstructed, so it is
+withdrawn rather than re-explained.
 
 ## Status
 
