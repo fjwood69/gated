@@ -29,6 +29,35 @@ from sandbox.observed import (
 )
 
 
+_RT_NAME = "podman"          # the audited NAME — what ``sandbox.runtime`` reports
+_RT_PATH = "/usr/bin/podman"  # the resolved PATH — what argv[0] carries
+
+
+def _argv_test_sandbox(name: str = _RT_NAME, path: str = _RT_PATH) -> ObservedOCISandbox:
+    """An ``ObservedOCISandbox`` built WITHOUT running runtime detection, for argv-shape assertions.
+
+    Internals-coupled on purpose and in ONE place. These tests must not construct the sandbox normally
+    (``__init__`` runs a container capability probe, which CI cannot do), so they bypass it and set the
+    attributes ``_create_network`` reads. Centralised because P2a added a second such attribute
+    (``_runtime_path``, the resolved absolute binary, kept separate from the audited ``_runtime`` NAME)
+    and the previous per-test setup meant two tests broke instead of one line.
+
+    If a future change adds another internal to this path, THIS is the line to update — and a
+    ``AttributeError`` from these tests is that signal, not a failure of the seam.
+
+    ``path`` IS ABSOLUTE, and this is the one line where P2a's remediation touched a P1 test. It
+    previously held the bare NAME, purely so the assertions could compare against
+    ``network_create_argv(runtime, …)``. The exec boundary now refuses a non-absolute ``argv[0]``, so
+    that fixture modelled a shape production can no longer produce — the fixture was wrong, not the new
+    check. Direction established before changing either side: a red test is disagreement between test
+    and code, and here the code is right.
+    """
+    sbx = ObservedOCISandbox.__new__(ObservedOCISandbox)
+    sbx._runtime = name
+    sbx._runtime_path = path
+    return sbx
+
+
 class SealedNetworkArgvBinding(unittest.TestCase):
     """``network_create_argv`` is the single application site for the attested flags."""
 
@@ -93,14 +122,13 @@ class CreateNetworkUsesTheSeam(unittest.TestCase):
     """
 
     def test_create_network_invokes_the_seam_argv(self) -> None:
-        sbx = ObservedOCISandbox.__new__(ObservedOCISandbox)  # no runtime detection
-        sbx._runtime = "podman"
+        sbx = _argv_test_sandbox()
         with mock.patch.object(subprocess, "run") as run:
             run.return_value = subprocess.CompletedProcess([], 0, b"", b"")
             sbx._create_network("net-x")
         self.assertTrue(run.called, "_create_network did not invoke subprocess.run")
         self.assertEqual(
-            list(run.call_args.args[0]), network_create_argv("podman", "net-x"),
+            list(run.call_args.args[0]), network_create_argv(_RT_PATH, "net-x"),
             "_create_network built its own argv instead of using network_create_argv",
         )
 
@@ -116,8 +144,7 @@ class CreateNetworkUsesTheSeam(unittest.TestCase):
         argv ``_create_network`` actually executes. A restated literal cannot follow it.
         """
         fake = (*_SEALED_NETWORK_FLAGS, "--sentinel-not-a-real-flag")
-        sbx = ObservedOCISandbox.__new__(ObservedOCISandbox)
-        sbx._runtime = "podman"
+        sbx = _argv_test_sandbox()
         with mock.patch("sandbox.observed._SEALED_NETWORK_FLAGS", fake):
             with mock.patch.object(subprocess, "run") as run:
                 run.return_value = subprocess.CompletedProcess([], 0, b"", b"")
