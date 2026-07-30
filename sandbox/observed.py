@@ -58,6 +58,9 @@ from sandbox.base import BaseSandbox
 from sandbox.oci import (
     RESOURCE_PREFIX,
     OCIRuntimeUnavailable,
+    detect_runtime,
+    resolve_runtime_path,
+    runtime_client_env,
     _make_snapshot_readable,
     _selinux_enforcing,
     probe_existence,
@@ -169,7 +172,8 @@ def reap_orphans(runtime: str = "podman") -> None:
     resource not CONFIRMED gone raises."""
     def _names(args: list[str], what: str) -> list[str]:
         try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+            r = subprocess.run(args, capture_output=True, text=True, timeout=30,
+                               env=runtime_client_env())
         except (OSError, subprocess.SubprocessError) as exc:
             raise SandboxLeakError(
                 f"orphan reaper could not list {what} ({exc!r}) — cannot confirm a clean slate"
@@ -184,7 +188,7 @@ def reap_orphans(runtime: str = "podman") -> None:
         # SandboxLeakError contract, so swallow it — the re-probe below is the sole destruction
         # authority and normalises every not-CONFIRMED-gone outcome to SandboxLeakError.
         try:
-            subprocess.run(args, capture_output=True, timeout=30)
+            subprocess.run(args, capture_output=True, timeout=30, env=runtime_client_env())
         except (OSError, subprocess.SubprocessError):
             pass
 
@@ -230,7 +234,10 @@ class ObservedOCISandbox(BaseSandbox):
 
     def __init__(self, image: str, runtime: str | None = None) -> None:
         self.image = image
+        # NAME vs PATH kept separate (see sandbox/oci.py header): ``runtime`` reports the audited
+        # name; every argv[0] uses ``_runtime_path``.
         self._runtime = runtime if runtime is not None else self._detect_runtime(image)
+        self._runtime_path = resolve_runtime_path(self._runtime)
 
     @property
     def runtime(self) -> str:
@@ -238,19 +245,12 @@ class ObservedOCISandbox(BaseSandbox):
 
     @staticmethod
     def _detect_runtime(image: str) -> str:
-        for rt in _RUNTIMES:
-            if shutil.which(rt) is None:
-                continue
-            try:
-                probe = subprocess.run(
-                    [rt, "run", "--rm", "--network=none", image, "true"],
-                    capture_output=True, timeout=90,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            if probe.returncode == 0:
-                return rt
-        raise OCIRuntimeUnavailable(f"no runtime can run '{image}' hermetically")
+        """Thin delegation to the shared ``detect_runtime`` — ONE implementation for both backends.
+
+        This was a verbatim copy of ``OCISandbox``'s, differing only in its error message. The function
+        chooses WHICH BINARY THE GATE EXECUTES; two copies could drift into two runtimes in one run.
+        """
+        return detect_runtime(image)
 
     @staticmethod
     def available(image: str) -> bool:
@@ -265,7 +265,7 @@ class ObservedOCISandbox(BaseSandbox):
         # 3.5-close #1.1: resolve the IMMUTABLE image digest ONCE at the TOP of prepare(); the
         # artifact, proxy and escape-probe containers ALL execute this same digest (one consistent
         # snapshot — no swap between resolving the proxy and running the artifact).
-        image_id = resolve_image_id(self._runtime, self.image)
+        image_id = resolve_image_id(self._runtime_path, self.image)
         snapshot = Path(tempfile.mkdtemp(prefix=f"{_PREFIX}obs-"))
         rid = uuid.uuid4().hex[:16]
         # _PREFIX is the SINGLE SOURCE: reap_orphans selects orphans by ``--filter name={_PREFIX}``,
@@ -321,7 +321,7 @@ class ObservedOCISandbox(BaseSandbox):
         if _selinux_enforcing():
             mount += ",relabel=private"
         cmd = [
-            self._runtime, "run", "--rm", "--init", "--name", h.container,
+            self._runtime_path, "run", "--rm", "--init", "--name", h.container,
             "--network", h.network, "--add-host", f"{PROXY_HOST}:{h.proxy_ip}",
             "--mount", mount, "--tmpfs", WORK_DIR, "--workdir", WORK_DIR,
             # 3.5-close #1.1: run the immutable digest resolved in prepare() (recorded in the result).
@@ -330,7 +330,7 @@ class ObservedOCISandbox(BaseSandbox):
         try:
             proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin"},
+                stderr=subprocess.DEVNULL, env=runtime_client_env(),
             )
         except OSError:
             return self._result("error", None, None, h)
@@ -363,20 +363,20 @@ class ObservedOCISandbox(BaseSandbox):
 
     # -- infra helpers -----------------------------------------------------------
     def _create_network(self, name: str) -> None:
-        subprocess.run(network_create_argv(self._runtime, name),
-                       capture_output=True, timeout=30, check=True)
+        subprocess.run(network_create_argv(self._runtime_path, name),
+                       capture_output=True, timeout=30, check=True, env=runtime_client_env())
 
     def _start_proxy(self, network: str, name: str, mode: str, image_id: str) -> str:
         subprocess.run(
-            [self._runtime, "run", "-d", "--network", network, "--name", name,
+            [self._runtime_path, "run", "-d", "--network", network, "--name", name,
              "--mount", f"type=bind,source={_PROXY_SRC},target=/proxy.py,readonly",
              image_id, "python3", "/proxy.py", str(PROXY_PORT), _COUNTFILE, mode],
-            capture_output=True, timeout=60, check=True,
+            capture_output=True, timeout=60, check=True, env=runtime_client_env(),
         )
         ip = subprocess.run(
-            [self._runtime, "inspect", name, "--format",
+            [self._runtime_path, "inspect", name, "--format",
              "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, env=runtime_client_env(),
         ).stdout.strip()
         if not ip:
             raise NetworkIsolationError("proxy has no IP on the sealed network")
@@ -397,9 +397,10 @@ class ObservedOCISandbox(BaseSandbox):
 
     def _escape_probe(self, network: str, proxy_ip: str, image_id: str) -> None:
         p = subprocess.run(
-            [self._runtime, "run", "-i", "--rm", "--network", network,
+            [self._runtime_path, "run", "-i", "--rm", "--network", network,
              "--add-host", f"{PROXY_HOST}:{proxy_ip}", image_id, "python3", "-"],
             input=_ESCAPE_SCRIPT.encode(), capture_output=True, timeout=60,
+            env=runtime_client_env(),
         )
         if p.returncode != 0:
             detail = (p.stdout + p.stderr).decode(errors="replace").strip()
@@ -407,8 +408,8 @@ class ObservedOCISandbox(BaseSandbox):
 
     def _read_count(self, proxy: str) -> int | None:
         r = subprocess.run(
-            [self._runtime, "exec", proxy, "cat", _COUNTFILE],
-            capture_output=True, text=True, timeout=30,
+            [self._runtime_path, "exec", proxy, "cat", _COUNTFILE],
+            capture_output=True, text=True, timeout=30, env=runtime_client_env(),
         )
         try:
             return int(r.stdout.strip())
@@ -437,24 +438,25 @@ class ObservedOCISandbox(BaseSandbox):
     def _force_remove(self, name: str) -> None:
         # best-effort; the destruction AUTHORITY is the tri-state probe (a non-zero rm re-probes, fails closed).
         try:
-            subprocess.run([self._runtime, "rm", "-f", name], capture_output=True, timeout=30)
+            subprocess.run([self._runtime_path, "rm", "-f", name], capture_output=True, timeout=30,
+                           env=runtime_client_env())
         except (OSError, subprocess.SubprocessError):
             pass
 
     def _force_remove_network(self, name: str) -> None:
         try:
-            subprocess.run([self._runtime, "network", "rm", "-f", name],
-                           capture_output=True, timeout=30)
+            subprocess.run([self._runtime_path, "network", "rm", "-f", name],
+                           capture_output=True, timeout=30, env=runtime_client_env())
         except (OSError, subprocess.SubprocessError):
             pass
 
     def _container_state(self, name: str) -> Existence:
         return probe_existence(
-            [self._runtime, "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"], name)
+            [self._runtime_path, "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"], name)
 
     def _network_state(self, name: str) -> Existence:
         return probe_existence(
-            [self._runtime, "network", "ls", "--filter", f"name=^{name}$", "--format", "{{.Name}}"], name)
+            [self._runtime_path, "network", "ls", "--filter", f"name=^{name}$", "--format", "{{.Name}}"], name)
 
     def _result(self, outcome: _Outcome, exit_code: int | None, egress: int | None,
                 handle: ObservedHandle, raw: int | None = None) -> ExecutionResult:

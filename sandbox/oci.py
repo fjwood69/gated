@@ -74,6 +74,119 @@ WORK_DIR = "/work"            # writable tmpfs — scratch/audit only, NEVER gra
 RESOURCE_PREFIX = "moriverify-"
 
 
+# ---------------------------------------------------------------------------------------------------
+# P2a — ONE runtime resolution and ONE client-env policy, shared by every sandbox backend.
+#
+# Two DISTINCT things, deliberately not conflated (they were, before P2a):
+#
+#   * the runtime NAME  — an audited identity from a closed set (``gate/backends.py``'s
+#     ``_APPROVED_RUNTIMES``). It is what ``sandbox.runtime`` reports and what the trusted factory
+#     validates. It must stay a bare name: an arbitrary string or path there is an exec-injection
+#     surface, which is precisely what that closed set exists to refuse.
+#   * the runtime PATH  — the resolved absolute binary, used as ``argv[0]`` at every invocation.
+#
+# Why the split matters. ``Popen(cmd, env=...)`` with a slash-less ``cmd[0]`` resolves the binary via
+# the PATH *in the passed env dict*, so a trojaned ``podman`` on an early PATH entry would execute AS
+# THE GATE during verdict runs. Naming the binary absolutely closes that regardless of env. Keeping the
+# NAME separate means the closed-set contract is untouched.
+_CLIENT_PATH_FALLBACK = "/usr/bin:/bin"
+
+# The client env allowlist. NOT full ``os.environ`` (the runtime client should not inherit the host's
+# world) and NOT ``{"PATH": ...}`` alone.
+#
+# MEASURED on the reference host (podman 4.9.3, crun 1.14.1, rootless uid 1000, home-dir
+# ``storage.conf``): a bare ``{"PATH": ...}`` IS sufficient — the capability probe exits 0, the
+# configured graphroot resolves, and locally-built images are readable, because podman falls back to
+# ``getpwuid`` when HOME is unset. An ABSENT ``HOME`` degrades correctly; a WRONG one fails loudly.
+#
+# So this allowlist is PORTABILITY INSURANCE for untested runtimes (``nerdctl``, ``docker``) and for
+# hosts whose container config is not home-derived — it is NOT "what makes rootless podman work".
+# Do not justify it with "rootless needs HOME"; that claim is contradicted by the measurement above.
+# Each name is passed through ONLY if present in the parent environment.
+_CLIENT_ENV_PASSTHROUGH = (
+    "HOME",                       # rootless config/storage discovery when getpwuid is not authoritative
+    "XDG_RUNTIME_DIR",            # rootless runroot / socket location
+    "XDG_CONFIG_HOME",            # non-default config root
+    "CONTAINERS_CONF",            # explicit containers.conf
+    "CONTAINERS_STORAGE_CONF",    # explicit storage.conf
+    "CONTAINERS_REGISTRIES_CONF", # explicit registries.conf
+    "DOCKER_HOST",                # docker/nerdctl daemon endpoint
+    "DOCKER_CONFIG",              # docker client config dir
+)
+
+
+def runtime_client_env() -> dict[str, str]:
+    """The environment for a HOST-SIDE runtime invocation — every one of them, uniformly.
+
+    This is the CLIENT's env (podman/docker itself), NOT the container's: no ``--env`` appears in any
+    argv, so the container's environment comes from the image config and is already covered by the
+    attested image digest. The artifact cannot reach this dict.
+
+    Before P2a there were three postures in one package — one site hardcoded ``{"PATH": "/usr/bin:/bin"}``,
+    one inherited the host ``PATH``, and eighteen passed no ``env=`` at all and inherited the entire host
+    environment, including the capability probe that decides whether the gate can run. Nobody chose that;
+    it drifted.
+    """
+    env = {"PATH": os.environ.get("PATH", _CLIENT_PATH_FALLBACK)}
+    for var in _CLIENT_ENV_PASSTHROUGH:
+        value = os.environ.get(var)
+        if value is not None:
+            env[var] = value
+    return env
+
+
+def resolve_runtime_path(runtime: str) -> str:
+    """The absolute path of ``runtime``, or ``runtime`` unchanged when it cannot be resolved.
+
+    BEST-EFFORT BY DESIGN, and the reason is a real constraint rather than laziness: ``observed.py``
+    instantiates a sandbox at MODULE IMPORT (the ``Sandbox`` protocol conformance check), so raising
+    here would make importing the package fail on any host without that runtime. An unresolvable name
+    falls through unchanged and the invocation fails at exec, exactly as it did before.
+
+    Already-absolute input is returned as-is, so a caller that pinned a path keeps it.
+
+    TOCTOU, stated rather than implied: resolution happens once at construction, so a binary replaced
+    between construction and invocation is not detected. That is strictly better than resolving by name
+    at every call — which is what this replaces — but it is not a guarantee that the bytes are unchanged.
+    Binding the runtime's identity into the attested execution identity is a separate, deferred question.
+    """
+    if os.path.isabs(runtime):
+        return runtime
+    return shutil.which(runtime) or runtime
+
+
+def detect_runtime(image: str) -> str:
+    """The ONE runtime-detection implementation, shared by every OCI-family backend.
+
+    Returns the audited NAME (not the path) so the closed-set contract in ``gate/backends.py`` and
+    ``sandbox.runtime`` are unaffected. Detection is by CAPABILITY, not presence: a runtime on ``$PATH``
+    that cannot actually run a hermetic container is not "available".
+
+    Was duplicated verbatim in ``oci.py`` and ``observed.py`` — the function that decides WHICH BINARY
+    THE GATE EXECUTES, maintained in two places. ``ObservedOCISandbox`` does not subclass ``OCISandbox``
+    (both derive from ``BaseSandbox``), which is why it was copied rather than inherited.
+    """
+    for rt in _RUNTIMES:
+        path = resolve_runtime_path(rt)
+        if path == rt and not os.path.isabs(rt):
+            continue  # not on PATH at all
+        try:
+            probe = subprocess.run(
+                [path, "run", "--rm", "--network=none", image, "true"],
+                capture_output=True,
+                timeout=90,
+                env=runtime_client_env(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:  # it can actually run hermetically
+            return rt
+    raise OCIRuntimeUnavailable(
+        f"no OCI runtime can run '{image}' hermetically "
+        "(rootless, --network=none); HERMETIC unavailable — fail closed"
+    )
+
+
 def probe_existence(argv: list[str], name: str, *, timeout: float = 30.0) -> Existence:
     """Probe whether the runtime resource ``name`` is listed by ``argv`` — the SHARED, fail-CLOSED existence
     check for OCI + observed teardown/reap. EXISTS/ABSENT are returned ONLY on a query that actually ran
@@ -81,7 +194,8 @@ def probe_existence(argv: list[str], name: str, *, timeout: float = 30.0) -> Exi
     return code (an empty stdout from a *failed* ``ps`` is not proof of absence) — is ``UNKNOWN``. Ephemerality
     is security-critical, so a caller must treat ``UNKNOWN`` after teardown as a leak, never as 'gone'."""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                           env=runtime_client_env())
     except (OSError, subprocess.SubprocessError):
         return Existence.UNKNOWN
     if r.returncode != 0:
@@ -103,8 +217,8 @@ def resolve_image_id(runtime: str, image: str) -> str:
     image is absent or the runtime can't report an id."""
     try:
         out = subprocess.run(
-            [runtime, "image", "inspect", "--format", "{{.Id}}", image],
-            capture_output=True, text=True, timeout=30,
+            [resolve_runtime_path(runtime), "image", "inspect", "--format", "{{.Id}}", image],
+            capture_output=True, text=True, timeout=30, env=runtime_client_env(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ImageResolutionError(f"could not inspect image {image!r}: {exc}") from exc
@@ -152,7 +266,10 @@ class OCISandbox(BaseSandbox):
 
     def __init__(self, image: str, runtime: str | None = None) -> None:
         self.image = image
+        # NAME (audited identity, closed set) and PATH (what actually execs) are separate — see the
+        # module header. ``runtime`` reports the name; every argv[0] uses ``_runtime_path``.
         self._runtime = runtime if runtime is not None else self._detect_runtime(image)
+        self._runtime_path = resolve_runtime_path(self._runtime)
 
     @property
     def runtime(self) -> str:
@@ -161,23 +278,12 @@ class OCISandbox(BaseSandbox):
     # -- Catch 1: detect by CAPABILITY, not presence ----------------------
     @staticmethod
     def _detect_runtime(image: str) -> str:
-        for rt in _RUNTIMES:
-            if shutil.which(rt) is None:
-                continue
-            try:
-                probe = subprocess.run(
-                    [rt, "run", "--rm", "--network=none", image, "true"],
-                    capture_output=True,
-                    timeout=90,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            if probe.returncode == 0:  # it can actually run hermetically
-                return rt
-        raise OCIRuntimeUnavailable(
-            f"no OCI runtime can run '{image}' hermetically "
-            "(rootless, --network=none); HERMETIC unavailable — fail closed"
-        )
+        """Thin delegation to the shared ``detect_runtime`` — ONE implementation for both backends.
+
+        Kept as a staticmethod on the class because it is a patch point in the closed-runtime tests
+        (``mock.patch.object(OCISandbox, "_detect_runtime")`` asserts a pinned runtime does NOT probe).
+        """
+        return detect_runtime(image)
 
     @staticmethod
     def available(image: str) -> bool:
@@ -199,7 +305,7 @@ class OCISandbox(BaseSandbox):
     def prepare(self, artifact: ArtifactSpec, fixtures: Fixtures) -> SandboxHandle:
         # 3.5-close #1.1: resolve the IMMUTABLE image digest at the TOP of prepare(), ONCE, before
         # anything runs — run() then executes THIS digest, not the mutable tag (closes tag-remap).
-        image_id = resolve_image_id(self._runtime, self.image)
+        image_id = resolve_image_id(self._runtime_path, self.image)
         snapshot = Path(tempfile.mkdtemp(prefix=f"{RESOURCE_PREFIX}oci-"))
         try:
             if artifact.path.is_dir():
@@ -238,7 +344,7 @@ class OCISandbox(BaseSandbox):
             # --init: a real init as PID 1 so the artifact runs as its child — a
             # namespace's PID 1 can't be signal-killed from within (crashes would
             # otherwise be mis-reported as clean exits), and zombies get reaped.
-            self._runtime, "run", "--rm", "--init", "--name", h.container,
+            self._runtime_path, "run", "--rm", "--init", "--name", h.container,
             *self._network_args(),
             "--mount", mount,          # verified artifact, read-only, private
             "--tmpfs", WORK_DIR,       # writable scratch (audit-only)
@@ -247,9 +353,9 @@ class OCISandbox(BaseSandbox):
             # truth — the SAME h.image_id is recorded in the result), NEVER the mutable self.image tag.
             h.image_id, *entrypoint.argv,
         ]
-        # Sterile env: Popen(env=...) with a minimal dict — the container never
-        # inherits the host runner's environment. podman itself needs a PATH.
-        sterile = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        # One client-env policy for every runtime invocation (P2a) — see ``runtime_client_env``.
+        # This is the CLIENT's env, never the container's: no ``--env`` appears in this argv.
+        sterile = runtime_client_env()
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -304,13 +410,14 @@ class OCISandbox(BaseSandbox):
         # best-effort removal — the AUTHORITY that destruction happened is the tri-state probe below, not this
         # return code (a non-zero rm still forces a re-probe, which fails closed on EXISTS/UNKNOWN).
         try:
-            subprocess.run([self._runtime, "rm", "-f", name], capture_output=True, timeout=30)
+            subprocess.run([self._runtime_path, "rm", "-f", name], capture_output=True, timeout=30,
+                           env=runtime_client_env())
         except (OSError, subprocess.SubprocessError):
             pass
 
     def _container_state(self, name: str) -> Existence:
         return probe_existence(
-            [self._runtime, "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"], name)
+            [self._runtime_path, "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"], name)
 
     def _result(
         self,
