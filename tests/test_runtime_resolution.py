@@ -103,7 +103,15 @@ _ENFORCING_RESOLVERS = ("_exec_runtime", "exec_runtime_path")
 _PROVING_RESOLVERS = ("_resolved_or_none",)
 
 # Functions that RETURN an argv. ``{name: index of the parameter that becomes argv[0]}``.
-_ARGV_BUILDERS = {"network_create_argv": 0}
+_ARGV_BUILDERS = {
+    "network_create_argv": 0,
+    # P2b posture builders. Registering them here is what lets the argv[0] assertion see through a
+    # builder call: each takes the resolved runtime as parameter 0 and returns the argv verbatim.
+    "capability_probe_argv": 0,
+    "artifact_run_argv": 0,
+    "proxy_run_argv": 0,
+    "escape_probe_argv": 0,
+}
 # Functions that RECEIVE a built argv and exec it. ``{name: index of the argv parameter}``.
 _ARGV_CONSUMERS = {"probe_existence": 0, "_names": 0, "_rm": 0}
 
@@ -651,6 +659,286 @@ class ClientEnvIsAnAllowlist(unittest.TestCase):
             env = runtime_client_env()
         for name in _CLIENT_ENV_PASSTHROUGH:
             self.assertNotIn(name, env, f"{name} was fabricated rather than passed through")
+
+
+
+# ===================================================================================================
+# P2b — THE POSTURE CENSUS. Every runtime invocation is classified, and CONSTRUCT sites must route
+# through a registered builder.
+#
+# Classification is by WHO CONSUMES THE EFFECT OR THE STDOUT. That replaced a posture/lifecycle split
+# refuted by two live counter-examples here: ``exec cat`` reads as "lifecycle" yet its stdout IS the
+# verdict input, and ``inspect`` reads as "lifecycle" yet its stdout AUTHORS ``--add-host``.
+#
+# KEYED PER CALL, not per scope — ``_start_proxy`` holds ONE CONSTRUCT and ONE WITNESS invocation, so a
+# scope-keyed table would silently classify the CONSTRUCT one by its neighbour. That is the
+# exemption-by-adjacency failure this suite already fixed once on the assertion axis; the key is now
+# CALL x ASSERTION x CLASS.
+# ===================================================================================================
+CONSTRUCT, WITNESS, PROBE_DESTROY = "CONSTRUCT", "WITNESS", "PROBE-DESTROY"
+
+_SITE_CLASS: dict[str, tuple[str, str]] = {
+    # -- CONSTRUCT: creates/configures a resource whose posture flags bear on isolation ------------
+    "sandbox/oci.py::detect_runtime#0": (CONSTRUCT,
+        "runs a throwaway container to test CAPABILITY; its --network=none must be the SAME statement "
+        "the artifact run uses, or the probe certifies a posture the real run does not apply"),
+    "sandbox/oci.py::OCISandbox.run#0": (CONSTRUCT, "the artifact's own isolation - hermetic variant"),
+    "sandbox/observed.py::ObservedOCISandbox.run#0": (CONSTRUCT,
+        "the artifact's own isolation - sealed-network variant; same builder, network passed as data"),
+    "sandbox/observed.py::ObservedOCISandbox._create_network#0": (CONSTRUCT,
+        "creates the sealed network; its flags are ATTESTED via _OBSERVER_CONFIG_HASH"),
+    "sandbox/observed.py::ObservedOCISandbox._start_proxy#0": (CONSTRUCT,
+        "stands up the observer sidecar on the sealed network with a read-only source mount"),
+    "sandbox/observed.py::ObservedOCISandbox._escape_probe#0": (CONSTRUCT,
+        "calibration-of-the-detector: constructs a container with the sealed posture and must certify "
+        "the SAME segment the artifact receives"),
+
+    # -- WITNESS: stdout becomes a value consumed by the verdict or by a later argv -----------------
+    "sandbox/observed.py::ObservedOCISandbox._read_count#0": (WITNESS,
+        "stdout parsed to int and returned as egress_attempts - THE VERDICT INPUT. Argv shape is not "
+        "its risk; stdout interpretation is. Empty handling is sound (-> None -> ERROR/TELEMETRY_MISSING)"),
+    "sandbox/observed.py::ObservedOCISandbox._start_proxy#1": (WITNESS,
+        "SECOND call in this scope: inspect's stdout becomes proxy_ip and AUTHORS --add-host. The FIRST "
+        "call here is CONSTRUCT and IS builder-routed - this classification is per-CALL for that reason. "
+        "Empty handling is sound (raises NetworkIsolationError)"),
+    "sandbox/oci.py::resolve_image_id#0": (WITNESS,
+        "stdout is the immutable digest that is both EXECUTED and ATTESTED as image_digest. Empty "
+        "handling is sound: 'if out.returncode != 0 or not digest: raise ImageResolutionError'"),
+
+    # -- PROBE-DESTROY: consumed only as a fail-closed existence/destruction decision ---------------
+    "sandbox/oci.py::probe_existence#0": (PROBE_DESTROY,
+        "returncode/stdout consumed as TRI-STATE; the ABSENT branch is UNSOUND on rc 0 + empty stdout "
+        "- see the stdout-interpretation increment. NOT 'boolean only': the tree falsifies that"),
+    "sandbox/observed.py::reap_orphans._names#0": (PROBE_DESTROY,
+        "stdout.split() is the list of resources to destroy. SAME SHAPE as probe_existence: rc 0 with "
+        "empty stdout returns [] and reports a clean slate. Milder (a genuine no-match also gives rc 0 "
+        "+ empty) but the same class - the stdout increment has TWO sites, not one"),
+    "sandbox/observed.py::reap_orphans._rm#0": (PROBE_DESTROY, "best-effort removal; the re-probe is the authority"),
+    "sandbox/oci.py::OCISandbox._force_remove#0": (PROBE_DESTROY, "best-effort removal; the re-probe is the authority"),
+    "sandbox/observed.py::ObservedOCISandbox._force_remove#0": (PROBE_DESTROY, "best-effort removal; re-probe is authority"),
+    "sandbox/observed.py::ObservedOCISandbox._force_remove_network#0": (PROBE_DESTROY, "best-effort removal; re-probe is authority"),
+}
+
+
+def _argv_from_registered_builder(node: ast.expr, scope: "_Scope | None" = None) -> bool:
+    """The ROUTING obligation — strictly NARROWER than ``pinned_argv``.
+
+    ``pinned_argv`` accepts a LIST LITERAL with a pinned head, a Name bound to one, or a builder Call.
+    Routing rejects the list literal in every form: the argv must ORIGINATE in a registered builder.
+
+    A Name IS resolved through its bindings, because ``cmd = artifact_run_argv(...)`` then ``Popen(cmd)``
+    is builder-routed — the value's origin is the builder, and the local binding is a readability choice,
+    not a posture decision. (Discovered by the assertion going red against correct code on both artifact
+    ``run()`` sites: the CODE was right and the predicate was too narrow. Establish direction, then fix
+    the side that is wrong.) Mutation still disqualifies, exactly as under ``pinned_argv``.
+
+    The narrowing is proven rather than asserted: a CONSTRUCT site with a PINNED INLINE LIST goes RED
+    here while staying GREEN under argv[0]. Without that proof routing is a rename of an existing
+    control.
+    """
+    if isinstance(node, ast.Call):
+        return _callee(node.func) in _ARGV_BUILDERS
+    if isinstance(node, ast.Name) and scope is not None:
+        if node.id in scope.mutated:
+            return False
+        bindings = scope.assigns.get(node.id)
+        return bool(bindings) and all(_argv_from_registered_builder(b, scope) for b in bindings)
+    return False
+
+
+# P2b-fix (post-build consult, finding P1-1). Routing proves the provenance of the argv LIST OBJECT.
+# It does NOT reach the posture passed INTO the builder as data — and the network segment is exactly the
+# flag that distinguishes the two backends' isolation guarantees. REPRODUCED before fixing: changing the
+# observed run site to ``network=["--network=host"]`` left the whole suite GREEN.
+#
+# So a builder argument that CARRIES posture gets its own provenance obligation: it must come from a
+# registered segment primitive, not a literal. Same trick as routing, one level down.
+_SEGMENT_PRIMITIVES = ("hermetic_network_segment", "sealed_network_segment",
+                       "attached_network_segment", "_network_args")
+# ``_network_args`` is the documented 1.4 swap seam on ``OCISandbox``; it is admitted because it
+# DELEGATES to ``hermetic_network_segment``. Admitting a seam without checking that it delegates
+# would only move the hole one level, so the delegation is asserted below rather than assumed.
+
+# {builder: {keyword: allowed provenance}} — the arguments through which posture may not be hand-written.
+_BUILDER_ARG_OBLIGATIONS: dict[str, dict[str, tuple[str, ...]]] = {
+    "artifact_run_argv": {"network": _SEGMENT_PRIMITIVES},
+}
+
+# Every registered builder must place its parameter 0 at argv[0]. Sample arguments for the contract
+# check below — a builder that ignored ``runtime`` and hardcoded a name would regress P2a's
+# resolved-absolute-path property while staying GREEN under BOTH assertions, because the registry is
+# hand-maintained data with no tie to the function it names.
+_BUILDER_CONTRACT_ARGS: dict[str, dict[str, object]] = {
+    "network_create_argv": {"name": "zz-net"},
+    "capability_probe_argv": {"image": "zz-image"},
+    "artifact_run_argv": {"container": "zz-c", "network": [], "snapshot": pathlib.Path("/zz"),
+                          "image_id": "sha256:zz", "entrypoint": ["zz"]},
+    "proxy_run_argv": {"network": "zz-net", "name": "zz-p", "image_id": "sha256:zz", "mode": "fail_always"},
+    "escape_probe_argv": {"network": "zz-net", "proxy_ip": "10.0.0.2", "image_id": "sha256:zz"},
+}
+
+
+def _from_segment_primitive(node: ast.expr, scope: "_Scope", allowed: tuple[str, ...]) -> bool:
+    if isinstance(node, ast.Call):
+        return _callee(node.func) in allowed
+    if isinstance(node, ast.Name):
+        if node.id in scope.mutated:
+            return False
+        bindings = scope.assigns.get(node.id)
+        return bool(bindings) and all(_from_segment_primitive(b, scope, allowed) for b in bindings)
+    return False
+
+
+def _classified_sites() -> list[tuple[str, "_Scope", ast.Call]]:
+    out = []
+    for scope in _all_scopes():
+        for i, call in enumerate(scope.execs):
+            out.append((f"{scope.where}#{i}", scope, call))
+    return out
+
+
+class PostureCensus(unittest.TestCase):
+    def test_every_construct_site_routes_through_a_builder(self) -> None:
+        """CONSTRUCT sites may not hand-build an argv. A new inline posture is a flagged defect."""
+        offenders = []
+        for key, _scope, call in _classified_sites():
+            entry = _SITE_CLASS.get(key)
+            if entry is None or entry[0] != CONSTRUCT:
+                continue
+            argv = _argv_of(call)
+            if argv is None or not _argv_from_registered_builder(argv, _scope):
+                offenders.append(f"{key} (argv shape: {type(argv).__name__ if argv else 'none'})")
+        self.assertEqual(
+            offenders, [],
+            f"these CONSTRUCT sites build an argv inline instead of via a registered builder: {offenders}",
+        )
+
+    def test_posture_arguments_come_from_a_segment_primitive(self) -> None:
+        """Routing proves the argv LIST's origin; this proves the origin of the POSTURE INSIDE it.
+
+        Found by the post-build consult and REPRODUCED before fixing: ``network=["--network=host"]`` at
+        the observed run site left the entire suite green. Routing inspected the callee name only, so
+        the one argument that carries the isolation difference between the two backends was hand-writable
+        with nothing failing — the exact drift the sealed-segment docstring claims cannot happen.
+        """
+        offenders = []
+        for key, scope, call in _classified_sites():
+            argv = _argv_of(call)
+            if isinstance(argv, ast.Name):  # resolve one hop: cmd = artifact_run_argv(...); Popen(cmd)
+                bound = (scope.assigns.get(argv.id) or [None])[0]
+                argv = bound
+            if not isinstance(argv, ast.Call):
+                continue  # not a builder call — routing already governs this site's argv shape
+            builder = argv
+            obligations = _BUILDER_ARG_OBLIGATIONS.get(_callee(builder.func))
+            if not obligations:
+                continue
+            for kw in builder.keywords:
+                allowed = obligations.get(kw.arg or "")
+                if allowed and not _from_segment_primitive(kw.value, scope, allowed):
+                    offenders.append(f"{key} {kw.arg}= (shape: {type(kw.value).__name__})")
+        self.assertEqual(
+            offenders, [],
+            "these builder calls hand-write a posture argument instead of taking it from a registered "
+            f"segment primitive {_SEGMENT_PRIMITIVES}: {offenders}",
+        )
+
+    def test_every_registered_builder_puts_parameter_zero_at_argv0(self) -> None:
+        """The registry is hand-maintained DATA with no tie to the functions it names.
+
+        Registering a name weakens TWO assertions at once — routing here, and P2a's argv[0] check, which
+        treats a builder call as pinned. So a registered builder that ignored its ``runtime`` parameter
+        and hardcoded a name would regress the resolved-absolute-path property while green under both.
+        Nothing verified the contract; this calls each builder with a sentinel and checks argv[0].
+        """
+        import sandbox.oci as _oci
+        import sandbox.observed as _obs
+        for name, pos in _ARGV_BUILDERS.items():
+            fn = getattr(_oci, name, None) or getattr(_obs, name, None)
+            self.assertIsNotNone(fn, f"registered builder {name!r} does not exist in the swept package")
+            sentinel = "/zz/sentinel-runtime"
+            argv = fn(sentinel, **_BUILDER_CONTRACT_ARGS[name])  # type: ignore[misc,operator]
+            self.assertEqual(
+                argv[pos], sentinel,
+                f"{name} does not place its parameter {pos} at argv[{pos}] — registering it silently "
+                "weakens BOTH the routing assertion and the argv[0] pin",
+            )
+
+    def test_the_network_args_seam_delegates_to_the_primitive(self) -> None:
+        """The seam is admitted as a posture source ONLY because it delegates. Bind that, do not assume
+        it: a seam that started returning its own literal would re-open the two-statements defect while
+        remaining an admitted primitive."""
+        # BOUND, not compared. An earlier version asserted
+        # ``_network_args() == hermetic_network_segment()`` — which a RESTATED LITERAL satisfies, because
+        # the two values agree. Verified: reverting the seam to its own ``["--network=none"]`` left that
+        # version GREEN. It compared a value to itself, which is P1's defect reproduced inside P2b's own
+        # control. Swap a sentinel into the primitive and require the seam to FOLLOW it.
+        with mock.patch("sandbox.oci.hermetic_network_segment", return_value=["--zz-sentinel"]):
+            self.assertEqual(
+                OCISandbox._network_args(), ["--zz-sentinel"],
+                "_network_args does not FOLLOW hermetic_network_segment — it restates the posture, so "
+                "the two can drift while both look correct",
+            )
+
+    def test_network_flags_appear_only_inside_the_segment_primitives(self) -> None:
+        """Routing governs CALL SITES; this governs BUILDER BODIES.
+
+        Found by discharge: hand-writing the segment INSIDE ``escape_probe_argv`` — replacing
+        ``*sealed_network_segment(...)`` with ``"--network", network`` — was GREEN under everything else,
+        because routing only inspects the argv a call site passes, never what a builder puts in it. That
+        is exactly the drift the sealed-segment docstring says cannot happen: the probe would certify a
+        posture the artifact does not receive.
+
+        So the network flags are single-sourced by source text, the same shape as P1's ``_PREFIX`` test:
+        they may appear ONLY in the two primitives that define them.
+        """
+        allowed = {"hermetic_network_segment", "sealed_network_segment", "attached_network_segment"}
+        flags = ("--network", "--network=none", "--add-host")
+        offenders = []
+        for module in _swept_modules():
+            tree = ast.parse((_PKG / module).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name in allowed:
+                    continue
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Constant) and sub.value in flags:
+                        offenders.append(f"sandbox/{module}::{node.name} restates {sub.value!r}")
+        self.assertEqual(
+            offenders, [],
+            f"network posture must come from {sorted(allowed)}, not be restated: {offenders}",
+        )
+
+    def test_the_census_is_total_and_fresh(self) -> None:
+        """Every invocation classified exactly once; every entry names a real site. Both directions,
+        because a stale key is inert and an unclassified site is invisible."""
+        live = {k for k, _s, _c in _classified_sites()}
+        self.assertEqual(sorted(live - set(_SITE_CLASS)), [], "UNCLASSIFIED runtime invocations")
+        self.assertEqual(sorted(set(_SITE_CLASS) - live), [], "STALE classification keys")
+
+    def test_every_classification_has_a_class_and_a_reason(self) -> None:
+        for key, (cls, reason) in _SITE_CLASS.items():
+            self.assertIn(cls, (CONSTRUCT, WITNESS, PROBE_DESTROY), f"{key}: unknown class {cls!r}")
+            self.assertTrue(reason.strip(), f"{key}: no reason recorded")
+
+    def test_start_proxy_holds_both_a_construct_and_a_witness_call(self) -> None:
+        """The per-CALL key, asserted rather than assumed. If these two ever collapse to one class, the
+        classification has been coarsened and the CONSTRUCT call is riding on its neighbour."""
+        self.assertEqual(_SITE_CLASS["sandbox/observed.py::ObservedOCISandbox._start_proxy#0"][0], CONSTRUCT)
+        self.assertEqual(_SITE_CLASS["sandbox/observed.py::ObservedOCISandbox._start_proxy#1"][0], WITNESS)
+
+    def test_routing_is_strictly_narrower_than_argv0(self) -> None:
+        """The distinctness proof, as a unit test on the two predicates over the SAME synthetic argv.
+
+        A pinned inline list satisfies argv[0] provenance and fails routing. If these two ever agree on
+        every shape, routing has stopped being a separate control.
+        """
+        inline = ast.parse("[self._exec_runtime(), 'run']").body[0].value  # type: ignore[attr-defined]
+        built = ast.parse("artifact_run_argv(self._exec_runtime())").body[0].value  # type: ignore[attr-defined]
+        scope = _Scope("oci.py", "synthetic")
+        self.assertTrue(scope.pinned_argv(inline), "premise: the inline list IS pinned under argv[0]")
+        self.assertFalse(_argv_from_registered_builder(inline), "routing must REJECT a pinned inline list")
+        self.assertTrue(scope.pinned_argv(built), "a builder call is also pinned under argv[0]")
+        self.assertTrue(_argv_from_registered_builder(built), "routing must ACCEPT a builder call")
 
 
 if __name__ == "__main__":
