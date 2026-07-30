@@ -309,7 +309,7 @@ def detect_runtime(image: str) -> str:
             continue  # not resolvable to an absolute binary on the client PATH — try the next
         try:
             probe = subprocess.run(
-                [path, "run", "--rm", "--network=none", image, "true"],
+                capability_probe_argv(path, image),
                 capture_output=True,
                 timeout=90,
                 env=runtime_client_env(),
@@ -377,6 +377,92 @@ def _selinux_enforcing() -> bool:
     return os.path.exists("/sys/fs/selinux/enforce")
 
 
+# ---------------------------------------------------------------------------------------------------
+# P2b — POSTURE PRIMITIVES and ARGV BUILDERS.
+#
+# Every CONSTRUCT invocation (one that creates or configures a runtime resource whose posture flags bear
+# on isolation) builds its argv HERE rather than inline. Classification is by WHO CONSUMES THE EFFECT OR
+# THE STDOUT — the ratified replacement for a posture/lifecycle split that was refuted by two live
+# counter-examples in this package: ``exec cat`` is "lifecycle" yet its stdout IS the verdict input, and
+# ``inspect`` is "lifecycle" yet its stdout AUTHORS ``--add-host``.
+#
+# WHY CENTRALISE. Before P2b, three posture values were restated across argv-bearing sites:
+# ``--network=none`` appeared as a live literal in TWO places (the capability probe and
+# ``_network_args``), the mount spec carrying the read-only guarantee was hand-built in two modules, and
+# ``--rm --init --name`` / ``--tmpfs`` / ``--workdir`` were restated at both artifact-run sites. That is
+# P1's defect class exactly: a value that matters, applied by hand, with nothing binding application to
+# intent.
+#
+# AND IT IS THE PRECONDITION FOR ATTESTING ANY OF IT. ``OCISandbox`` carries no ``observer_config_hash``
+# and has no runtime network check, so its hermetic posture currently rests on a literal being correct
+# with no second layer to catch it if it is not. Attestation (a later increment) binds BUILDER SOURCE
+# BYTES — so until a value comes out of one shared builder there is nothing for it to attest. This
+# increment does not attest anything and does not claim to.
+# ---------------------------------------------------------------------------------------------------
+
+
+def hermetic_network_segment() -> list[str]:
+    """The no-network posture, stated ONCE for both the capability probe and the artifact run.
+
+    Returned as a SEGMENT (a list spliced into an argv) rather than signalled by a mode flag, so a
+    caller selects a posture by passing data instead of by passing a boolean the builder branches on.
+    A branch inside the builder would put the choice back where the census cannot see it.
+    """
+    return ["--network=none"]
+
+
+def artifact_mount_spec(snapshot: Path, target: str = ARTIFACT_MOUNT) -> str:
+    """The read-only bind of the verified tree — the mount that closes the hash->mount TOCTOU.
+
+    Was hand-built identically in ``oci.py`` and ``observed.py``. Verified char-identical to both before
+    centralising: same field order, same ``readonly,bind-propagation=rprivate``, same conditional
+    ``,relabel=private`` under SELinux (``:Z``-equivalent, and it does NOT break readonly).
+    """
+    spec = f"type=bind,source={snapshot},target={target},readonly,bind-propagation=rprivate"
+    if _selinux_enforcing():
+        spec += ",relabel=private"
+    return spec
+
+
+def capability_probe_argv(runtime: str, image: str) -> list[str]:
+    """Detection by CAPABILITY, not presence: can this runtime actually run a hermetic container?
+
+    Its ``--network=none`` now comes from the same segment the artifact run uses, so the probe cannot
+    certify a posture the real run does not apply — which is precisely what two independent literals
+    permitted.
+    """
+    return [runtime, "run", "--rm", *hermetic_network_segment(), image, "true"]
+
+
+def artifact_run_argv(
+    runtime: str,
+    *,
+    container: str,
+    network: list[str],
+    snapshot: Path,
+    image_id: str,
+    entrypoint: list[str],
+) -> list[str]:
+    """The artifact-execution argv — ONE builder serving BOTH backends.
+
+    The two run sites differed only in their network segment, so passing that as DATA collapses them.
+    That collapse is the whole argument for segments-over-mode-flags, and it is why this increment has
+    five builders rather than six.
+
+    ``--init``: a real init as PID 1 so the artifact runs as its child — a namespace's PID 1 cannot be
+    signal-killed from within (crashes would otherwise be mis-reported as clean exits) and zombies get
+    reaped. ``image_id`` is the IMMUTABLE digest resolved at prepare(), never the mutable tag.
+    """
+    return [
+        runtime, "run", "--rm", "--init", "--name", container,
+        *network,
+        "--mount", artifact_mount_spec(snapshot),
+        "--tmpfs", WORK_DIR,
+        "--workdir", WORK_DIR,
+        image_id, *entrypoint,
+    ]
+
+
 def _make_snapshot_readable(root: Path) -> None:
     """Add world read (+ dir traverse) so a rootless container's non-root user can
     read the ro-mounted tree. The artifact code is not secret; tree_hash excludes
@@ -432,7 +518,9 @@ class OCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
     def _network_args() -> list[str]:
         # 1.3: hard no-network. 1.4 replaces this with a veth pair + host-side tap
         # for egress counting — without touching prepare/run/teardown.
-        return ["--network=none"]
+        # P2b: delegates rather than restating. This was the SECOND live statement of the no-network
+        # posture (the capability probe held the other), so the two could drift with nothing failing.
+        return hermetic_network_segment()
 
     # -- prepare: snapshot -> hash -> verify (TOCTOU-closed) --------------
     def prepare(self, artifact: ArtifactSpec, fixtures: Fixtures) -> SandboxHandle:
@@ -467,25 +555,16 @@ class OCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         self, handle: SandboxHandle, entrypoint: Command, budget: ResourceBudget
     ) -> ExecutionResult:
         h = self._require_own(handle)
-        mount = (
-            f"type=bind,source={h.snapshot},target={ARTIFACT_MOUNT},"
-            "readonly,bind-propagation=rprivate"
+        # P2b: argv comes from the shared builder. 3.5-close #1.1 still holds — the digest executed is
+        # the IMMUTABLE h.image_id resolved in prepare(), the same value recorded in the result.
+        cmd = artifact_run_argv(
+            self._exec_runtime(),
+            container=h.container,
+            network=self._network_args(),
+            snapshot=h.snapshot,
+            image_id=h.image_id,
+            entrypoint=list(entrypoint.argv),
         )
-        if _selinux_enforcing():
-            mount += ",relabel=private"  # :Z-equivalent, doesn't break readonly
-        cmd = [
-            # --init: a real init as PID 1 so the artifact runs as its child — a
-            # namespace's PID 1 can't be signal-killed from within (crashes would
-            # otherwise be mis-reported as clean exits), and zombies get reaped.
-            self._exec_runtime(), "run", "--rm", "--init", "--name", h.container,
-            *self._network_args(),
-            "--mount", mount,          # verified artifact, read-only, private
-            "--tmpfs", WORK_DIR,       # writable scratch (audit-only)
-            "--workdir", WORK_DIR,
-            # 3.5-close #1.1: execute the IMMUTABLE digest resolved in prepare() (single source of
-            # truth — the SAME h.image_id is recorded in the result), NEVER the mutable self.image tag.
-            h.image_id, *entrypoint.argv,
-        ]
         # One client-env policy for every runtime invocation (P2a) — see ``runtime_client_env``.
         # This is the CLIENT's env, never the container's: no ``--env`` appears in this argv.
         sterile = runtime_client_env()

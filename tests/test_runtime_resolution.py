@@ -103,7 +103,15 @@ _ENFORCING_RESOLVERS = ("_exec_runtime", "exec_runtime_path")
 _PROVING_RESOLVERS = ("_resolved_or_none",)
 
 # Functions that RETURN an argv. ``{name: index of the parameter that becomes argv[0]}``.
-_ARGV_BUILDERS = {"network_create_argv": 0}
+_ARGV_BUILDERS = {
+    "network_create_argv": 0,
+    # P2b posture builders. Registering them here is what lets the argv[0] assertion see through a
+    # builder call: each takes the resolved runtime as parameter 0 and returns the argv verbatim.
+    "capability_probe_argv": 0,
+    "artifact_run_argv": 0,
+    "proxy_run_argv": 0,
+    "escape_probe_argv": 0,
+}
 # Functions that RECEIVE a built argv and exec it. ``{name: index of the argv parameter}``.
 _ARGV_CONSUMERS = {"probe_existence": 0, "_names": 0, "_rm": 0}
 

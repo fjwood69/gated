@@ -57,6 +57,7 @@ import shutil
 from sandbox.base import BaseSandbox
 from sandbox.oci import (
     RESOURCE_PREFIX,
+    artifact_run_argv,
     OCIRuntimeUnavailable,
     RuntimePathUnresolved,
     detect_runtime,
@@ -65,7 +66,6 @@ from sandbox.oci import (
     runtime_client_env,
     _ResolvedRuntimeMixin,
     _make_snapshot_readable,
-    _selinux_enforcing,
     probe_existence,
     resolve_image_id,
 )
@@ -142,6 +142,44 @@ def network_create_argv(runtime: str, name: str) -> list[str]:
     seal is a CI-time source-integrity control, not a runtime one.
     """
     return [runtime, "network", "create", *_SEALED_NETWORK_FLAGS, name]
+
+
+def sealed_network_segment(network: str, proxy_ip: str) -> list[str]:
+    """The SEALED posture: join the internal network, and restore the ONE name the artifact may resolve.
+
+    Shared by the artifact run and the escape probe, deliberately — the probe must certify the SAME
+    network posture the artifact will get, and two independent statements of it could drift with the
+    probe still passing. ``--add-host`` is what makes the proxy reachable after ``--disable-dns`` rips
+    the resolver out.
+    """
+    return ["--network", network, "--add-host", f"{PROXY_HOST}:{proxy_ip}"]
+
+
+def proxy_mount_spec() -> str:
+    """The observer's own source, bind-mounted read-only. Its BYTES are hashed into
+    ``_OBSERVER_CONFIG_HASH``, so a changed proxy is visible in the attested identity."""
+    return f"type=bind,source={_PROXY_SRC},target=/proxy.py,readonly"
+
+
+def proxy_run_argv(runtime: str, *, network: str, name: str, image_id: str, mode: str) -> list[str]:
+    """The counting fail-responder sidecar. It sits ON the sealed network but needs no ``--add-host``:
+    it is the thing being resolved, not a resolver."""
+    return [
+        runtime, "run", "-d", "--network", network, "--name", name,
+        "--mount", proxy_mount_spec(),
+        image_id, "python3", "/proxy.py", str(PROXY_PORT), _COUNTFILE, mode,
+    ]
+
+
+def escape_probe_argv(runtime: str, *, network: str, proxy_ip: str, image_id: str) -> list[str]:
+    """Calibration-of-the-detector: a known-bad the isolation must catch, run BEFORE the artifact.
+
+    Uses ``sealed_network_segment`` so the posture it certifies is the posture the artifact receives.
+    """
+    return [
+        runtime, "run", "-i", "--rm", *sealed_network_segment(network, proxy_ip),
+        image_id, "python3", "-",
+    ]
 
 
 _OBSERVER_CONFIG_HASH = content_digest({
@@ -336,17 +374,16 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         self, handle: SandboxHandle, entrypoint: Command, budget: ResourceBudget
     ) -> ExecutionResult:
         h = self._require_own(handle)
-        mount = (f"type=bind,source={h.snapshot},target={ARTIFACT_MOUNT},"
-                 "readonly,bind-propagation=rprivate")
-        if _selinux_enforcing():
-            mount += ",relabel=private"
-        cmd = [
-            self._exec_runtime(), "run", "--rm", "--init", "--name", h.container,
-            "--network", h.network, "--add-host", f"{PROXY_HOST}:{h.proxy_ip}",
-            "--mount", mount, "--tmpfs", WORK_DIR, "--workdir", WORK_DIR,
-            # 3.5-close #1.1: run the immutable digest resolved in prepare() (recorded in the result).
-            h.image_id, *entrypoint.argv,
-        ]
+        # P2b: the SAME builder the hermetic backend uses — the two differed only in their network
+        # segment, so that is passed as DATA. 3.5-close #1.1 holds: the immutable digest from prepare().
+        cmd = artifact_run_argv(
+            self._exec_runtime(),
+            container=h.container,
+            network=sealed_network_segment(h.network, h.proxy_ip),
+            snapshot=h.snapshot,
+            image_id=h.image_id,
+            entrypoint=list(entrypoint.argv),
+        )
         try:
             proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -388,9 +425,8 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
 
     def _start_proxy(self, network: str, name: str, mode: str, image_id: str) -> str:
         subprocess.run(
-            [self._exec_runtime(), "run", "-d", "--network", network, "--name", name,
-             "--mount", f"type=bind,source={_PROXY_SRC},target=/proxy.py,readonly",
-             image_id, "python3", "/proxy.py", str(PROXY_PORT), _COUNTFILE, mode],
+            proxy_run_argv(self._exec_runtime(), network=network, name=name,
+                           image_id=image_id, mode=mode),
             capture_output=True, timeout=60, check=True, env=runtime_client_env(),
         )
         ip = subprocess.run(
@@ -417,8 +453,8 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
 
     def _escape_probe(self, network: str, proxy_ip: str, image_id: str) -> None:
         p = subprocess.run(
-            [self._exec_runtime(), "run", "-i", "--rm", "--network", network,
-             "--add-host", f"{PROXY_HOST}:{proxy_ip}", image_id, "python3", "-"],
+            escape_probe_argv(self._exec_runtime(), network=network, proxy_ip=proxy_ip,
+                              image_id=image_id),
             input=_ESCAPE_SCRIPT.encode(), capture_output=True, timeout=60,
             env=runtime_client_env(),
         )
