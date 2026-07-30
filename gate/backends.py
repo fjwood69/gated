@@ -4,8 +4,30 @@ WHY. calibrate() runs adversarial known-bad fixtures and requires HERMETIC isola
 ``Sandbox`` API only lets a factory DECLARE ``IsolationLevel.HERMETIC`` — it does not PROVE no-egress /
 observer isolation. An unaudited backend could declare HERMETIC without being it (a fail-open). This
 module confines security-relevant calibration to the AUDITED backends (``OCISandbox``,
-``ObservedOCISandbox``) whose isolation is verified in code (``--network=none`` / sealed network +
-external proxy + escape probe).
+``ObservedOCISandbox``).
+
+WHAT "AUDITED" MEANS HERE, AND IT IS NOT THE SAME FOR BOTH. An earlier version of this paragraph said
+their isolation is "verified in code (``--network=none`` / sealed network + external proxy + escape
+probe)", collapsing two very different postures into one sentence. That is true of one backend and false
+of the other, which matters because this is the module that decides what may be trusted for
+security-relevant calibration:
+
+  * ``ObservedOCISandbox`` — isolation is VERIFIED AT RUNTIME. It creates a sealed network, stands up an
+    out-of-process proxy, and runs an escape probe that must find every residual channel closed before
+    the artifact runs at all; a reachable channel raises ``NetworkIsolationError``. Its observer config
+    is additionally bound into the attested execution identity via ``observer_config_hash``.
+  * ``OCISandbox`` — isolation is APPLIED, NOT VERIFIED. ``--network=none`` is placed in the run argv by
+    ``_network_args()`` and nothing checks it took effect: there is no escape probe in ``sandbox/oci.py``
+    and no post-hoc network check of any kind. It also carries NO ``observer_config_hash``, so its
+    isolation posture contributes nothing to the attested execution identity — ``engine/runner.py``'s
+    ``getattr(sandbox, "observer_config_hash", "")`` reads the empty string for it.
+
+Presence of a flag in an argv is APPLICATION, not verification. So ``OCISandbox``'s membership in
+``_APPROVED`` rests on the weaker of the two claims, and it should be read that way: the hermetic
+posture is only as good as that literal being correct, with no second layer to catch it if it is not.
+Making the value attestable at all requires it to come from one shared builder rather than a literal
+(deferred: the builder increment, then envelope attestation); a RUNTIME check for this backend is a
+separate open question and does not exist today.
 
 HOW — a construction guard under the trusted-gate model, NOT authorization. Audited backends are built
 through ``trusted_sandbox_factory`` and stamped with a capability token whose constructor requires the
@@ -61,9 +83,11 @@ class _TrustedBackendTicket:
 _TICKET = _TrustedBackendTicket(_MINT)
 _TICKET_ATTR = "_gated_trusted_backend_ticket"
 
-# the CLOSED set of audited backends. NOT the generic ``Sandbox`` interface: only backends whose
-# isolation is verified in code are here (OCISandbox --network=none; ObservedOCISandbox sealed net +
-# external proxy + escape probe). Adding a backend here is a reviewed, security-relevant change.
+# the CLOSED set of audited backends. NOT the generic ``Sandbox`` interface. The two members are NOT
+# equally evidenced and the module header says so at length: ObservedOCISandbox VERIFIES its isolation at
+# runtime (sealed net + external proxy + escape probe, fail-closed); OCISandbox APPLIES --network=none by
+# argv construction, with no runtime check and no attestation of that posture. Adding a backend here is a
+# reviewed, security-relevant change — and reviewing it means asking which of those two bars it clears.
 _APPROVED: dict[str, Callable[[str, str | None], Sandbox]] = {
     "oci": lambda image, runtime: OCISandbox(image=image, runtime=runtime),
     "observed": lambda image, runtime: ObservedOCISandbox(image=image, runtime=runtime),

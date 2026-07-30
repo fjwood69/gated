@@ -1,8 +1,11 @@
 """3.5-close #1.6 — the trusted-backend construction guard + its adversarial harness. Run:
 python3 -m unittest discover -s tests
 
-The guard confines security-relevant calibration to AUDITED backends (whose isolation is verified in
-code), refusing a backend that merely DECLARES HERMETIC. The token's constructor requires the module's
+The guard confines security-relevant calibration to AUDITED backends, refusing a backend that merely
+DECLARES HERMETIC. "Audited" is NOT one bar: ObservedOCISandbox verifies its isolation at runtime
+(sealed net + proxy + escape probe, fail-closed), while OCISandbox APPLIES ``--network=none`` by argv
+construction with no runtime check and no attestation of that posture — see gate/backends.py's header.
+What this guard itself establishes is CONSTRUCTION PROVENANCE, not isolation. The token's constructor requires the module's
 internal mint sentinel, so a caller routes through the intended path (a trusted-code convention, not an
 unforgeable boundary); the guard verifies the RETURNED object bears the exact token (board amendment:
 a factory that returns a different object is still refused).

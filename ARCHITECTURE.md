@@ -210,6 +210,23 @@ image D → verdict V" (the trial report + the enriched Check Run). Keep them di
   claim no-egress / observer-isolation **only for the audited backends**, never the generic `Sandbox`
   interface.
 
+  **And not uniformly even there — the guard proves PROVENANCE, not ISOLATION.** What the token
+  establishes is that the sandbox object was constructed through the intended path; it says nothing
+  about egress. The two audited backends are evidenced differently, and the difference is the whole
+  distance between an applied flag and a checked one:
+
+  - `ObservedOCISandbox` — isolation is **verified at runtime**: a sealed network, an out-of-process
+    proxy, and an escape probe that must find every residual channel closed *before the artifact runs*,
+    raising `NetworkIsolationError` if any is reachable. Its observer config is bound into the attested
+    execution identity (`observer_config_hash`).
+  - `OCISandbox` — isolation is **applied, not verified**: `--network=none` is placed in the run argv and
+    nothing checks it took effect. There is no escape probe in `sandbox/oci.py`, and it carries no
+    `observer_config_hash`, so its isolation posture contributes nothing to the attested identity.
+
+  So a no-egress claim for `OCISandbox` rests on that literal being correct, with no second layer to
+  catch it if it is not. Stated here rather than left to the reader because this section is the one that
+  licenses the claim, and an earlier version of it licensed more than the code supports.
+
 ### The 6th — unmeasured runtime TCB (the deploy ceiling)
 The host kernel, OCI runtime, egress observer, and verdict aggregator are a **trusted-but-unattested
 TCB**. Static identity binding ≠ runtime-behaviour assurance: a compromised host can verify the right
