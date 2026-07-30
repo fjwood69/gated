@@ -547,7 +547,33 @@ class AResolvedPathIsAlwaysAbsolute(unittest.TestCase):
     def test_the_exec_boundary_refuses_a_relative_path(self) -> None:
         with self.assertRaises(RuntimePathUnresolved):
             require_resolved_runtime("zzruntime", "reldir/zzruntime")
-        self.assertEqual(require_resolved_runtime("zzruntime", "/usr/bin/zzruntime"), "/usr/bin/zzruntime")
+
+    def test_the_exec_boundary_accepts_a_valid_absolute_path(self) -> None:
+        """The KNOWN-GOOD side, named — the other half of a two-sided control.
+
+        ``require_resolved_runtime`` is the single point of correctness for every runtime invocation
+        (12 execution flows converge on it — corroborated independently by the call graph), which is the
+        concentration the fused-boundary design deliberately accepts. The cost of that concentration is
+        that "refuses the bad" and "refuses EVERYTHING" are indistinguishable from the refusal
+        assertions alone: a guard that raised unconditionally would satisfy every one of them.
+
+        The acceptance assertions did already exist, but only as second assertions inside tests whose
+        NAMES say "refuses". An unnamed property is one a later edit can weaken without any test's
+        title objecting, so it is lifted out here and discharged in its own right: verified RED by
+        making the raise unconditional.
+
+        All three shapes, because each is a distinct entry point: the bare guard, the fused
+        module-level resolver, and the fused method on both backends.
+        """
+        self.assertEqual(require_resolved_runtime("podman", "/usr/bin/podman"), "/usr/bin/podman")
+        self.assertEqual(exec_runtime_path("/opt/bin/podman"), "/opt/bin/podman")
+        for cls in (OCISandbox, ObservedOCISandbox):
+            sbx = cls.__new__(cls)
+            sbx._runtime, sbx._runtime_path = "podman", "/usr/bin/podman"
+            self.assertEqual(
+                sbx._exec_runtime(), "/usr/bin/podman",
+                f"{cls.__name__} refused a VALID absolute argv[0] — the guard rejects everything",
+            )
 
     def test_exec_runtime_path_refuses_an_unresolvable_name(self) -> None:
         with self.assertRaises(RuntimePathUnresolved):
