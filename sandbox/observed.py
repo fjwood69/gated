@@ -144,6 +144,16 @@ def network_create_argv(runtime: str, name: str) -> list[str]:
     return [runtime, "network", "create", *_SEALED_NETWORK_FLAGS, name]
 
 
+def attached_network_segment(network: str) -> list[str]:
+    """Join a named network, and nothing else. The proxy sidecar's posture: it sits ON the sealed
+    network but needs no ``--add-host``, because it is the thing being resolved rather than a resolver.
+
+    Split out because it was the THIRD live statement of ``--network`` in the package — found by a
+    single-source test over builder bodies, not by looking for it.
+    """
+    return ["--network", network]
+
+
 def sealed_network_segment(network: str, proxy_ip: str) -> list[str]:
     """The SEALED posture: join the internal network, and restore the ONE name the artifact may resolve.
 
@@ -152,7 +162,7 @@ def sealed_network_segment(network: str, proxy_ip: str) -> list[str]:
     probe still passing. ``--add-host`` is what makes the proxy reachable after ``--disable-dns`` rips
     the resolver out.
     """
-    return ["--network", network, "--add-host", f"{PROXY_HOST}:{proxy_ip}"]
+    return [*attached_network_segment(network), "--add-host", f"{PROXY_HOST}:{proxy_ip}"]
 
 
 def proxy_mount_spec() -> str:
@@ -165,7 +175,7 @@ def proxy_run_argv(runtime: str, *, network: str, name: str, image_id: str, mode
     """The counting fail-responder sidecar. It sits ON the sealed network but needs no ``--add-host``:
     it is the thing being resolved, not a resolver."""
     return [
-        runtime, "run", "-d", "--network", network, "--name", name,
+        runtime, "run", "-d", *attached_network_segment(network), "--name", name,
         "--mount", proxy_mount_spec(),
         image_id, "python3", "/proxy.py", str(PROXY_PORT), _COUNTFILE, mode,
     ]

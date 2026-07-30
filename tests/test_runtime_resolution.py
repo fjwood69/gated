@@ -746,6 +746,49 @@ def _argv_from_registered_builder(node: ast.expr, scope: "_Scope | None" = None)
     return False
 
 
+# P2b-fix (post-build consult, finding P1-1). Routing proves the provenance of the argv LIST OBJECT.
+# It does NOT reach the posture passed INTO the builder as data — and the network segment is exactly the
+# flag that distinguishes the two backends' isolation guarantees. REPRODUCED before fixing: changing the
+# observed run site to ``network=["--network=host"]`` left the whole suite GREEN.
+#
+# So a builder argument that CARRIES posture gets its own provenance obligation: it must come from a
+# registered segment primitive, not a literal. Same trick as routing, one level down.
+_SEGMENT_PRIMITIVES = ("hermetic_network_segment", "sealed_network_segment",
+                       "attached_network_segment", "_network_args")
+# ``_network_args`` is the documented 1.4 swap seam on ``OCISandbox``; it is admitted because it
+# DELEGATES to ``hermetic_network_segment``. Admitting a seam without checking that it delegates
+# would only move the hole one level, so the delegation is asserted below rather than assumed.
+
+# {builder: {keyword: allowed provenance}} — the arguments through which posture may not be hand-written.
+_BUILDER_ARG_OBLIGATIONS: dict[str, dict[str, tuple[str, ...]]] = {
+    "artifact_run_argv": {"network": _SEGMENT_PRIMITIVES},
+}
+
+# Every registered builder must place its parameter 0 at argv[0]. Sample arguments for the contract
+# check below — a builder that ignored ``runtime`` and hardcoded a name would regress P2a's
+# resolved-absolute-path property while staying GREEN under BOTH assertions, because the registry is
+# hand-maintained data with no tie to the function it names.
+_BUILDER_CONTRACT_ARGS: dict[str, dict[str, object]] = {
+    "network_create_argv": {"name": "zz-net"},
+    "capability_probe_argv": {"image": "zz-image"},
+    "artifact_run_argv": {"container": "zz-c", "network": [], "snapshot": pathlib.Path("/zz"),
+                          "image_id": "sha256:zz", "entrypoint": ["zz"]},
+    "proxy_run_argv": {"network": "zz-net", "name": "zz-p", "image_id": "sha256:zz", "mode": "fail_always"},
+    "escape_probe_argv": {"network": "zz-net", "proxy_ip": "10.0.0.2", "image_id": "sha256:zz"},
+}
+
+
+def _from_segment_primitive(node: ast.expr, scope: "_Scope", allowed: tuple[str, ...]) -> bool:
+    if isinstance(node, ast.Call):
+        return _callee(node.func) in allowed
+    if isinstance(node, ast.Name):
+        if node.id in scope.mutated:
+            return False
+        bindings = scope.assigns.get(node.id)
+        return bool(bindings) and all(_from_segment_primitive(b, scope, allowed) for b in bindings)
+    return False
+
+
 def _classified_sites() -> list[tuple[str, "_Scope", ast.Call]]:
     out = []
     for scope in _all_scopes():
@@ -768,6 +811,101 @@ class PostureCensus(unittest.TestCase):
         self.assertEqual(
             offenders, [],
             f"these CONSTRUCT sites build an argv inline instead of via a registered builder: {offenders}",
+        )
+
+    def test_posture_arguments_come_from_a_segment_primitive(self) -> None:
+        """Routing proves the argv LIST's origin; this proves the origin of the POSTURE INSIDE it.
+
+        Found by the post-build consult and REPRODUCED before fixing: ``network=["--network=host"]`` at
+        the observed run site left the entire suite green. Routing inspected the callee name only, so
+        the one argument that carries the isolation difference between the two backends was hand-writable
+        with nothing failing — the exact drift the sealed-segment docstring claims cannot happen.
+        """
+        offenders = []
+        for key, scope, call in _classified_sites():
+            argv = _argv_of(call)
+            if isinstance(argv, ast.Name):  # resolve one hop: cmd = artifact_run_argv(...); Popen(cmd)
+                bound = (scope.assigns.get(argv.id) or [None])[0]
+                argv = bound
+            if not isinstance(argv, ast.Call):
+                continue  # not a builder call — routing already governs this site's argv shape
+            builder = argv
+            obligations = _BUILDER_ARG_OBLIGATIONS.get(_callee(builder.func))
+            if not obligations:
+                continue
+            for kw in builder.keywords:
+                allowed = obligations.get(kw.arg or "")
+                if allowed and not _from_segment_primitive(kw.value, scope, allowed):
+                    offenders.append(f"{key} {kw.arg}= (shape: {type(kw.value).__name__})")
+        self.assertEqual(
+            offenders, [],
+            "these builder calls hand-write a posture argument instead of taking it from a registered "
+            f"segment primitive {_SEGMENT_PRIMITIVES}: {offenders}",
+        )
+
+    def test_every_registered_builder_puts_parameter_zero_at_argv0(self) -> None:
+        """The registry is hand-maintained DATA with no tie to the functions it names.
+
+        Registering a name weakens TWO assertions at once — routing here, and P2a's argv[0] check, which
+        treats a builder call as pinned. So a registered builder that ignored its ``runtime`` parameter
+        and hardcoded a name would regress the resolved-absolute-path property while green under both.
+        Nothing verified the contract; this calls each builder with a sentinel and checks argv[0].
+        """
+        import sandbox.oci as _oci
+        import sandbox.observed as _obs
+        for name, pos in _ARGV_BUILDERS.items():
+            fn = getattr(_oci, name, None) or getattr(_obs, name, None)
+            self.assertIsNotNone(fn, f"registered builder {name!r} does not exist in the swept package")
+            sentinel = "/zz/sentinel-runtime"
+            argv = fn(sentinel, **_BUILDER_CONTRACT_ARGS[name])  # type: ignore[misc,operator]
+            self.assertEqual(
+                argv[pos], sentinel,
+                f"{name} does not place its parameter {pos} at argv[{pos}] — registering it silently "
+                "weakens BOTH the routing assertion and the argv[0] pin",
+            )
+
+    def test_the_network_args_seam_delegates_to_the_primitive(self) -> None:
+        """The seam is admitted as a posture source ONLY because it delegates. Bind that, do not assume
+        it: a seam that started returning its own literal would re-open the two-statements defect while
+        remaining an admitted primitive."""
+        # BOUND, not compared. An earlier version asserted
+        # ``_network_args() == hermetic_network_segment()`` — which a RESTATED LITERAL satisfies, because
+        # the two values agree. Verified: reverting the seam to its own ``["--network=none"]`` left that
+        # version GREEN. It compared a value to itself, which is P1's defect reproduced inside P2b's own
+        # control. Swap a sentinel into the primitive and require the seam to FOLLOW it.
+        with mock.patch("sandbox.oci.hermetic_network_segment", return_value=["--zz-sentinel"]):
+            self.assertEqual(
+                OCISandbox._network_args(), ["--zz-sentinel"],
+                "_network_args does not FOLLOW hermetic_network_segment — it restates the posture, so "
+                "the two can drift while both look correct",
+            )
+
+    def test_network_flags_appear_only_inside_the_segment_primitives(self) -> None:
+        """Routing governs CALL SITES; this governs BUILDER BODIES.
+
+        Found by discharge: hand-writing the segment INSIDE ``escape_probe_argv`` — replacing
+        ``*sealed_network_segment(...)`` with ``"--network", network`` — was GREEN under everything else,
+        because routing only inspects the argv a call site passes, never what a builder puts in it. That
+        is exactly the drift the sealed-segment docstring says cannot happen: the probe would certify a
+        posture the artifact does not receive.
+
+        So the network flags are single-sourced by source text, the same shape as P1's ``_PREFIX`` test:
+        they may appear ONLY in the two primitives that define them.
+        """
+        allowed = {"hermetic_network_segment", "sealed_network_segment", "attached_network_segment"}
+        flags = ("--network", "--network=none", "--add-host")
+        offenders = []
+        for module in _swept_modules():
+            tree = ast.parse((_PKG / module).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name in allowed:
+                    continue
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Constant) and sub.value in flags:
+                        offenders.append(f"sandbox/{module}::{node.name} restates {sub.value!r}")
+        self.assertEqual(
+            offenders, [],
+            f"network posture must come from {sorted(allowed)}, not be restated: {offenders}",
         )
 
     def test_the_census_is_total_and_fresh(self) -> None:
