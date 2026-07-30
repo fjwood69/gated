@@ -661,5 +661,147 @@ class ClientEnvIsAnAllowlist(unittest.TestCase):
             self.assertNotIn(name, env, f"{name} was fabricated rather than passed through")
 
 
+
+# ===================================================================================================
+# P2b — THE POSTURE CENSUS. Every runtime invocation is classified, and CONSTRUCT sites must route
+# through a registered builder.
+#
+# Classification is by WHO CONSUMES THE EFFECT OR THE STDOUT. That replaced a posture/lifecycle split
+# refuted by two live counter-examples here: ``exec cat`` reads as "lifecycle" yet its stdout IS the
+# verdict input, and ``inspect`` reads as "lifecycle" yet its stdout AUTHORS ``--add-host``.
+#
+# KEYED PER CALL, not per scope — ``_start_proxy`` holds ONE CONSTRUCT and ONE WITNESS invocation, so a
+# scope-keyed table would silently classify the CONSTRUCT one by its neighbour. That is the
+# exemption-by-adjacency failure this suite already fixed once on the assertion axis; the key is now
+# CALL x ASSERTION x CLASS.
+# ===================================================================================================
+CONSTRUCT, WITNESS, PROBE_DESTROY = "CONSTRUCT", "WITNESS", "PROBE-DESTROY"
+
+_SITE_CLASS: dict[str, tuple[str, str]] = {
+    # -- CONSTRUCT: creates/configures a resource whose posture flags bear on isolation ------------
+    "sandbox/oci.py::detect_runtime#0": (CONSTRUCT,
+        "runs a throwaway container to test CAPABILITY; its --network=none must be the SAME statement "
+        "the artifact run uses, or the probe certifies a posture the real run does not apply"),
+    "sandbox/oci.py::OCISandbox.run#0": (CONSTRUCT, "the artifact's own isolation - hermetic variant"),
+    "sandbox/observed.py::ObservedOCISandbox.run#0": (CONSTRUCT,
+        "the artifact's own isolation - sealed-network variant; same builder, network passed as data"),
+    "sandbox/observed.py::ObservedOCISandbox._create_network#0": (CONSTRUCT,
+        "creates the sealed network; its flags are ATTESTED via _OBSERVER_CONFIG_HASH"),
+    "sandbox/observed.py::ObservedOCISandbox._start_proxy#0": (CONSTRUCT,
+        "stands up the observer sidecar on the sealed network with a read-only source mount"),
+    "sandbox/observed.py::ObservedOCISandbox._escape_probe#0": (CONSTRUCT,
+        "calibration-of-the-detector: constructs a container with the sealed posture and must certify "
+        "the SAME segment the artifact receives"),
+
+    # -- WITNESS: stdout becomes a value consumed by the verdict or by a later argv -----------------
+    "sandbox/observed.py::ObservedOCISandbox._read_count#0": (WITNESS,
+        "stdout parsed to int and returned as egress_attempts - THE VERDICT INPUT. Argv shape is not "
+        "its risk; stdout interpretation is. Empty handling is sound (-> None -> ERROR/TELEMETRY_MISSING)"),
+    "sandbox/observed.py::ObservedOCISandbox._start_proxy#1": (WITNESS,
+        "SECOND call in this scope: inspect's stdout becomes proxy_ip and AUTHORS --add-host. The FIRST "
+        "call here is CONSTRUCT and IS builder-routed - this classification is per-CALL for that reason. "
+        "Empty handling is sound (raises NetworkIsolationError)"),
+    "sandbox/oci.py::resolve_image_id#0": (WITNESS,
+        "stdout is the immutable digest that is both EXECUTED and ATTESTED as image_digest. Empty "
+        "handling is sound: 'if out.returncode != 0 or not digest: raise ImageResolutionError'"),
+
+    # -- PROBE-DESTROY: consumed only as a fail-closed existence/destruction decision ---------------
+    "sandbox/oci.py::probe_existence#0": (PROBE_DESTROY,
+        "returncode/stdout consumed as TRI-STATE; the ABSENT branch is UNSOUND on rc 0 + empty stdout "
+        "- see the stdout-interpretation increment. NOT 'boolean only': the tree falsifies that"),
+    "sandbox/observed.py::reap_orphans._names#0": (PROBE_DESTROY,
+        "stdout.split() is the list of resources to destroy. SAME SHAPE as probe_existence: rc 0 with "
+        "empty stdout returns [] and reports a clean slate. Milder (a genuine no-match also gives rc 0 "
+        "+ empty) but the same class - the stdout increment has TWO sites, not one"),
+    "sandbox/observed.py::reap_orphans._rm#0": (PROBE_DESTROY, "best-effort removal; the re-probe is the authority"),
+    "sandbox/oci.py::OCISandbox._force_remove#0": (PROBE_DESTROY, "best-effort removal; the re-probe is the authority"),
+    "sandbox/observed.py::ObservedOCISandbox._force_remove#0": (PROBE_DESTROY, "best-effort removal; re-probe is authority"),
+    "sandbox/observed.py::ObservedOCISandbox._force_remove_network#0": (PROBE_DESTROY, "best-effort removal; re-probe is authority"),
+}
+
+
+def _argv_from_registered_builder(node: ast.expr, scope: "_Scope | None" = None) -> bool:
+    """The ROUTING obligation — strictly NARROWER than ``pinned_argv``.
+
+    ``pinned_argv`` accepts a LIST LITERAL with a pinned head, a Name bound to one, or a builder Call.
+    Routing rejects the list literal in every form: the argv must ORIGINATE in a registered builder.
+
+    A Name IS resolved through its bindings, because ``cmd = artifact_run_argv(...)`` then ``Popen(cmd)``
+    is builder-routed — the value's origin is the builder, and the local binding is a readability choice,
+    not a posture decision. (Discovered by the assertion going red against correct code on both artifact
+    ``run()`` sites: the CODE was right and the predicate was too narrow. Establish direction, then fix
+    the side that is wrong.) Mutation still disqualifies, exactly as under ``pinned_argv``.
+
+    The narrowing is proven rather than asserted: a CONSTRUCT site with a PINNED INLINE LIST goes RED
+    here while staying GREEN under argv[0]. Without that proof routing is a rename of an existing
+    control.
+    """
+    if isinstance(node, ast.Call):
+        return _callee(node.func) in _ARGV_BUILDERS
+    if isinstance(node, ast.Name) and scope is not None:
+        if node.id in scope.mutated:
+            return False
+        bindings = scope.assigns.get(node.id)
+        return bool(bindings) and all(_argv_from_registered_builder(b, scope) for b in bindings)
+    return False
+
+
+def _classified_sites() -> list[tuple[str, "_Scope", ast.Call]]:
+    out = []
+    for scope in _all_scopes():
+        for i, call in enumerate(scope.execs):
+            out.append((f"{scope.where}#{i}", scope, call))
+    return out
+
+
+class PostureCensus(unittest.TestCase):
+    def test_every_construct_site_routes_through_a_builder(self) -> None:
+        """CONSTRUCT sites may not hand-build an argv. A new inline posture is a flagged defect."""
+        offenders = []
+        for key, _scope, call in _classified_sites():
+            entry = _SITE_CLASS.get(key)
+            if entry is None or entry[0] != CONSTRUCT:
+                continue
+            argv = _argv_of(call)
+            if argv is None or not _argv_from_registered_builder(argv, _scope):
+                offenders.append(f"{key} (argv shape: {type(argv).__name__ if argv else 'none'})")
+        self.assertEqual(
+            offenders, [],
+            f"these CONSTRUCT sites build an argv inline instead of via a registered builder: {offenders}",
+        )
+
+    def test_the_census_is_total_and_fresh(self) -> None:
+        """Every invocation classified exactly once; every entry names a real site. Both directions,
+        because a stale key is inert and an unclassified site is invisible."""
+        live = {k for k, _s, _c in _classified_sites()}
+        self.assertEqual(sorted(live - set(_SITE_CLASS)), [], "UNCLASSIFIED runtime invocations")
+        self.assertEqual(sorted(set(_SITE_CLASS) - live), [], "STALE classification keys")
+
+    def test_every_classification_has_a_class_and_a_reason(self) -> None:
+        for key, (cls, reason) in _SITE_CLASS.items():
+            self.assertIn(cls, (CONSTRUCT, WITNESS, PROBE_DESTROY), f"{key}: unknown class {cls!r}")
+            self.assertTrue(reason.strip(), f"{key}: no reason recorded")
+
+    def test_start_proxy_holds_both_a_construct_and_a_witness_call(self) -> None:
+        """The per-CALL key, asserted rather than assumed. If these two ever collapse to one class, the
+        classification has been coarsened and the CONSTRUCT call is riding on its neighbour."""
+        self.assertEqual(_SITE_CLASS["sandbox/observed.py::ObservedOCISandbox._start_proxy#0"][0], CONSTRUCT)
+        self.assertEqual(_SITE_CLASS["sandbox/observed.py::ObservedOCISandbox._start_proxy#1"][0], WITNESS)
+
+    def test_routing_is_strictly_narrower_than_argv0(self) -> None:
+        """The distinctness proof, as a unit test on the two predicates over the SAME synthetic argv.
+
+        A pinned inline list satisfies argv[0] provenance and fails routing. If these two ever agree on
+        every shape, routing has stopped being a separate control.
+        """
+        inline = ast.parse("[self._exec_runtime(), 'run']").body[0].value  # type: ignore[attr-defined]
+        built = ast.parse("artifact_run_argv(self._exec_runtime())").body[0].value  # type: ignore[attr-defined]
+        scope = _Scope("oci.py", "synthetic")
+        self.assertTrue(scope.pinned_argv(inline), "premise: the inline list IS pinned under argv[0]")
+        self.assertFalse(_argv_from_registered_builder(inline), "routing must REJECT a pinned inline list")
+        self.assertTrue(scope.pinned_argv(built), "a builder call is also pinned under argv[0]")
+        self.assertTrue(_argv_from_registered_builder(built), "routing must ACCEPT a builder call")
+
+
 if __name__ == "__main__":
     unittest.main()
