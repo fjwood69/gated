@@ -195,10 +195,21 @@ def resolve_runtime_path(runtime: str) -> str:
     ``PATH`` does not fall back to a CWD-searching default. The finding stands on the relative-entry
     route alone.)
 
-    BEST-EFFORT BY DESIGN — it does not raise. ``observed.py`` instantiates a sandbox at MODULE IMPORT
-    for the ``Sandbox`` protocol conformance check, so raising here would make importing the package fail
-    on any host without that runtime. Refusal belongs at the EXEC BOUNDARY, where it is a decision about
-    one invocation rather than about whether the module can be imported at all.
+    BEST-EFFORT BY DESIGN — it does not raise, for two reasons that both still hold:
+
+      * ``detect_runtime`` must SKIP an unresolvable candidate and try the next one. A resolver that
+        raised on the first miss would make "podman is absent" fatal on a host where docker would have
+        worked. That is why the detection path narrows this through ``_resolved_or_none`` instead.
+      * CONSTRUCTING IS NOT EXECUTING. A sandbox may be built and never run — ``gate/backends.py``
+        constructs with a pinned runtime under test — and refusal is a decision about ONE INVOCATION.
+        It belongs at the exec boundary (``require_resolved_runtime``).
+
+    An earlier version of this paragraph justified best-effort by a THIRD reason that is no longer true:
+    that ``observed.py`` instantiated a sandbox at MODULE IMPORT for the protocol conformance check, so
+    raising here would break importing the package. That instantiation was moved behind ``_conforms()``
+    in the same change that added the exec boundary, so the import constraint is GONE. Recorded rather
+    than quietly deleted, because a docstring citing a constraint the tree no longer has is the same
+    defect class as the "absolute path" claim two paragraphs up — a property credited, not held.
 
     Already-absolute input is returned as-is, so a caller that pinned a path keeps it.
 
@@ -219,14 +230,16 @@ def require_resolved_runtime(runtime: str, path: str) -> str:
     """THE EXEC BOUNDARY: refuse to build a runtime argv around a non-absolute ``argv[0]``.
 
     Fail-closed, and placed here rather than in ``__init__`` for two reasons that both bit the first
-    attempt. Constructing is not executing — an ``__init__`` raise breaks the module-import conformance
-    check and the ungated ``test_backends`` construction, and it fires even for a sandbox that is never
-    run. And a guard in ``__init__`` cannot bind ``_runtime_path``, which is writable and IS written by
-    tests on ``__new__`` instances; only a check on the value being used can.
+    attempt. CONSTRUCTING IS NOT EXECUTING — an ``__init__`` raise fires for a sandbox that is never run
+    and breaks the ungated ``test_backends`` construction. And a guard in ``__init__`` cannot BIND
+    ``_runtime_path``, which is writable and IS written by tests on ``__new__`` instances; only a check
+    on the value actually being used can.
 
     RESIDUAL, stated plainly: failure therefore surfaces at the FIRST INVOCATION, not at startup. On a
     host where the runtime cannot be resolved, the refusal arrives when the gate first tries to exec.
-    That is the correct trade for not raising at import, but it is not startup validation.
+    That is the correct trade for refusing per-invocation rather than per-construction, but it is not
+    startup validation. (An earlier version of this paragraph also cited the module-import conformance
+    check; that instantiation now sits behind ``_conforms()``, so it is no longer a reason for anything.)
     """
     if not os.path.isabs(path):
         raise RuntimePathUnresolved(

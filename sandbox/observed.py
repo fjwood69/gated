@@ -496,9 +496,13 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
 # Type-check proof: ObservedOCISandbox IS a core.Sandbox (session() inherited from base).
 #
 # Behind a FUNCTION, matching ``sandbox/oci.py``. As a module-level binding this instantiated a sandbox
-# at IMPORT, which is what forced ``resolve_runtime_path`` to be best-effort in the first place and made
-# any construction-time validation an import-time failure on hosts without the runtime. Enforcement now
-# lives at the exec boundary, so the constraint is gone — but leaving the import-time instantiation in
-# place would quietly re-create it for the next person who reaches for an ``__init__`` guard.
+# at IMPORT, which was one of the original reasons ``resolve_runtime_path`` had to be best-effort: any
+# construction-time validation became an import-time failure on hosts without the runtime.
+#
+# THAT REASON IS NOW SPENT, and it is retired in ``resolve_runtime_path``'s own docstring rather than left
+# there to rot. Best-effort survives on the two grounds that still hold — detection must skip an
+# unresolvable candidate, and constructing is not executing — so this change removed a justification
+# without removing the behaviour it justified. Leaving the import-time instantiation in place would
+# quietly re-create the constraint for the next person who reaches for an ``__init__`` guard.
 def _conforms() -> Sandbox:
     return ObservedOCISandbox(image="scratch", runtime="podman")  # no detection at import
