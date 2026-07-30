@@ -74,6 +74,25 @@ WORK_DIR = "/work"            # writable tmpfs — scratch/audit only, NEVER gra
 RESOURCE_PREFIX = "moriverify-"
 
 
+class OCIRuntimeUnavailable(Exception):
+    """No OCI runtime can actually run a hermetic (rootless, --network=none)
+    container for the requested image. HERMETIC is unavailable — the engine must
+    fail closed (no silent WEAK fallback outside explicit dev mode).
+
+    Defined HERE, above the resolution helpers, so ``RuntimePathUnresolved`` can subclass it."""
+
+
+class RuntimePathUnresolved(OCIRuntimeUnavailable):
+    """The runtime NAME could not be resolved to an ABSOLUTE binary path, so no argv may be built
+    around it — raised at the exec boundary, never at construction or import.
+
+    A SUBCLASS of ``OCIRuntimeUnavailable`` deliberately: the consequence is identical (HERMETIC is
+    unavailable, fail closed) and every existing handler — including ``available()``, which reports
+    the backend as unusable rather than propagating — already treats that correctly. A fresh
+    top-level exception type would have slipped past all of them.
+    """
+
+
 # ---------------------------------------------------------------------------------------------------
 # P2a — ONE runtime resolution and ONE client-env policy, shared by every sandbox backend.
 #
@@ -94,14 +113,17 @@ _CLIENT_PATH_FALLBACK = "/usr/bin:/bin"
 # The client env allowlist. NOT full ``os.environ`` (the runtime client should not inherit the host's
 # world) and NOT ``{"PATH": ...}`` alone.
 #
-# MEASURED on the reference host (podman 4.9.3, crun 1.14.1, rootless uid 1000, home-dir
-# ``storage.conf``): a bare ``{"PATH": ...}`` IS sufficient — the capability probe exits 0, the
-# configured graphroot resolves, and locally-built images are readable, because podman falls back to
-# ``getpwuid`` when HOME is unset. An ABSENT ``HOME`` degrades correctly; a WRONG one fails loudly.
+# MEASURED on the reference host (podman 4.9.3, crun 1.14.1, conmon 2.1.10, rootless uid 1000,
+# Ubuntu 24.04.4, kernel 6.17.0-35, home-dir ``storage.conf``) on 2026-07-29, n=1: a bare
+# ``{"PATH": ...}`` IS sufficient — the capability probe exits 0, the configured graphroot resolves,
+# and locally-built images are readable, because podman falls back to ``getpwuid`` when HOME is unset.
+# An ABSENT ``HOME`` degrades correctly; a WRONG one fails loudly.
 #
-# So this allowlist is PORTABILITY INSURANCE for untested runtimes (``nerdctl``, ``docker``) and for
-# hosts whose container config is not home-derived — it is NOT "what makes rootless podman work".
-# Do not justify it with "rootless needs HOME"; that claim is contradicted by the measurement above.
+# The scope of that measurement is load-bearing and is stated with it deliberately: cited bare, it
+# reads as justifying this allowlist by the very measurement that showed it unnecessary. What it
+# establishes is a fact about ONE host. The allowlist exists for hosts where the ``getpwuid`` fallback
+# is not authoritative and for the untested runtimes (``nerdctl``, ``docker``) — i.e. PORTABILITY
+# INSURANCE, NOT "what makes rootless podman work", which the measurement contradicts.
 # Each name is passed through ONLY if present in the parent environment.
 _CLIENT_ENV_PASSTHROUGH = (
     "HOME",                       # rootless config/storage discovery when getpwuid is not authoritative
@@ -115,6 +137,17 @@ _CLIENT_ENV_PASSTHROUGH = (
 )
 
 
+def client_path() -> str:
+    """The ``PATH`` a runtime client will be given — and the SAME value resolution searches.
+
+    Resolution and execution MUST agree. Resolving a bare name against the *host's* ``PATH`` while
+    executing with a *different* ``PATH`` in the env dict is how an argv[0] that looks resolved ends up
+    naming a binary the client would never have found — or a different one. Keeping both through this
+    one function makes that divergence unrepresentable rather than merely unlikely.
+    """
+    return os.environ.get("PATH", _CLIENT_PATH_FALLBACK)
+
+
 def runtime_client_env() -> dict[str, str]:
     """The environment for a HOST-SIDE runtime invocation — every one of them, uniformly.
 
@@ -126,8 +159,15 @@ def runtime_client_env() -> dict[str, str]:
     one inherited the host ``PATH``, and eighteen passed no ``env=`` at all and inherited the entire host
     environment, including the capability probe that decides whether the gate can run. Nobody chose that;
     it drifted.
+
+    ``PATH`` IS STILL PASSED, and the reason changed under P2a — so the rationale is restated here rather
+    than left to rot into a false claim. With the absolute-path pin, this ``PATH`` no longer selects the
+    runtime BINARY: argv[0] is absolute, so the client is found without it. It is retained because the
+    runtime spawns HELPER CHILDREN of its own (``crun``/``runc``, ``conmon``, ``newuidmap``, the OCI
+    hooks), and those are resolved by name against exactly this value. Stripping it would break the
+    container lifecycle while closing nothing that the pin has not already closed.
     """
-    env = {"PATH": os.environ.get("PATH", _CLIENT_PATH_FALLBACK)}
+    env = {"PATH": client_path()}
     for var in _CLIENT_ENV_PASSTHROUGH:
         value = os.environ.get(var)
         if value is not None:
@@ -136,12 +176,29 @@ def runtime_client_env() -> dict[str, str]:
 
 
 def resolve_runtime_path(runtime: str) -> str:
-    """The absolute path of ``runtime``, or ``runtime`` unchanged when it cannot be resolved.
+    """An ABSOLUTE path for ``runtime``, or ``runtime`` UNCHANGED when no absolute path can be produced.
 
-    BEST-EFFORT BY DESIGN, and the reason is a real constraint rather than laziness: ``observed.py``
-    instantiates a sandbox at MODULE IMPORT (the ``Sandbox`` protocol conformance check), so raising
-    here would make importing the package fail on any host without that runtime. An unresolvable name
-    falls through unchanged and the invocation fails at exec, exactly as it did before.
+    The postcondition is "absolute, or the input verbatim" — NOT "the absolute path". That distinction
+    is the whole point of this function and an earlier docstring got it wrong, which is worth recording
+    because the wrong version was strictly more dangerous than no docstring: it stamped a value as
+    resolved without establishing it.
+
+    ``shutil.which()`` DOES return a relative path — verified on CPython 3.12.3/Linux,
+    ``which('zzruntime', path='reldir') -> 'reldir/zzruntime'`` — whenever the matching ``PATH`` entry is
+    itself relative. A relative argv[0] is resolved by ``Popen`` at spawn time against the CWD, which is
+    precisely the trojan geometry the pin exists to close, so a non-absolute result is treated as NO
+    RESULT here and rejected outright at the exec boundary (``require_resolved_runtime``).
+
+    Searched against ``client_path()`` — the PATH the invocation will actually carry — not the ambient
+    default. (A second mechanism was proposed for this finding and is REFUTED on this platform, recorded
+    so it is not re-added: ``os.defpath`` is ``/bin:/usr/bin``, with no leading empty entry, so an unset
+    ``PATH`` does not fall back to a CWD-searching default. The finding stands on the relative-entry
+    route alone.)
+
+    BEST-EFFORT BY DESIGN — it does not raise. ``observed.py`` instantiates a sandbox at MODULE IMPORT
+    for the ``Sandbox`` protocol conformance check, so raising here would make importing the package fail
+    on any host without that runtime. Refusal belongs at the EXEC BOUNDARY, where it is a decision about
+    one invocation rather than about whether the module can be imported at all.
 
     Already-absolute input is returned as-is, so a caller that pinned a path keeps it.
 
@@ -152,7 +209,74 @@ def resolve_runtime_path(runtime: str) -> str:
     """
     if os.path.isabs(runtime):
         return runtime
-    return shutil.which(runtime) or runtime
+    found = shutil.which(runtime, path=client_path())
+    if found is None or not os.path.isabs(found):
+        return runtime  # UNRESOLVED — a relative hit is not a resolution
+    return found
+
+
+def require_resolved_runtime(runtime: str, path: str) -> str:
+    """THE EXEC BOUNDARY: refuse to build a runtime argv around a non-absolute ``argv[0]``.
+
+    Fail-closed, and placed here rather than in ``__init__`` for two reasons that both bit the first
+    attempt. Constructing is not executing — an ``__init__`` raise breaks the module-import conformance
+    check and the ungated ``test_backends`` construction, and it fires even for a sandbox that is never
+    run. And a guard in ``__init__`` cannot bind ``_runtime_path``, which is writable and IS written by
+    tests on ``__new__`` instances; only a check on the value being used can.
+
+    RESIDUAL, stated plainly: failure therefore surfaces at the FIRST INVOCATION, not at startup. On a
+    host where the runtime cannot be resolved, the refusal arrives when the gate first tries to exec.
+    That is the correct trade for not raising at import, but it is not startup validation.
+    """
+    if not os.path.isabs(path):
+        raise RuntimePathUnresolved(
+            f"runtime {runtime!r} did not resolve to an absolute binary path on the client PATH "
+            f"(got {path!r}); refusing to exec an argv[0] that PATH would resolve at spawn time — "
+            "HERMETIC unavailable, fail closed"
+        )
+    return path
+
+
+def exec_runtime_path(runtime: str) -> str:
+    """Resolve ``runtime`` and REFUSE a non-absolute result — one expression, for module-level callers.
+
+    Resolution and enforcement are deliberately fused: there is no way to obtain the resolved value
+    without passing the check, so no shape exists in which an unresolved path reaches an argv.
+    """
+    return require_resolved_runtime(runtime, resolve_runtime_path(runtime))
+
+
+def _resolved_or_none(runtime: str) -> str | None:
+    """``resolve_runtime_path`` narrowed to "an absolute path, or nothing" — for DETECTION, which must
+    SKIP an unresolvable candidate and try the next rather than raise on the first.
+
+    The ``None`` branch cannot reach an argv, and that is enforced by a compiler rather than by review:
+    ``mypy --strict`` refuses ``str | None`` as a member of the ``list[str]`` ``subprocess`` requires, so
+    omitting the guard is a type error, not a latent bug.
+    """
+    path = resolve_runtime_path(runtime)
+    return path if os.path.isabs(path) else None
+
+
+class _ResolvedRuntimeMixin:
+    """The exec boundary for the OCI-family backends — ONE implementation, mixed into both.
+
+    Deliberately not duplicated per class and not pushed down into ``BaseSandbox``: the NAME/PATH split
+    is specific to the backends that exec a container runtime, and ``NoOpSandbox`` /
+    ``SubprocessSandbox`` have no runtime to resolve.
+    """
+
+    _runtime: str
+    _runtime_path: str
+
+    def _exec_runtime(self) -> str:
+        """``argv[0]`` for every runtime invocation — the resolved path, REFUSED if not absolute.
+
+        The pin and its enforcement are one expression on purpose: a method cannot build a runtime argv
+        without passing the check. Reading ``self._runtime_path`` directly into an argv is therefore a
+        defect the static sweep flags, not a style preference. One ``isabs`` per invocation.
+        """
+        return require_resolved_runtime(self._runtime, self._runtime_path)
 
 
 def detect_runtime(image: str) -> str:
@@ -167,9 +291,9 @@ def detect_runtime(image: str) -> str:
     (both derive from ``BaseSandbox``), which is why it was copied rather than inherited.
     """
     for rt in _RUNTIMES:
-        path = resolve_runtime_path(rt)
-        if path == rt and not os.path.isabs(rt):
-            continue  # not on PATH at all
+        path = _resolved_or_none(rt)
+        if path is None:
+            continue  # not resolvable to an absolute binary on the client PATH — try the next
         try:
             probe = subprocess.run(
                 [path, "run", "--rm", "--network=none", image, "true"],
@@ -203,21 +327,17 @@ def probe_existence(argv: list[str], name: str, *, timeout: float = 30.0) -> Exi
     return Existence.EXISTS if name in r.stdout.split() else Existence.ABSENT
 
 
-class OCIRuntimeUnavailable(Exception):
-    """No OCI runtime can actually run a hermetic (rootless, --network=none)
-    container for the requested image. HERMETIC is unavailable — the engine must
-    fail closed (no silent WEAK fallback outside explicit dev mode)."""
-
-
 def resolve_image_id(runtime: str, image: str) -> str:
     """Resolve ``image`` (a possibly-mutable tag) to its IMMUTABLE local content id
     (``<rt> inspect --format {{.Id}}`` -> ``sha256:...``) so the caller can execute the DIGEST,
     not the tag (3.5-close #1.1 — closes the tag-remap TOCTOU). The FULL digest is returned (never
     a short prefix — a short prefix reopens id ambiguity). Raises ``ImageResolutionError`` if the
-    image is absent or the runtime can't report an id."""
+    image is absent or the runtime can't report an id, and ``RuntimePathUnresolved`` (an
+    ``OCIRuntimeUnavailable``) if ``runtime`` yields no absolute binary — an unresolvable runtime is a
+    fail-closed refusal to exec, not an image-resolution outcome, so it is NOT folded into the latter."""
     try:
         out = subprocess.run(
-            [resolve_runtime_path(runtime), "image", "inspect", "--format", "{{.Id}}", image],
+            [exec_runtime_path(runtime), "image", "inspect", "--format", "{{.Id}}", image],
             capture_output=True, text=True, timeout=30, env=runtime_client_env(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -259,7 +379,7 @@ def _make_snapshot_readable(root: Path) -> None:
             pass
 
 
-class OCISandbox(BaseSandbox):
+class OCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
     """HERMETIC isolation via an ephemeral OCI container."""
 
     isolation_level: IsolationLevel = IsolationLevel.HERMETIC
@@ -305,7 +425,7 @@ class OCISandbox(BaseSandbox):
     def prepare(self, artifact: ArtifactSpec, fixtures: Fixtures) -> SandboxHandle:
         # 3.5-close #1.1: resolve the IMMUTABLE image digest at the TOP of prepare(), ONCE, before
         # anything runs — run() then executes THIS digest, not the mutable tag (closes tag-remap).
-        image_id = resolve_image_id(self._runtime_path, self.image)
+        image_id = resolve_image_id(self._exec_runtime(), self.image)
         snapshot = Path(tempfile.mkdtemp(prefix=f"{RESOURCE_PREFIX}oci-"))
         try:
             if artifact.path.is_dir():
@@ -344,7 +464,7 @@ class OCISandbox(BaseSandbox):
             # --init: a real init as PID 1 so the artifact runs as its child — a
             # namespace's PID 1 can't be signal-killed from within (crashes would
             # otherwise be mis-reported as clean exits), and zombies get reaped.
-            self._runtime_path, "run", "--rm", "--init", "--name", h.container,
+            self._exec_runtime(), "run", "--rm", "--init", "--name", h.container,
             *self._network_args(),
             "--mount", mount,          # verified artifact, read-only, private
             "--tmpfs", WORK_DIR,       # writable scratch (audit-only)
@@ -410,14 +530,15 @@ class OCISandbox(BaseSandbox):
         # best-effort removal — the AUTHORITY that destruction happened is the tri-state probe below, not this
         # return code (a non-zero rm still forces a re-probe, which fails closed on EXISTS/UNKNOWN).
         try:
-            subprocess.run([self._runtime_path, "rm", "-f", name], capture_output=True, timeout=30,
+            subprocess.run([self._exec_runtime(), "rm", "-f", name], capture_output=True, timeout=30,
                            env=runtime_client_env())
         except (OSError, subprocess.SubprocessError):
             pass
 
     def _container_state(self, name: str) -> Existence:
         return probe_existence(
-            [self._runtime_path, "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"], name)
+            [self._exec_runtime(), "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
+            name)
 
     def _result(
         self,

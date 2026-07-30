@@ -29,7 +29,11 @@ from sandbox.observed import (
 )
 
 
-def _argv_test_sandbox(runtime: str = "podman") -> ObservedOCISandbox:
+_RT_NAME = "podman"          # the audited NAME — what ``sandbox.runtime`` reports
+_RT_PATH = "/usr/bin/podman"  # the resolved PATH — what argv[0] carries
+
+
+def _argv_test_sandbox(name: str = _RT_NAME, path: str = _RT_PATH) -> ObservedOCISandbox:
     """An ``ObservedOCISandbox`` built WITHOUT running runtime detection, for argv-shape assertions.
 
     Internals-coupled on purpose and in ONE place. These tests must not construct the sandbox normally
@@ -40,11 +44,17 @@ def _argv_test_sandbox(runtime: str = "podman") -> ObservedOCISandbox:
 
     If a future change adds another internal to this path, THIS is the line to update — and a
     ``AttributeError`` from these tests is that signal, not a failure of the seam.
+
+    ``path`` IS ABSOLUTE, and this is the one line where P2a's remediation touched a P1 test. It
+    previously held the bare NAME, purely so the assertions could compare against
+    ``network_create_argv(runtime, …)``. The exec boundary now refuses a non-absolute ``argv[0]``, so
+    that fixture modelled a shape production can no longer produce — the fixture was wrong, not the new
+    check. Direction established before changing either side: a red test is disagreement between test
+    and code, and here the code is right.
     """
     sbx = ObservedOCISandbox.__new__(ObservedOCISandbox)
-    sbx._runtime = runtime          # audited NAME — what ``sandbox.runtime`` reports
-    sbx._runtime_path = runtime     # resolved PATH — what argv[0] uses; a bare name here keeps the
-                                    # assertions comparing against network_create_argv(runtime, ...)
+    sbx._runtime = name
+    sbx._runtime_path = path
     return sbx
 
 
@@ -118,7 +128,7 @@ class CreateNetworkUsesTheSeam(unittest.TestCase):
             sbx._create_network("net-x")
         self.assertTrue(run.called, "_create_network did not invoke subprocess.run")
         self.assertEqual(
-            list(run.call_args.args[0]), network_create_argv("podman", "net-x"),
+            list(run.call_args.args[0]), network_create_argv(_RT_PATH, "net-x"),
             "_create_network built its own argv instead of using network_create_argv",
         )
 
