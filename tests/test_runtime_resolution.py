@@ -56,6 +56,7 @@ from unittest import mock
 
 from sandbox.oci import (
     OCISandbox,
+    ResourceKind,
     RuntimePathUnresolved,
     _CLIENT_ENV_PASSTHROUGH,
     _resolved_or_none,
@@ -111,9 +112,16 @@ _ARGV_BUILDERS = {
     "artifact_run_argv": 0,
     "proxy_run_argv": 0,
     "escape_probe_argv": 0,
+    # stdout-interpretation law: the unfiltered listing and the container-kind witness.
+    "listing_argv": 0,
+    "canary_container_argv": 0,
 }
 # Functions that RECEIVE a built argv and exec it. ``{name: index of the argv parameter}``.
-_ARGV_CONSUMERS = {"probe_existence": 0, "_names": 0, "_rm": 0}
+# ``probe_existence`` and ``_names`` were REMOVED as consumers: the stdout-interpretation increment moved
+# the seam so they take (runtime, kind, …) and build their own listing. A function handed a finished argv
+# cannot construct the control query that proves the argv's shape works, which is why the seam moved —
+# and leaving them registered here would assert an interface the tree no longer has.
+_ARGV_CONSUMERS = {"_rm": 0}
 
 # Methods that would rewrite a list after a compliant assignment.
 _MUTATORS = ("insert", "append", "extend", "__setitem__")
@@ -132,7 +140,8 @@ _FORBIDDEN_KWARGS = ("executable", "shell")
 # since that site does pass ``env=``), and justified where it was never consumed. An exemption is scoped
 # to the assertion it was argued for; anything else is an exemption by adjacency.
 # --------------------------------------------------------------------------------------------------
-_ASSERTIONS = ("argv0_is_pinned", "env_is_the_policy", "no_forbidden_kwargs")
+_ASSERTIONS = ("argv0_is_pinned", "env_is_the_policy", "no_forbidden_kwargs",
+               "sink_head_is_pinned")
 
 _ARGV_FROM_CALLER = (
     "receives a fully-built argv from its callers and execs it verbatim, so argv[0] is not this "
@@ -141,18 +150,36 @@ _ARGV_FROM_CALLER = (
     "obligation, it does not discharge it."
 )
 
-# {swept site qualname: (CLASS, the ONE assertion it applies to, why)}
-_EXEMPTIONS: dict[str, tuple[str, str, str]] = {
-    "sandbox/oci.py::probe_existence": ("ARGV_FROM_CALLER", "argv0_is_pinned", _ARGV_FROM_CALLER),
-    "sandbox/observed.py::reap_orphans._names": ("ARGV_FROM_CALLER", "argv0_is_pinned", _ARGV_FROM_CALLER),
-    "sandbox/observed.py::reap_orphans._rm": ("ARGV_FROM_CALLER", "argv0_is_pinned", _ARGV_FROM_CALLER),
+_RUNTIME_FROM_CALLER = (
+    "receives the ALREADY-RESOLVED runtime path as a parameter and hands it to a registered builder. The "
+    "argv is builder-built and correct; what this function cannot prove locally is that its CALLER passed "
+    "a resolved path. That obligation is discharged at the call sites, which the census sweeps — the "
+    "exemption MOVES the obligation, it does not discharge it. Distinct from ARGV_FROM_CALLER: that class "
+    "is for functions handed a finished argv, and after the stdout-interpretation increment these build "
+    "their own."
+)
+
+# KEYED BY (SITE, ASSERTION) -> (CLASS, why).
+#
+# The key gained the assertion when a site legitimately needed exemption from TWO assertions for the same
+# reason and a qualname-keyed map could only express one. Widening the VALUE would have let one grant
+# cover both silently; widening the KEY forces each grant to be written, which is the law this suite
+# already enforces elsewhere: an exemption is keyed to exactly what was justified — the CALL, the
+# ASSERTION, and the CLASS. Any coarser key grants exemptions nobody granted.
+_EXEMPTIONS: dict[tuple[str, str], tuple[str, str]] = {
+    ("sandbox/oci.py::probe_existence", "argv0_is_pinned"): ("RUNTIME_FROM_CALLER", _RUNTIME_FROM_CALLER),
+    ("sandbox/oci.py::probe_existence", "sink_head_is_pinned"): ("RUNTIME_FROM_CALLER", _RUNTIME_FROM_CALLER),
+    ("sandbox/oci.py::ensure_container_witness", "argv0_is_pinned"): ("RUNTIME_FROM_CALLER", _RUNTIME_FROM_CALLER),
+    ("sandbox/oci.py::ensure_container_witness", "sink_head_is_pinned"): ("RUNTIME_FROM_CALLER", _RUNTIME_FROM_CALLER),
+    ("sandbox/observed.py::reap_orphans._names", "argv0_is_pinned"): ("RUNTIME_FROM_CALLER", _RUNTIME_FROM_CALLER),
+    ("sandbox/observed.py::reap_orphans._names", "sink_head_is_pinned"): ("RUNTIME_FROM_CALLER", _RUNTIME_FROM_CALLER),
+    ("sandbox/observed.py::reap_orphans._rm", "argv0_is_pinned"): ("ARGV_FROM_CALLER", _ARGV_FROM_CALLER),
 }
 
 
 def _exempt(where: str, assertion: str) -> bool:
     """True only if ``where`` is exempt from THIS assertion. Each assertion consults its own keys."""
-    entry = _EXEMPTIONS.get(where)
-    return entry is not None and entry[1] == assertion
+    return (where, assertion) in _EXEMPTIONS
 
 
 def _callee(func: ast.expr) -> str:
@@ -351,11 +378,13 @@ class Argv0IsAlwaysResolved(unittest.TestCase):
         """The obligation the ARGV_FROM_CALLER exemption moves, discharged at the call sites.
 
         A literal passed to a plain function was invisible to the first version under either polarity:
-        it swept only ``subprocess.*`` calls, so ``probe_existence([self._runtime, …])`` and the
+        it swept only ``subprocess.*`` calls, so ``probe_existence([self._runtime, …]).state`` and the
         reaper's ``_names``/``_rm`` calls were never examined at all.
         """
         offenders = []
         for scope in _all_scopes():
+            if _exempt(scope.where, "sink_head_is_pinned"):
+                continue
             for call in scope.sinks:
                 pos = _ARGV_CONSUMERS[_callee(call.func)]
                 if len(call.args) <= pos or not scope.pinned_argv(call.args[pos]):
@@ -409,8 +438,11 @@ class TheSweepIsNotVacuous(unittest.TestCase):
 
     def test_the_sweep_finds_the_sink_and_builder_call_sites(self) -> None:
         scopes = _all_scopes()
-        self.assertGreaterEqual(sum(len(s.sinks) for s in scopes), 6, "argv-consumer call sites unswept")
-        self.assertGreaterEqual(sum(len(s.builders) for s in scopes), 1, "argv-builder call sites unswept")
+        # The consumer count DROPPED from 6 to 2 when the stdout increment moved the seam: probe_existence
+        # and _names stopped receiving argvs and started building them. Recorded rather than quietly
+        # lowered — a floor that follows the code down asserts nothing.
+        self.assertGreaterEqual(sum(len(s.sinks) for s in scopes), 2, "argv-consumer call sites unswept")
+        self.assertGreaterEqual(sum(len(s.builders) for s in scopes), 6, "argv-builder call sites unswept")
 
     def test_both_artifact_run_sites_are_swept(self) -> None:
         """NAMED, because these two are the ones the first version could not see.
@@ -469,20 +501,20 @@ class ExemptionsAreScopedAndFresh(unittest.TestCase):
     def test_every_exemption_key_names_a_real_swept_site(self) -> None:
         swept = {s.where for s in _all_scopes()}
         self.assertEqual(
-            set(_EXEMPTIONS) - swept, set(),
+            {w for w, _a in _EXEMPTIONS} - swept, set(),
             "these exemption keys match no swept site — a typo'd key is invisible without this test",
         )
 
     def test_every_exemption_names_one_real_assertion_and_a_reason(self) -> None:
-        for where, (cls, assertion, reason) in _EXEMPTIONS.items():
+        for (where, assertion), (cls, reason) in _EXEMPTIONS.items():
             self.assertIn(assertion, _ASSERTIONS, f"{where} exempts an unknown assertion {assertion!r}")
             self.assertTrue(cls.strip(), f"{where} has no exemption CLASS")
             self.assertTrue(reason.strip(), f"{where} has no reason")
 
     def test_an_exemption_does_not_leak_to_other_assertions(self) -> None:
-        for where, (_cls, assertion, _reason) in _EXEMPTIONS.items():
+        for (where, assertion) in _EXEMPTIONS:
             for other in _ASSERTIONS:
-                if other != assertion:
+                if other != assertion and (where, other) not in _EXEMPTIONS:
                     self.assertFalse(
                         _exempt(where, other),
                         f"{where}'s exemption for {assertion!r} also grants {other!r}",
@@ -491,7 +523,7 @@ class ExemptionsAreScopedAndFresh(unittest.TestCase):
     def test_argv_exempt_sites_still_pass_the_env_assertion(self) -> None:
         """The exemption is for argv OWNERSHIP only — those sites do pass ``env=``, and must keep doing so."""
         by_where = {s.where: s for s in _all_scopes()}
-        for where, (_cls, assertion, _reason) in _EXEMPTIONS.items():
+        for (where, assertion) in _EXEMPTIONS:
             if assertion != "argv0_is_pinned":
                 continue
             scope = by_where[where]
@@ -693,6 +725,10 @@ _SITE_CLASS: dict[str, tuple[str, str]] = {
         "calibration-of-the-detector: constructs a container with the sealed posture and must certify "
         "the SAME segment the artifact receives"),
 
+    "sandbox/oci.py::ensure_container_witness#0": (CONSTRUCT,
+        "creates the container-kind WITNESS — a resource the validity of every subsequent destruction "
+        "verdict depends on, so it is CONSTRUCT and routes through canary_container_argv like any other"),
+
     # -- WITNESS: stdout becomes a value consumed by the verdict or by a later argv -----------------
     "sandbox/observed.py::ObservedOCISandbox._read_count#0": (WITNESS,
         "stdout parsed to int and returned as egress_attempts - THE VERDICT INPUT. Argv shape is not "
@@ -775,6 +811,8 @@ _BUILDER_CONTRACT_ARGS: dict[str, dict[str, object]] = {
                           "image_id": "sha256:zz", "entrypoint": ["zz"]},
     "proxy_run_argv": {"network": "zz-net", "name": "zz-p", "image_id": "sha256:zz", "mode": "fail_always"},
     "escape_probe_argv": {"network": "zz-net", "proxy_ip": "10.0.0.2", "image_id": "sha256:zz"},
+    "listing_argv": {"kind": ResourceKind.CONTAINER},
+    "canary_container_argv": {"name": "zz-canary", "image_id": "sha256:zz"},
 }
 
 

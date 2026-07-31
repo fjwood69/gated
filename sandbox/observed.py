@@ -33,12 +33,13 @@ import subprocess
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 from core import (
     ArtifactHashMismatchError,
+    ImageResolutionError,
     ArtifactSpec,
     Command,
     Existence,
@@ -66,10 +67,18 @@ from sandbox.oci import (
     runtime_client_env,
     _ResolvedRuntimeMixin,
     _make_snapshot_readable,
-    probe_existence,
+    ProbeReading,
+    ResourceKind,
+    TeardownVerdict,
+    UnsupportedRuntimeWitness,
+    VerdictKind,
+    ambient_network_witness,
+    ensure_container_witness,
+    listing_argv,
+    probe_container,
+    probe_network,
     resolve_image_id,
 )
-from sandbox.subprocess import _rmtree_resilient
 
 _Outcome = Literal["completed", "timeout", "error"]
 _RUNTIMES = ("podman", "nerdctl", "docker")
@@ -116,6 +125,30 @@ _PREFIX = RESOURCE_PREFIX
 _SEALED_NETWORK_FLAGS = ("--internal", "--disable-dns")
 
 
+@dataclass
+class _SweepReport:
+    """What one destroy-and-probe sweep established: two disjoint lists and the reasons, if any.
+
+    A THIRD FIELD, because the second was carrying two jobs. ``unproven`` says WHICH resources could
+    not be verified; ``causes`` says WHY, once per distinct reason rather than once per item. A
+    whole-kind refusal (this runtime has no measured ambient network) previously arrived as N separate
+    unproven entries with no cause attached at all — N mysteries in place of one stated fact, and the
+    exact "confidence label is not a coverage claim" shape one level along.
+    """
+
+    present: list[str] = field(default_factory=list)
+    unproven: list[str] = field(default_factory=list)
+    causes: list[str] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        """True when the sweep found ANYTHING to report — i.e. the teardown was not clean.
+
+        Defined explicitly. The dataclass would otherwise be truthy always, so a caller writing the
+        obvious ``if report:`` would branch into the failure path on every clean teardown.
+        """
+        return bool(self.present or self.unproven)
+
+
 def network_create_argv(runtime: str, name: str) -> list[str]:
     """The sealed-network create argv — the application site for the attested sealed-network flags.
 
@@ -142,6 +175,17 @@ def network_create_argv(runtime: str, name: str) -> list[str]:
     seal is a CI-time source-integrity control, not a runtime one.
     """
     return [runtime, "network", "create", *_SEALED_NETWORK_FLAGS, name]
+
+
+def _add_note(exc: BaseException, note: str) -> None:
+    """Attach context WITHOUT supplanting the exception. ``add_note`` is PEP 678 (3.11+); the CI matrix
+    includes 3.9 and 3.10, so degrade to an args append rather than assuming the newer interpreter — the
+    kind of version assumption that has reddened three of five jobs in this tree before."""
+    adder = getattr(exc, "add_note", None)
+    if adder is not None:
+        adder(note)
+    else:  # pragma: no cover - exercised only on pre-3.11 interpreters
+        exc.args = (*exc.args, note)
 
 
 def attached_network_segment(network: str) -> list[str]:
@@ -201,7 +245,7 @@ _OBSERVER_CONFIG_HASH = content_digest({
 })
 
 
-def reap_orphans(runtime: str = "podman") -> None:
+def reap_orphans(runtime: str = "podman", *, canary_image: str) -> None:
     """Force-remove orphaned gated containers and networks by name prefix. A TEST/OPS UTILITY —
     **nothing invokes this at startup, and it does not guarantee a clean slate to anything.**
 
@@ -230,6 +274,22 @@ def reap_orphans(runtime: str = "podman") -> None:
     (``SandboxLeakError``) rather than propagating ``RuntimePathUnresolved``: a caller that cannot list
     is in exactly the state this promises to refuse, and its two existing negative tests pin that
     exception type."""
+    # FIRST, before resolution and before any subprocess: is this runtime SUPPORTED at all? Ordering is
+    # load-bearing. Resolution runs a filesystem probe and fails for an ABSENT BINARY; the map fails for
+    # an UNMEASURED RUNTIME. On a host where an unsupported runtime also happens not to be installed, the
+    # resolution failure would mask the support failure and the operator would be told to install
+    # something that still would not be trusted. Absence of support is decided first, and decided
+    # statically. Normalised into the reaper's own contract like RuntimePathUnresolved below — the TYPE is
+    # shared, the MESSAGE is not, because "not in the supported set" must never read as "witness not
+    # found", which is indistinguishable from a broken channel.
+    try:
+        net_witness = ambient_network_witness(runtime)
+    except UnsupportedRuntimeWitness as exc:
+        raise SandboxLeakError(
+            f"orphan reaper refuses runtime {runtime!r}: NOT IN THE SUPPORTED SET ({exc}). This is a "
+            "refusal to probe, not a failed probe — no listing was attempted"
+        ) from exc
+
     try:
         rt = exec_runtime_path(runtime)
     except RuntimePathUnresolved as exc:
@@ -238,18 +298,32 @@ def reap_orphans(runtime: str = "podman") -> None:
             "— cannot confirm a clean slate"
         ) from exc
 
-    def _names(args: list[str], what: str) -> list[str]:
+    def _names(kind: ResourceKind, what: str, witness: str) -> list[str]:
+        """Names under ``_PREFIX``, from a channel PROVEN LIVE — never from silence.
+
+        This used to return ``r.stdout.split()`` on rc 0, so an empty result meant "clean slate". By this
+        function's OWN stated standard that is already the raise branch: the reaper promises to raise
+        "rather than reap nothing and report success", and a vacuously-empty listing does exactly that.
+        It CERTIFIED BY SILENCE. Refusing outright was rejected too — a reaper that will not run on a
+        genuinely empty host is obviously wrong. So neither: the listing is UNFILTERED and matched
+        in-process, and the witness turns "empty" into PROVEN empty, at which point proceeding is sound.
+        """
         try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=30,
+            r = subprocess.run(listing_argv(rt, kind), capture_output=True, text=True, timeout=30,
                                env=runtime_client_env())
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
             raise SandboxLeakError(
-                f"orphan reaper could not list {what} ({exc!r}) — cannot confirm a clean slate"
+                f"orphan reaper could not list {what} ({type(exc).__name__}) — cannot confirm a clean slate"
             ) from exc
         if r.returncode != 0:
             raise SandboxLeakError(
                 f"orphan reaper list of {what} returned {r.returncode} — cannot confirm a clean slate")
-        return r.stdout.split()
+        listed = r.stdout.split()
+        if witness not in listed:
+            raise SandboxLeakError(
+                f"orphan reaper's {what} listing did not contain its witness — the channel is not proven "
+                "live, so an empty result proves nothing. Cannot confirm a clean slate")
+        return [n for n in listed if n.startswith(_PREFIX)]
 
     def _rm(args: list[str]) -> None:
         # best-effort removal; a raw TimeoutExpired/OSError from rm would ESCAPE the reaper's
@@ -260,18 +334,32 @@ def reap_orphans(runtime: str = "podman") -> None:
         except (OSError, subprocess.SubprocessError):
             pass
 
-    for c in _names([rt, "ps", "-a", "--filter", f"name={_PREFIX}", "--format", "{{.Names}}"],
-                    "containers"):
-        _rm([rt, "rm", "-f", c])
-        if probe_existence([rt, "ps", "-a", "--filter", f"name=^{c}$", "--format", "{{.Names}}"],
-                           c) is not Existence.ABSENT:
-            raise SandboxLeakError(f"orphan reaper could not CONFIRM container {c} destroyed")
-    for n in _names([rt, "network", "ls", "--filter", f"name={_PREFIX}", "--format", "{{.Name}}"],
-                    "networks"):
-        _rm([rt, "network", "rm", "-f", n])
-        if probe_existence([rt, "network", "ls", "--filter", f"name=^{n}$", "--format", "{{.Name}}"],
-                           n) is not Existence.ABSENT:
-            raise SandboxLeakError(f"orphan reaper could not CONFIRM network {n} destroyed")
+    # Normalised into the reaper's OWN fail-closed contract, exactly as RuntimePathUnresolved is above:
+    # a caller that cannot obtain a witness is in precisely the state this function promises to refuse.
+    # The TYPE is shared; the MESSAGE is not — "not in the supported set" must never read as "witness not
+    # found", because the second is indistinguishable from a broken channel.
+    try:
+        image_id = resolve_image_id(rt, canary_image)
+    except ImageResolutionError as exc:
+        raise SandboxLeakError(
+            f"orphan reaper could not resolve its canary image {canary_image!r} LOCALLY ({exc}) — the "
+            "container witness cannot be created, so an empty listing would prove nothing. Resolution is "
+            "local-only BY CONTRACT: the image must already be present, it is never pulled"
+        ) from exc
+    witness = ensure_container_witness(rt, image_id, uuid.uuid4().hex[:16])
+    try:
+        for c in _names(ResourceKind.CONTAINER, "containers", witness):
+            if c == witness:
+                continue  # the reaper's own witness is not an orphan
+            _rm([rt, "rm", "-f", c])
+            if probe_container(rt, c, witness=witness).state is not Existence.ABSENT:
+                raise SandboxLeakError(f"orphan reaper could not CONFIRM container {c} destroyed")
+        for n in _names(ResourceKind.NETWORK, "networks", net_witness):
+            _rm([rt, "network", "rm", "-f", n])
+            if probe_network(rt, n, runtime_name=runtime).state is not Existence.ABSENT:
+                raise SandboxLeakError(f"orphan reaper could not CONFIRM network {n} destroyed")
+    finally:
+        _rm([rt, "rm", "-f", witness])
 
 
 class NetworkIsolationError(Exception):
@@ -334,8 +422,11 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         # artifact, proxy and escape-probe containers ALL execute this same digest (one consistent
         # snapshot — no swap between resolving the proxy and running the artifact).
         image_id = resolve_image_id(self._exec_runtime(), self.image)
-        snapshot = Path(tempfile.mkdtemp(prefix=f"{_PREFIX}obs-"))
         rid = uuid.uuid4().hex[:16]
+        # The canary's rid is DERIVED from the session rid, not a second uuid4: a leaked canary must be
+        # correlatable by name to the session that leaked it. Reaping is not diagnosis.
+        self._witness = ensure_container_witness(self._exec_runtime(), image_id, rid)
+        snapshot = Path(tempfile.mkdtemp(prefix=f"{_PREFIX}obs-"))
         # _PREFIX is the SINGLE SOURCE: reap_orphans selects orphans by ``--filter name={_PREFIX}``,
         # so a name that does not derive from it is a resource the reaper cannot see.
         network = f"{_PREFIX}net-{rid}"
@@ -365,13 +456,28 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
             # list is authority, not decoration. If cleanup cannot PROVE the infra gone (EXISTS/UNKNOWN),
             # surface the lifecycle-containment failure rather than swallow it behind the setup error —
             # keeping the original setup exception as the cause for diagnosis.
-            survivors = self._teardown_infra(network, proxy)
+            report = self._teardown_infra(network, proxy)
             shutil.rmtree(snapshot, ignore_errors=True)
-            if survivors:
-                raise SandboxLeakError(
-                    f"partial-setup teardown left survivors {survivors}; "
-                    f"original setup error: {setup_exc!r}"
-                ) from setup_exc
+            # THE ORIGINAL SETUP EXCEPTION IS THE CERTAIN FACT and stays the primary. Cleanup trouble is
+            # ATTACHED, never promoted to the headline: an earlier version raised SandboxLeakError here
+            # and demoted the real cause to __cause__, so any caller branching on exception type
+            # misclassified the event — and when the cleanup "trouble" was merely an uncalibrated probe,
+            # the headline asserted a leak that no measurement supported.
+            #
+            # ``except BaseException`` catches KeyboardInterrupt and SystemExit too. Those must propagate
+            # AS THEMSELVES; a note is attached rather than the exception being supplanted.
+            if report:
+                causes = f" [cause: {'; '.join(report.causes)}]" if report.causes else ""
+                detail = (f"partial-setup cleanup: OBSERVED TO PERSIST {report.present}" if report.present
+                          else f"partial-setup cleanup: UNPROVEN {report.unproven} (destruction "
+                               "attempted; the probe could not answer — no claim that anything "
+                               "survived)") + causes
+                if isinstance(setup_exc, (KeyboardInterrupt, SystemExit)):
+                    _add_note(setup_exc, detail)
+                    raise
+                if report.present:
+                    raise SandboxLeakError(f"{detail}; original setup error: {setup_exc!r}") from setup_exc
+                _add_note(setup_exc, detail)
             raise
         return ObservedHandle(
             id=uuid.uuid4().hex, artifact_hash=artifact.tree_hash, snapshot=snapshot,
@@ -420,13 +526,41 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
     # -- teardown: converge THREE resources to all-gone, verify, or leak ---------
     def teardown(self, handle: SandboxHandle) -> None:
         if not isinstance(handle, ObservedHandle):
+            # A FOREIGN HANDLE IS A PROGRAMMING ERROR, NOT A NO-OP — see OCISandbox.teardown. The silent
+            # return reported verified destruction for work never attempted.
+            raise TypeError(
+                f"{type(self).__name__}.teardown was given a {type(handle).__name__}, which it cannot "
+                "tear down. Returning silently would report success for work never attempted"
+            )
+        prior = self._replay_verdict(handle.id, handle.container)
+        if prior is not None:
+            # REPLAY, not a fresh assertion. Teardown is idempotent, so a repeat must not re-probe — the
+            # witness is gone by then and every resource would come back unproven, turning a defensive
+            # ``finally: teardown()`` into an error generator. But a stored verdict is a claim about a
+            # PAST moment, so it is returned AS a replay: reconstructed from data, and stamped with WHEN
+            # it was measured. Presenting a cached verdict as a current observation is the same confusion
+            # this increment exists to close.
+            replayed = prior.replay()
+            if replayed is not None:
+                raise replayed
             return
+        # ⚠ ``None`` UNTIL A VERDICT IS ACTUALLY REACHED — THE P1-2 FIX, and the reason it is a sentinel
+        # rather than a seeded pair of empty lists. The previous shape initialised ``present``/``unproven``
+        # to ``[]`` and let the ``finally`` block read them; any unanticipated exception out of the sweep
+        # left those empties untouched and the tombstone recorded them as "nothing present, nothing
+        # unproven" — a CLEAN certificate for a computation that never took a reading. The witness was
+        # then dropped and the snapshot deleted, and the next teardown returned silently. VERIFIED LIVE
+        # before the fix: 1st raised · witness → None · tombstone (clean) · 2nd returned silently.
+        verdict: TeardownVerdict | None = None
         try:
-            survivors = self._teardown_infra(handle.network, handle.proxy, handle.container)
-            if survivors:
-                raise SandboxLeakError(f"survived teardown: {survivors}")
+            verdict = self._verdict_for(
+                handle.container,
+                self._teardown_infra(handle.network, handle.proxy, handle.container))
         finally:
-            _rmtree_resilient(handle.snapshot)
+            # Finalisation runs whether or not the sweep raised — and the RAISE now happens after it, so
+            # cleanup notes are complete before any exception is constructed. See OCISandbox.teardown.
+            verdict = self._finalise(verdict, handle.id, handle.container, handle.snapshot)
+        self._surface(verdict)
 
     # -- infra helpers -----------------------------------------------------------
     def _create_network(self, name: str) -> None:
@@ -487,19 +621,110 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         final = self._read_count(h.proxy)
         return (final - h.baseline) if final is not None else None
 
-    def _teardown_infra(self, network: str, proxy: str, sandbox: str | None = None) -> list[str]:
+    def _teardown_infra(
+        self, network: str, proxy: str, sandbox: str | None = None
+    ) -> _SweepReport:
+        """Destroy, then report PROVEN-PRESENT and UNPROVEN separately — never as one list.
+
+        DESTRUCTION IS ALWAYS ATTEMPTED, including when the instrument is uncalibrated: an unreadable
+        probe is a reason to distrust the report, never a reason to skip the work.
+
+        ⚠ ORDER, stated correctly here after the previous version's rationale went stale. EVERY DESTROY
+        RUNS FIRST, in a loop of its own, BEFORE any probe. So a raise from inside the probe loop cannot
+        abort a destroy — the destroys are already done. What it would abort is the remaining PROBES, and
+        that is still the reason calibration is checked once at entry rather than per probe: an
+        uncalibrated sweep must produce a full, honestly-labelled report rather than a partial one.
+
+        The split is the whole point. ``EXISTS`` is an answer about the SUBJECT: this resource was
+        observed to persist. ``UNKNOWN`` is a report about the INSTRUMENT: nothing could be observed.
+        The earlier version returned one list containing both, so a dead canary made every resource a
+        "survivor" and raised a leak alarm on a session that may have been destroyed perfectly.
+        """
         for name in (sandbox, proxy):
             if name:
                 self._force_remove(name)
         self._force_remove_network(network)
-        # a SURVIVOR is any of the three resources we cannot PROVE gone — EXISTS or UNKNOWN (the probe timed
-        # out / errored / returned non-zero). Only a probed ABSENT clears a resource; a fail-open "can't tell
-        # -> gone" would let a container or the sealed network outlive its verdict.
-        survivors = [n for n in (sandbox, proxy)
-                     if n and self._container_state(n) is not Existence.ABSENT]
-        if self._network_state(network) is not Existence.ABSENT:
-            survivors.append(network)
-        return survivors
+
+        names: list[tuple[str, bool]] = [(n, True) for n in (sandbox, proxy) if n]
+        names.append((network, False))
+        # The probe's OWN predicate, not a weaker paraphrase of it: a witness is a NON-EMPTY STRING.
+        # ``is None`` let an empty-string witness past this gate and into the loop, where the probe
+        # would raise ``WitnessNotProvisioned`` — the precondition failure the entry check exists to
+        # make unreachable.
+        if not isinstance(self._witness, str) or not self._witness:
+            # Uncalibrated: the destroys above still ran. Nothing is claimed about what remains.
+            return _SweepReport(
+                [], [n for n, _ in names],
+                ["no container witness was provisioned, so no probe could be calibrated"],
+            )
+
+        report = _SweepReport([], [], [])
+        for name, is_container in names:
+            try:
+                # The probe RETURNS its cause — a caller cannot opt out of diagnosability, so there is
+                # no site at which the same UNKNOWN is mute. Three different failures used to arrive as
+                # one silent value; they are now three enum members, deduplicated onto the aggregate.
+                reading = (self._container_state(name) if is_container
+                           else self._network_state(name))
+            except UnsupportedRuntimeWitness as exc:
+                # A WHOLE-KIND condition reported as per-item data was the shape here before: this
+                # runtime has no measured ambient network, so EVERY network probe is refused for the
+                # same single reason, and marking each one "unproven" with no cause left the operator
+                # reading N mysteries instead of one stated fact. The item is still unproven; the CAUSE
+                # travels on the aggregate, where it is true exactly once.
+                report.unproven.append(name)
+                cause = f"{type(exc).__name__}: {exc}"
+                if cause not in report.causes:
+                    report.causes.append(cause)
+                continue
+            # ⚠ ``WitnessNotProvisioned`` IS DELIBERATELY NOT CAUGHT HERE. The entry check above makes it
+            # unreachable, so catching it would re-quiet a LOGIC error into a per-item UNKNOWN — a
+            # precondition failure wearing the costume of a measurement. If it ever fires, it propagates,
+            # the sweep records an INCOMPLETE verdict, and the witness and snapshot are retained for the
+            # re-probe. That is the fail-closed answer; a quiet UNKNOWN is not.
+            if reading.state is Existence.EXISTS:
+                report.present.append(name)
+            elif reading.state is not Existence.ABSENT:
+                report.unproven.append(name)
+                cause = reading.describe()
+                if cause and cause not in report.causes:
+                    report.causes.append(cause)
+        return report
+
+    def _verdict_for(self, subject: str, report: _SweepReport) -> TeardownVerdict:
+        """The verdict for a sweep that COMPLETED — one composition site for live and replayed text.
+
+        Composing them separately is how the replayed leak message came to drop the unproven list: the
+        same event read as strictly less on the second call than on the first.
+        """
+        detail_causes = f" — cause: {'; '.join(report.causes)}" if report.causes else ""
+        if report.present:
+            return TeardownVerdict(
+                VerdictKind.LEAK,
+                f"OBSERVED TO PERSIST after teardown: {report.present} — a proven leak on a channel "
+                f"proven live"
+                f"{f'; additionally UNPROVEN: {report.unproven}' if report.unproven else ''}"
+                f"{detail_causes}",
+                time.time(),
+                subject,
+            )
+        if report.unproven:
+            return TeardownVerdict(
+                VerdictKind.UNVERIFIED,
+                f"teardown could not be VERIFIED for {report.unproven} — destruction was attempted, but "
+                f"the probe could not answer. This is a report about the instrument, NOT a claim that "
+                f"anything survived{detail_causes}",
+                time.time(),
+                subject,
+            )
+        return TeardownVerdict(VerdictKind.CLEAN, "all observed infra verified ABSENT",
+                               time.time(), subject)
+
+    def _drop_witness(self) -> None:
+        """Destroy this session's container witness (see OCISandbox._drop_witness)."""
+        if self._witness is not None:
+            self._force_remove(self._witness)
+            self._witness = None
 
     def _force_remove(self, name: str) -> None:
         # best-effort; the destruction AUTHORITY is the tri-state probe (a non-zero rm re-probes, fails closed).
@@ -516,13 +741,11 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         except (OSError, subprocess.SubprocessError):
             pass
 
-    def _container_state(self, name: str) -> Existence:
-        return probe_existence(
-            [self._exec_runtime(), "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"], name)
+    def _container_state(self, name: str) -> ProbeReading:
+        return probe_container(self._exec_runtime(), name, witness=self._witness)
 
-    def _network_state(self, name: str) -> Existence:
-        return probe_existence(
-            [self._exec_runtime(), "network", "ls", "--filter", f"name=^{name}$", "--format", "{{.Name}}"], name)
+    def _network_state(self, name: str) -> ProbeReading:
+        return probe_network(self._exec_runtime(), name, runtime_name=self._runtime)
 
     def _result(self, outcome: _Outcome, exit_code: int | None, egress: int | None,
                 handle: ObservedHandle, raw: int | None = None) -> ExecutionResult:
