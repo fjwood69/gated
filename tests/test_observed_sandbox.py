@@ -14,7 +14,9 @@ from core import (
 )
 from sandbox.noop import NoOpSandbox
 import subprocess
+import uuid
 
+from sandbox.oci import ensure_container_witness, probe_container, probe_network
 from sandbox.observed import ObservedHandle, ObservedOCISandbox, reap_orphans
 from core import Existence as _Existence
 
@@ -42,12 +44,30 @@ def _artifact(script: str) -> ArtifactSpec:
     return ArtifactSpec(path=d, tree_hash=tree_hash(d))
 
 
-def _exists_(sb, name):  # test helper: True iff the tri-state probe says EXISTS (healthy runtime)
-    return sb._container_state(name) is _Existence.EXISTS
+def _exists_(sb, name):
+    """True iff the probe says EXISTS, ON A CHANNEL PROVEN LIVE FOR THIS CALL.
+
+    The old version claimed "True iff the tri-state probe says EXISTS (healthy runtime)" and probed
+    whatever witness the instance happened to hold. On an instance that has not run ``prepare()`` there
+    is none, so it reported False for a container that demonstrably existed — the helper was itself an
+    artifact credited with a property it did not have, inside a suite that checks for exactly that.
+
+    It now PROVISIONS ITS OWN WITNESS for the duration of the call. Note what that costs: this helper is
+    no longer free, and it can raise ``WitnessProvisioningError`` if the runtime cannot create or list a
+    canary. That is the honest failure — it means the assertion below it could not have been trusted.
+    """
+    rt = sb._exec_runtime()
+    witness = ensure_container_witness(rt, IMAGE, uuid.uuid4().hex[:16])
+    try:
+        return probe_container(rt, name, witness=witness).state is _Existence.EXISTS
+    finally:
+        subprocess.run([rt, "rm", "-f", witness], capture_output=True, timeout=30)
 
 
 def _net_exists_(sb, name):
-    return sb._network_state(name) is _Existence.EXISTS
+    """Network kind. Its witness is the runtime's MEASURED ambient network, which always exists and costs
+    nothing to provision — so unlike the container helper above, this one needs no canary."""
+    return probe_network(sb._exec_runtime(), name, runtime_name=sb.runtime).state is _Existence.EXISTS
 
 
 @unittest.skipUnless(_HAVE, f"no OCI runtime can run {IMAGE} hermetically")
@@ -123,7 +143,7 @@ class ObservedSandboxTests(unittest.TestCase):
         subprocess.run([rt, "run", "-d", "--network", net, "--name", ctr, IMAGE, "sleep", "120"],
                        capture_output=True, timeout=60)
         self.assertTrue(_exists_(self.sb, ctr))  # type: ignore[attr-defined]
-        reap_orphans(rt)
+        reap_orphans(rt, canary_image=IMAGE)
         self.assertFalse(_exists_(self.sb, ctr), "reaper removes orphan container")  # type: ignore[attr-defined]
         self.assertFalse(_net_exists_(self.sb, net), "reaper removes orphan network")  # type: ignore[attr-defined]
 

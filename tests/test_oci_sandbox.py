@@ -8,6 +8,7 @@ Base image must contain a Python interpreter (the artifacts run `python3 /artifa
 from __future__ import annotations
 
 import subprocess
+import uuid
 import tempfile
 import time
 import unittest
@@ -24,7 +25,12 @@ from core import (
     tree_hash,
 )
 from sandbox.noop import NoOpSandbox
-from sandbox.oci import OCIHandle, OCISandbox
+from sandbox.oci import (
+    OCIHandle,
+    OCISandbox,
+    ensure_container_witness,
+    probe_container,
+)
 from core import Existence as _Existence
 
 IMAGE = "localhost/mori:local"  # local, has python3 (3.13) — the test base image
@@ -40,8 +46,20 @@ def _artifact(script: str) -> ArtifactSpec:
     return ArtifactSpec(path=d, tree_hash=tree_hash(d))
 
 
-def _exists_(sb, name):  # test helper: True iff the tri-state probe says EXISTS (healthy runtime)
-    return sb._container_state(name) is _Existence.EXISTS
+def _exists_(sb, name):
+    """True iff the probe says EXISTS, ON A CHANNEL PROVEN LIVE FOR THIS CALL.
+
+    A SECOND COPY of the helper fixed in test_observed_sandbox.py — found by the full suite, not by the
+    fix. Rule 2 in miniature: repairing one site says nothing about the other, and this one kept probing
+    with whatever witness the instance happened to hold (none, on an unprepared one), reporting False for
+    a container that demonstrably existed. It provisions its own witness for the duration of the call.
+    """
+    rt = sb._exec_runtime()
+    witness = ensure_container_witness(rt, IMAGE, uuid.uuid4().hex[:16])
+    try:
+        return probe_container(rt, name, witness=witness).state is _Existence.EXISTS
+    finally:
+        subprocess.run([rt, "rm", "-f", witness], capture_output=True, timeout=30)
 
 
 @unittest.skipUnless(_HAVE_OCI, f"no OCI runtime can run {IMAGE} hermetically")

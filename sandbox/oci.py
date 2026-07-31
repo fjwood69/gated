@@ -37,11 +37,15 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from core import (
     ArtifactHashMismatchError,
@@ -52,10 +56,17 @@ from core import (
     Fixtures,
     ImageResolutionError,
     IsolationLevel,
+    ReplayedSandboxLeak,
+    ReplayedTeardownIncomplete,
+    ReplayedTeardownUnverifiable,
     ResourceBudget,
     Sandbox,
     SandboxHandle,
     SandboxLeakError,
+    TeardownCleanupError,
+    TeardownError,
+    TeardownIncompleteError,
+    TeardownUnverifiableError,
     tree_hash,
 )
 from sandbox.base import BaseSandbox
@@ -271,6 +282,132 @@ def _resolved_or_none(runtime: str) -> str | None:
     return path if os.path.isabs(path) else None
 
 
+class VerdictKind(Enum):
+    """What a completed teardown established. FOUR states, because the first version had three and used
+    one of them for two different things.
+
+    ``CLEAN`` and ``LEAK`` are answers about the SUBJECT. ``UNVERIFIED`` is a report about the
+    INSTRUMENT — the sweep ran and the probe could not answer. ``INCOMPLETE`` is a report about the
+    COMPUTATION: no reading was taken at all, because the sweep raised somewhere unanticipated. Absence
+    of a measurement and a measurement of absence are different facts, one level up from where this
+    increment started."""
+
+    CLEAN = "clean"
+    LEAK = "leak"
+    UNVERIFIED = "unverified"
+    INCOMPLETE = "incomplete"
+
+
+# The verdict → exception mapping, in ONE place and split by whether the verdict is being raised LIVE or
+# REPLAYED. ``INCOMPLETE`` deliberately has no live entry: the first teardown never raises it, because the
+# exception that crashed the sweep is the certain fact and must stay primary. It exists only so the
+# REPEAT cannot read a crash as a clean result.
+_LIVE_VERDICT_EXC: dict[VerdictKind, type[TeardownError]] = {
+    VerdictKind.LEAK: SandboxLeakError,
+    VerdictKind.UNVERIFIED: TeardownUnverifiableError,
+    # INCOMPLETE IS MAPPED NOW. It used to be deliberately absent, on the reasoning that a crash is
+    # always propagating and must stay primary. True when one IS propagating — and ``_crashed_verdict``
+    # explicitly anticipates the case where none is. In that case the old code returned None and the
+    # fall-through surfaced as nothing. ``live()`` gates on ``crash_in_flight``, not on the map.
+    VerdictKind.INCOMPLETE: TeardownIncompleteError,
+}
+_REPLAY_VERDICT_EXC: dict[VerdictKind, type[TeardownError]] = {
+    VerdictKind.LEAK: ReplayedSandboxLeak,
+    VerdictKind.UNVERIFIED: ReplayedTeardownUnverifiable,
+    VerdictKind.INCOMPLETE: ReplayedTeardownIncomplete,
+}
+
+
+@dataclass
+class TeardownVerdict:
+    """A teardown outcome recorded AS DATA — never as a live exception object held for re-raising.
+
+    Holding the exception was four defects wearing one coat: replays accumulate tracebacks on a shared
+    object; ``__notes__`` written by whoever caught it last leak into the next raise; the stored message
+    was composed SEPARATELY from the live one and understated it (the leak replay dropped the unproven
+    list entirely, so the same event read differently on the second call); and one mutable object is
+    shared by every caller that ever catches it.
+
+    ``when`` is CONSUMED, not merely recorded: it is rendered into the replayed message. A field written
+    by one side and read by nobody is the seed of the next credited-property defect — this increment has
+    found five of those, and a timestamp that no output can show is the same shape.
+    """
+
+    kind: VerdictKind
+    detail: str
+    when: float
+    # WHAT THIS VERDICT IS ABOUT — REQUIRED, no default, and that is the fix rather than a nicety. The
+    # store is keyed by handle id alone, and a replay matching only on the key would certify THIS handle
+    # from a measurement of ANOTHER, silently, on the clean path. My first attempt added the field with
+    # a ``""`` default and guarded with ``if prior.subject and …`` — which makes a subject-less verdict
+    # REPRESENTABLE and then declines to check it: a fail-closed control with a representable skip
+    # state is fail-open by construction. I had written "positive shape, not truthiness" in this very
+    # increment. Required-by-contract removes the skip state instead of testing for it.
+    subject: str
+    notes: list[str] = field(default_factory=list)
+    # Was a crash genuinely propagating when this INCOMPLETE was minted? Only then may ``live()`` stay
+    # silent — because only then is there a primary exception to defer to. ``_crashed_verdict``
+    # explicitly anticipates the other case ("no exception was in flight"), and in THAT case silence
+    # would mean a fall-through bug surfaces as nothing at all.
+    crash_in_flight: bool = False
+
+    def live(self) -> TeardownError | None:
+        """The exception to raise on the FIRST teardown, or ``None`` when the verdict is clean.
+
+        ``CLEAN`` and ``INCOMPLETE`` are the ONLY silent kinds, and they are named rather than
+        defaulted. A kind missing from the map used to fall out as ``None`` — silence — so ADDING a
+        verdict kind and forgetting the map entry would have created a third quiet path in the one
+        place quiet paths are the subject. Now that is a loud failure at the moment of the omission.
+        """
+        if self.kind is VerdictKind.CLEAN:
+            return None
+        if self.kind is VerdictKind.INCOMPLETE and self.crash_in_flight:
+            # ONLY here. The crash is the certain fact and stays primary; the verdict is recorded, not
+            # raised. A CRASHLESS incomplete has no primary to defer to, so silence there would let a
+            # fall-through bug surface as nothing — fail-closed must be LOUD.
+            return None
+        exc_type = _LIVE_VERDICT_EXC.get(self.kind)
+        if exc_type is None:
+            raise AssertionError(
+                f"no LIVE exception is mapped for verdict kind {self.kind!r} — a new kind was added "
+                "without deciding how it surfaces, and returning None here would make it silent")
+        return exc_type(self._with_notes())
+
+    def replay(self) -> TeardownError | None:
+        """The exception to raise on a REPEAT teardown, reconstructed fresh and STAMPED as a replay.
+
+        A stored verdict is a claim about a past moment. Presenting it as a current observation is the
+        same confusion this increment exists to close, so the moment of measurement is in the message.
+        """
+        if self.kind is VerdictKind.CLEAN:
+            return None
+        exc_type = _REPLAY_VERDICT_EXC.get(self.kind)
+        if exc_type is None:
+            raise AssertionError(
+                f"no REPLAY exception is mapped for verdict kind {self.kind!r} — an unmapped kind "
+                "would replay as SILENCE, which is the defect this type exists to prevent")
+        stamp = datetime.fromtimestamp(self.when, tz=timezone.utc).isoformat(timespec="seconds")
+        return exc_type(
+            f"{self._with_notes()} [REPLAYED verdict — MEASURED AT {stamp}, not re-probed now]"
+        )
+
+    def _with_notes(self) -> str:
+        """The detail plus any cleanup notes — ONE composition site, used by both surfaces.
+
+        Notes used to be rendered by ``replay()`` alone, so a note recorded during cleanup reached an
+        operator only if someone happened to tear down twice. On a CLEAN verdict it reached nobody at
+        all, because both surfaces return ``None`` before formatting: a field written by one side and
+        read by no one, which is this increment's own defect class inside its own failure machinery.
+        """
+        if not self.notes:
+            return self.detail
+        return f"{self.detail} [also: {'; '.join(self.notes)}]"
+
+    def cleanup_failed(self) -> bool:
+        """Did post-verdict cleanup record a problem? The CLEAN path's only way to be heard."""
+        return bool(self.notes)
+
+
 class _ResolvedRuntimeMixin:
     """The exec boundary for the OCI-family backends — ONE implementation, mixed into both.
 
@@ -281,6 +418,165 @@ class _ResolvedRuntimeMixin:
 
     _runtime: str
     _runtime_path: str
+    # The container-kind witness for this session. Class-level default "" on purpose: an instance built
+    # via __new__ (as argv-shape tests do) has NO witness. The sentinel is None rather than "" so that
+    # NEVER-PROVISIONED and SPENT cannot share a representation, and so an accidental empty witness
+    # RAISES (WitnessNotProvisioned) rather than silently degrading to UNKNOWN.
+    _witness: str | None = None
+
+    def _verdict_store(self) -> dict[str, TeardownVerdict]:
+        """Per-instance tombstones, created lazily. Values are DATA — see ``TeardownVerdict``.
+
+        NOT a class-level ``= {}``: that is one dict SHARED BY EVERY INSTANCE, so a verdict recorded by
+        one sandbox would be replayed by another. ``__init__`` would shadow it for normally-constructed
+        objects and hide the bug, leaving it live only for ``__new__``-built ones — which is exactly the
+        construction path this increment already learned to distrust.
+        """
+        store: dict[str, TeardownVerdict] | None = self.__dict__.get("_verdicts")
+        if store is None:
+            store = {}
+            self.__dict__["_verdicts"] = store
+        return store
+
+    def _replay_verdict(self, handle_id: str, subject: str) -> TeardownVerdict | None:
+        """The recorded verdict for this handle, or ``None`` if it has not been torn down.
+
+        REFUSES on a subject mismatch rather than replaying. A stored verdict answers a question about
+        a NAMED resource; matching on the key alone would let a handle inherit a clean certificate
+        earned by a different one. Fail-closed: the mismatch itself is unverifiable, not clean.
+        """
+        prior = self._verdict_store().get(handle_id)
+        if prior is not None and prior.subject != subject:
+            raise TeardownUnverifiableError(
+                f"a verdict is recorded under handle id {handle_id!r} for subject {prior.subject!r}, "
+                f"but this teardown is for {subject!r}. Replaying it would certify one resource from a "
+                "measurement of another — refusing; re-probe with a fresh handle")
+        return prior
+
+    def _crashed_verdict(self, subject: str) -> TeardownVerdict:
+        """The verdict for a sweep that RAISED before it reached one.
+
+        The whole point of a distinct kind. The alternative — which shipped — was to leave the result
+        lists at their empty initial values and let the ``finally`` block read those empties as
+        "nothing present, nothing unproven", i.e. CLEAN. A crashed computation then held a permanent
+        clean certificate, and the next teardown returned silently.
+
+        ⚠ THE CAUSE IS CAPTURED, and the first version of this method did not capture it. It took only
+        a subject name, so the ``TeardownIncompleteError`` a repeat call raises could not name what went
+        wrong — at exactly the boundary where the crash is the ONLY fact anyone has. Building the
+        diagnostic plumbing for ``UNKNOWN`` while composing a message that excluded its own cause by
+        construction is the same defect, one method along. ``sys.exc_info()`` is read rather than passed
+        in, so no caller can forget to supply it.
+
+        ⚠ AND THE WORDING WAS AN OVERCLAIM. It said "nothing was measured". That is not knowable here:
+        the sweep destroys everything BEFORE it probes, so a crash may follow partial destruction and
+        partial measurement. What is true is that no verdict was REACHED — which is a statement about
+        the computation, and the only one this method is entitled to make.
+        """
+        exc = sys.exc_info()[1]
+        cause = (f"{type(exc).__name__}: {exc}" if exc is not None
+                 else "NO EXCEPTION WAS IN FLIGHT — the verdict was never assigned, which is a "
+                      "fall-through bug in teardown itself and has no primary error to defer to")
+        return TeardownVerdict(
+            VerdictKind.INCOMPLETE,
+            f"teardown of {subject} CRASHED MID-SWEEP and NEVER REACHED A VERDICT — destruction may "
+            f"have partially run and some resources may have been probed, but no verdict was reached, "
+            f"so nothing is claimed either way. Cause: {cause}. The witness and the snapshot are "
+            "RETAINED deliberately: they are what a re-probe needs",
+            time.time(),
+            subject,
+            crash_in_flight=exc is not None,
+        )
+
+    def _finalise(self, verdict: TeardownVerdict | None, handle_id: str, subject: str,
+                  snapshot: Path) -> TeardownVerdict:
+        """Record the verdict and run post-verdict cleanup. Returns the verdict actually stored.
+
+        Runs from the ``finally`` of both teardowns, so it must not raise: the sweep's own exception (if
+        any) is the certain fact. Every cleanup failure lands as a note on the verdict, and the caller
+        decides how to surface it once the unwinding is over.
+        """
+        if verdict is None:
+            verdict = self._crashed_verdict(subject)
+        # TOMBSTONE FIRST, CLEAN UP SECOND. Recording last meant that anything raising during cleanup
+        # LOST the verdict entirely, and the next teardown re-probed with a spent witness. The store
+        # holds the same object the cleanup below annotates, so notes still reach it.
+        self._verdict_store()[handle_id] = verdict
+        if verdict.kind is VerdictKind.CLEAN:
+            self._release_witness(verdict)
+        self._dispose_snapshot(snapshot, verdict)
+        return verdict
+
+    def _drop_witness(self) -> None:
+        """Destroy this session's witness. Implemented by each backend (each owns its own removal).
+
+        Declared here because ``_release_witness`` below calls it: without the declaration the mixin
+        would be reaching for an attribute it does not define, which ``mypy --strict`` correctly refuses
+        — and which would fail at runtime for any future mixee that forgot to provide one.
+        """
+        raise NotImplementedError
+
+    def _surface(self, verdict: TeardownVerdict) -> None:
+        """Raise whatever a FINALISED verdict has to say — the one place teardown becomes loud.
+
+        Called AFTER the ``finally`` block, so ``verdict.notes`` are complete and reach the exception.
+        Two things can need surfacing and they are different claims:
+
+          * the verdict itself (LEAK / UNVERIFIED / a crashless INCOMPLETE) — about the measurement;
+          * a cleanup failure on an otherwise CLEAN verdict — about what happened AFTER it.
+
+        The second used to reach nobody: notes were rendered only by ``replay()``, and ``replay()``
+        returns early for CLEAN. So a failed witness release on a clean teardown was written into a
+        field with no consumer — this module's own defect class, inside its own failure machinery. The
+        verdict is NOT reclassified: the measurement was clean and stays clean in the tombstone, so a
+        repeat replays clean and silent. This fires once, on the call that actually did the cleanup.
+        """
+        live = verdict.live()
+        if live is not None:
+            raise live
+        if verdict.cleanup_failed():
+            raise TeardownCleanupError(
+                f"{verdict.detail} — the verdict is CLEAN and stands, but POST-VERDICT CLEANUP FAILED: "
+                f"{'; '.join(verdict.notes)}")
+
+    def _release_witness(self, verdict: TeardownVerdict) -> None:
+        """Drop the session witness on a clean verdict — and NEVER let that failing lose the verdict.
+
+        The asymmetry this closes was in my own code: ``_dispose_snapshot`` right below was guarded and
+        this call was BARE, three lines apart. A raise here (an unresolvable runtime, a client error)
+        after the tombstone is stored leaves a verdict that says CLEAN, a witness still alive, and
+        nothing recording that the release failed. That surviving canary is not merely a leaked
+        resource: it is the precondition for the namesake-collision state on the next session that
+        draws the same rid — now certified clean.
+        """
+        try:
+            self._drop_witness()
+        except Exception as exc:  # noqa: BLE001 — a cleanup failure must never lose the verdict
+            verdict.notes.append(f"witness release FAILED: {type(exc).__name__} — canary may survive")
+
+    def _dispose_snapshot(self, snapshot: Path, verdict: TeardownVerdict) -> None:
+        """Delete the session snapshot — but ONLY on a verdict that was actually reached.
+
+        RULED, and the ruling is the reason this is a method rather than a bare call. On a PROVEN leak
+        (``EXISTS`` survivors) deleting the snapshot is intended HYGIENE: the snapshot is ephemeral
+        scratch and the leak claim is about runtime resources, not about the staged tree. On any
+        non-clean, unverifiable or crashed path it is EVIDENCE DESTRUCTION — that is precisely the state
+        in which someone must re-probe, and destroying the tree removes what they would re-probe with.
+
+        And the removal cannot be allowed to REPLACE the finding. This runs inside ``finally``, so a
+        raise here supplants the in-flight verdict with a filesystem error: the leak alarm disappears and
+        an ``OSError`` arrives in its place. The failure is therefore attached to the verdict as a note
+        and the verdict wins. ``BaseException`` is deliberately NOT caught — ``KeyboardInterrupt`` must
+        still propagate as itself.
+        """
+        if verdict.kind not in (VerdictKind.CLEAN, VerdictKind.LEAK):
+            verdict.notes.append(
+                f"snapshot {snapshot} RETAINED for re-probe (verdict: {verdict.kind.value})")
+            return
+        try:
+            _rmtree_resilient(snapshot)
+        except Exception as exc:  # noqa: BLE001 — a cleanup failure must never mask the verdict
+            verdict.notes.append(f"snapshot cleanup failed: {type(exc).__name__}")
 
     def _exec_runtime(self) -> str:
         """``argv[0]`` for every runtime invocation — the resolved path, REFUSED if not absolute.
@@ -324,20 +620,362 @@ def detect_runtime(image: str) -> str:
     )
 
 
-def probe_existence(argv: list[str], name: str, *, timeout: float = 30.0) -> Existence:
-    """Probe whether the runtime resource ``name`` is listed by ``argv`` — the SHARED, fail-CLOSED existence
-    check for OCI + observed teardown/reap. EXISTS/ABSENT are returned ONLY on a query that actually ran
-    (return code 0); ANY inability to tell — an ``OSError``, a timeout / ``SubprocessError``, OR a NON-ZERO
-    return code (an empty stdout from a *failed* ``ps`` is not proof of absence) — is ``UNKNOWN``. Ephemerality
-    is security-critical, so a caller must treat ``UNKNOWN`` after teardown as a leak, never as 'gone'."""
+class ResourceKind(Enum):
+    """The kind of runtime resource a probe asks about. A probe is ALWAYS about one kind, and the kind
+    selects both the listing argv and the witness — so it may not be inferred from the name."""
+
+    CONTAINER = "container"
+    NETWORK = "network"
+
+
+class ProbeCause(Enum):
+    """WHY a probe returned ``UNKNOWN``. A CLOSED SET, and closed is the point.
+
+    There are exactly three ways to arrive at UNKNOWN and they demand different responses: the listing
+    never ran (check the client), it ran and failed (check the runtime), or it ran and answered without
+    the witness in it (something destroyed the canary — the only one that points at another actor).
+    Collapsing them into one silent value is the confusion this module exists to end, applied to its own
+    output; and reporting them as FREE TEXT would drift, because a string nobody can enumerate cannot be
+    exhaustively tested. An enum can: a test asserts all three are reachable and distinct.
+    """
+
+    LISTING_DID_NOT_RUN = "listing-did-not-run"
+    LISTING_EXITED_NONZERO = "listing-exited-nonzero"
+    WITNESS_NOT_IN_LISTING = "witness-not-in-listing"
+
+
+class ProbeReading(NamedTuple):
+    """A probe's answer AND why, together — so a mute reading is unrepresentable.
+
+    ⚠ THIS REPLACED AN OPTIONAL OUT-PARAMETER, and the reason is worth keeping. The first version
+    threaded an optional ``reasons`` list that callers could pass or omit, which made diagnosability a
+    PER-CALL-SITE CHOICE: the same UNKNOWN was diagnosable at one site and mute at another, and the
+    guarantee that every site passed it lived in prose rather than in the type. Rule 2 — a site that
+    threads it says nothing about the site that does not. Returning the cause makes omission impossible.
+
+    ``cause`` is ``None`` if and only if ``state`` is EXISTS or ABSENT: an answer about the subject needs
+    no excuse. ``detail`` carries a bounded fact (a return code, an exception type name) and NEVER the
+    listing content — the listing is unfiltered and holds names this process does not own.
+    """
+
+    state: Existence
+    cause: ProbeCause | None = None
+    detail: str = ""
+
+    def describe(self) -> str:
+        """One human-readable line naming the cause, for a verdict message. Empty when there is none."""
+        if self.cause is None:
+            return ""
+        return f"{self.cause.value}{f' ({self.detail})' if self.detail else ''}"
+
+
+# The UNFILTERED listing argv per kind. There is exactly ONE construction site per kind and callers cannot
+# reach it — see ``probe_existence``'s docstring for why the seam had to move.
+#
+# NB the ``--format`` field differs BY KIND: containers report ``{{.Names}}``, networks ``{{.Name}}``. A
+# future "harmonising" edit that unified them would silently empty one kind's listing — which under the
+# old code read as ABSENT. The per-kind witness is what catches that, and it is why the witness is not
+# optional.
+_LISTING: dict[ResourceKind, tuple[str, ...]] = {
+    ResourceKind.CONTAINER: ("ps", "-a", "--format", "{{.Names}}"),
+    ResourceKind.NETWORK: ("network", "ls", "--format", "{{.Name}}"),
+}
+
+# ⚠ THE AMBIENT NETWORK PER RUNTIME — MEASURED, NOT ASSUMED, AND THIS IS THE LINE THAT MATTERS.
+#
+# An earlier draft carried a single constant with a comment asserting it was "present on every supported
+# runtime". That was a claim in a comment with no evidence behind it, in a control — the exact defect
+# this increment exists to close, one layer along. Each entry below was MEASURED on the reference host on
+# 2026-07-31 by listing networks under that runtime:
+#
+#     podman 4.9.3 (rootless)  -> "podman"
+#     docker 29.6.2 (daemon reachable, rc 0) -> "bridge"
+#
+# ``nerdctl`` is DELIBERATELY ABSENT: it is not installed here, so its ambient network name could only be
+# guessed. A guessed entry in a witness map is the same defect as the constant it replaced. An
+# unsupported runtime therefore fails CLOSED at the lookup below — and it fails at the LOOKUP, before any
+# subprocess runs, so the error says "this runtime is not in the supported set" rather than "witness not
+# found". Those are different failures and must not share a message: the second is indistinguishable from
+# a broken channel, which is precisely the confusion this increment eliminates. ABSENCE OF SUPPORT AND
+# ABSENCE OF EVIDENCE MUST NOT LOOK ALIKE. Widen this map by MEASURING, never by inferring.
+#
+# ⚠ QUIET-DOWNGRADE HAZARD, stated HERE because this is the line someone edits when a runtime reports a
+# false failure. The witness works because the ambient network is AMBIENT and NOT REMOVABLE. Do not
+# "fix" a failing runtime by CREATING a network with this name — that converts a non-removable ambient
+# witness into an ordinary user object that can be deleted, silently downgrading the guarantee to nothing
+# while every test stays green. Measure the real name and add it here instead.
+_AMBIENT_NETWORK: dict[str, str] = {
+    "podman": "podman",
+    "docker": "bridge",
+}
+
+
+class WitnessProvisioningError(Exception):
+    """The container-kind witness could not be created, or was created and could not be SEEN.
+
+    A distinct type because a failure HERE is a failure of the instrument, before any measurement is
+    attempted — it must never be reported as, or be indistinguishable from, a fact about the subject.
+    The earlier version of this function swallowed creation failures and returned the name anyway, so a
+    session could carry a witness IN NAME ONLY: non-empty, so no emptiness guard caught it, and absent
+    from every listing, so every probe returned UNKNOWN and every resource was reported a survivor. That
+    manufactured a leak alarm no measurement supported."""
+
+
+class WitnessCreateFailed(WitnessProvisioningError):
+    """``create`` did not succeed — it raised, or exited non-zero with no namesake in the listing.
+
+    ⚠ THE GUARD THAT RAISES THIS IS LOAD-BEARING, AND I CONCLUDED OTHERWISE. My reasoning was that
+    "create failed yet the canary is visible" could not be constructed, which would make the return-code
+    check mere defence-in-depth behind bootstrap-verify. It is constructible, and THE DESIGN CONSTRUCTS
+    IT — see ``WitnessNameCollision``. The two guards are a PAIR and prove different things:
+
+        return code  ->  EXCLUSIVITY: THIS session created the container now bearing this name
+        bootstrap    ->  LIVENESS:    the listing channel can actually see it
+
+    Neither implies the other. Dropping the first admits an adopted namesake; dropping the second admits
+    a witness that exists but cannot be read. They are separate TYPES rather than one message so a test
+    can assert WHICH guard refused — asserting on prose would pin the wording, not the control."""
+
+
+class WitnessNameCollision(WitnessCreateFailed):
+    """``create`` exited non-zero AND a container by that name IS listed — a stale namesake exists.
+
+    THE STATE THE DISCHARGE NEVER CONSTRUCTED. Canary names are deterministic (``canary-{rid}``), leaked
+    canaries are ANTICIPATED (the reaper is unwired, so namesakes persist across sessions), and a
+    repeated rid therefore makes ``create`` fail on a name conflict WHILE the stale canary is listed.
+    Accept that and the guarantor adopts a witness it did not create, whose lifetime belongs to a dead
+    session and which some other actor may destroy mid-probe. The same shape arrives via a client-side
+    create timeout that completes daemon-side and is then retried, and via a multi-phase runtime wrapper.
+
+    Refusal is decided by the RETURN CODE alone; the listing is read only to name the failure correctly.
+    Reading it does not and cannot authorise adoption — an unrecognised namesake is refused either way."""
+
+
+class WitnessNotVisible(WitnessProvisioningError):
+    """The witness was created and the listing channel cannot see it — bootstrap-verify's refusal.
+
+    Creating it is not the same as being able to READ it. This is the calibration PROOF the first version
+    of the increment never had: it added the calibration CHECK at probe time and left the instrument
+    unverified until teardown, which is the worst possible moment to discover it was never on."""
+
+
+class WitnessNotProvisioned(Exception):
+    """A probe was asked for a verdict with no witness. A PRECONDITION failure, not an outcome.
+
+    Absence of CALIBRATION must not look like absence of EVIDENCE — the same distinction the board drew
+    for an unmeasured runtime, applied one level in. An uncalibrated instrument is not a quiet channel;
+    asking it a question is a category error, and the tri-state is an evidence-level type that cannot
+    express one. So this RAISES rather than returning UNKNOWN, and it raises BEFORE any subprocess."""
+
+
+class UnsupportedRuntimeWitness(OCIRuntimeUnavailable):
+    """No MEASURED ambient-network witness exists for this runtime, so a network probe cannot be trusted.
+
+    A subclass of ``OCIRuntimeUnavailable`` so existing fail-closed handlers already cover it.
+    """
+
+
+def ambient_network_witness(runtime_name: str) -> str:
+    """The measured ambient network for ``runtime_name``, or refuse.
+
+    Raises BEFORE any subprocess call, so an unsupported runtime never reaches a listing and can never be
+    mistaken for a quiet channel."""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
-                           env=runtime_client_env())
-    except (OSError, subprocess.SubprocessError):
-        return Existence.UNKNOWN
+        return _AMBIENT_NETWORK[runtime_name]
+    except KeyError:
+        raise UnsupportedRuntimeWitness(
+            f"runtime {runtime_name!r} has no MEASURED ambient-network witness "
+            f"(measured: {sorted(_AMBIENT_NETWORK)}); a network probe cannot be trusted without one, so "
+            "this is a refusal to probe — NOT a failed probe. Measure the runtime's ambient network and "
+            "add it to _AMBIENT_NETWORK; do not create a network to satisfy the existing entries."
+        ) from None
+
+
+def listing_argv(runtime: str, kind: ResourceKind) -> list[str]:
+    """The UNFILTERED listing for ``kind``. Unfiltered deliberately — see ``probe_existence``."""
+    return [runtime, *_LISTING[kind]]
+
+
+def canary_container_argv(runtime: str, name: str, image_id: str) -> list[str]:
+    """CREATE (never start) the container-kind witness.
+
+    CREATED-NOT-RUNNING is load-bearing, not incidental. Every container listing this module makes uses
+    ``ps -a``, and a created-but-never-started container is listed ONLY under ``-a`` — measured on the
+    reference host (``ps`` → 0 matches, ``ps -a`` → 1). So this witness BINDS THE ``-a`` FLAG: drop it and
+    the witness vanishes, which is UNKNOWN rather than a silently truncated listing. A RUNNING witness
+    (reusing the proxy, say) would still be listed without ``-a`` and would certify strictly less.
+
+    A CONSTRUCT site under the posture census: it creates a container the validity of every subsequent
+    destruction verdict depends on, so its argv is built here rather than by a caller.
+    """
+    return [runtime, "create", "--name", name, image_id, "true"]
+
+
+def probe_existence(
+    runtime: str,
+    kind: ResourceKind,
+    name: str,
+    *,
+    witness: str | None,
+    timeout: float = 30.0,
+) -> ProbeReading:
+    """Is ``name`` present, on a channel PROVEN LIVE IN THIS RUN? The shared fail-CLOSED existence check.
+
+    ABSENT requires a POSITIVE OBSERVATION, not silence. The old contract said EXISTS/ABSENT are returned
+    "only on a query that actually RAN (return code 0)" — but "it ran" is the instrument's report about
+    its own operation, not an answer about the subject. A syntactically valid, semantically WRONG query
+    runs fine, returns rc 0 and empty stdout, and used to yield ABSENT: a surviving container reported as
+    destroyed, by the function whose own docstring calls itself the destruction authority.
+
+    THE SEAM HAD TO MOVE. This used to take a fully-built ``argv``, which made a positive control
+    impossible: a function handed a finished list cannot construct the control query that would prove
+    that list's shape works. It now takes ``(kind, name)`` and owns construction. A caller-supplied
+    control was considered and REJECTED — an independently built control SHARES NO FAILURE MODES with the
+    real query, so its success certifies nothing. The control's entire value is CORRELATED FAILURE: a
+    broken real query must break the control too.
+
+    ONE SAMPLE, TWO READINGS. The listing is UNFILTERED, so the witness and the subject are read from the
+    SAME output of the SAME call. There is no adjacency window in which the channel could change between
+    a control and a query, it is one subprocess call rather than two, and the filter disappears as a
+    failure mode entirely — along with the unescaped regex metacharacters the old ``name=^{n}$`` form
+    interpolated. What the witness still covers is every OTHER way the channel can go quiet: a wrong
+    binary, a mangled storage root in the client env, a dropped ``-a``, a harmonised ``--format``, output
+    truncation. Those survive the filter's deletion, which is why deleting the filter does not remove the
+    need for a control.
+
+    WITNESS ABSENT ⇒ UNKNOWN, NEVER ABSENT. If the channel cannot show us a thing we know exists, its
+    silence about ``name`` carries no information.
+
+    ⚠ DO NOT LOG OR EMBED THE LISTING. Unfiltered means it contains the names of containers this process
+    does not own. It must not reach a log record, an exception message, or a signed receipt — a precedent
+    in this tree baked ``str(exc)`` into a published observation, and that was found by review rather
+    than by anything failing. Sealed by test.
+
+    AN UNKNOWN THAT CANNOT SAY WHY IS THE DEFECT ONE LEVEL UP, so the return is a ``ProbeReading``:
+    the state AND, when it is UNKNOWN, which of the three arrivals produced it. Found by a red test I
+    could not diagnose from its own message. The cause is a CLOSED ENUM, and it is RETURNED rather than
+    accumulated into a caller-supplied list, so a call site cannot opt out of diagnosability — see
+    ``ProbeReading``.
+    """
+    def _unknown(cause: ProbeCause, detail: str = "") -> ProbeReading:
+        return ProbeReading(Existence.UNKNOWN, cause, detail)
+
+    # POSITIVE SHAPE, not a truthiness test. ``not witness`` accepts anything falsy-adjacent that is not
+    # a usable witness name and — worse — accepts any non-empty NON-STRING (a Mock, a list, a sentinel
+    # object) as calibrated, after which ``witness not in listed`` compares that object against a list of
+    # strings and reports UNKNOWN forever. What is required is a NON-EMPTY STRING; that is what is
+    # checked. The evasion set for "not falsy" is unbounded; the admitted set for "is a non-empty str"
+    # is exactly the valid one.
+    if not isinstance(witness, str) or not witness:
+        raise WitnessNotProvisioned(
+            f"a {kind.value} probe for {name!r} was asked for a verdict with NO WITNESS. This is a "
+            "refusal to measure, NOT a measurement — an uncalibrated instrument cannot distinguish "
+            "'absent' from 'I cannot see', and returning UNKNOWN here would let a lifecycle bug "
+            "masquerade as a quiet channel"
+        )
+    try:
+        r = subprocess.run(listing_argv(runtime, kind), capture_output=True, text=True,
+                           timeout=timeout, env=runtime_client_env())
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError is NOT a SubprocessError. ``text=True`` decodes the child's output, so
+        # undecodable bytes raise it straight out of this function — which has a TRI-STATE contract and
+        # must not throw. Measured reachable, and MORE reachable under unfiltered listing, because the
+        # output now contains names this process did not choose.
+        return _unknown(ProbeCause.LISTING_DID_NOT_RUN, type(exc).__name__)
     if r.returncode != 0:
-        return Existence.UNKNOWN
-    return Existence.EXISTS if name in r.stdout.split() else Existence.ABSENT
+        return _unknown(ProbeCause.LISTING_EXITED_NONZERO, f"rc={r.returncode}")
+    listed = r.stdout.split()
+    if witness not in listed:
+        # The channel is not proven live — its silence proves nothing. Distinct from the two above: the
+        # listing RAN and ANSWERED, and what it answered did not include a resource we know exists. This
+        # is the only one of the three that points at ANOTHER ACTOR rather than at our own client.
+        return _unknown(ProbeCause.WITNESS_NOT_IN_LISTING, f"witness={witness!r}")
+    return ProbeReading(Existence.EXISTS if name in listed else Existence.ABSENT)
+
+
+def ensure_container_witness(runtime: str, image_id: str, rid: str) -> str:
+    """Create the container-kind witness for this session and return its name.
+
+    Named ``{RESOURCE_PREFIX}canary-{rid}`` — kind-segmented like every other resource here, and it stays
+    UNDER the shared prefix ON PURPOSE so a leaked canary is reapable. Excluding it from the reaper would
+    make it a leak by design, which is the thing this control exists to prevent.
+
+    ⚠ PRECONDITION HANDED FORWARD, decided rather than discovered: the reaper selects by PREFIX, not by
+    instance, so a *wired* reaper could destroy another instance's LIVE canary mid-probe. That is the
+    pre-existing prefix-not-instance hazard with a new participant, and it is not live today because the
+    reaper is a test/ops utility that nothing invokes at startup. The wiring increment MUST handle
+    live-canary exclusion (by instance or by age); the ``canary-`` segment exists so it has something to
+    key on. The window is short — created and destroyed inside one session — which bounds it, not closes it.
+
+    ⚠ ``rid`` PROVENANCE. It is the caller's per-session random id, and it is RANDOM ON PURPOSE — never
+    derived from the artifact or its hash. An artifact-derived rid would make two runs of the same
+    artifact collide BY CONSTRUCTION, converting the namesake hazard below from a rare accident into the
+    normal case. Callers pass the SAME rid they name the session's other resources with, so a leaked
+    canary is correlatable by name to the session that leaked it: reaping is not diagnosis.
+
+    TWO GUARDS, PROVING DIFFERENT THINGS — exclusivity (return code) and liveness (bootstrap-verify).
+    See ``WitnessCreateFailed``; I previously reasoned the first was redundant and it is not.
+    """
+    name = f"{RESOURCE_PREFIX}canary-{rid}"
+    try:
+        r = subprocess.run(canary_container_argv(runtime, name, image_id),
+                           capture_output=True, text=True, timeout=30, env=runtime_client_env())
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
+        raise WitnessCreateFailed(
+            f"could not create the container witness {name!r}: {type(exc).__name__}"
+        ) from exc
+    if r.returncode != 0:
+        # REFUSAL IS ALREADY DECIDED — by the return code, above and alone. The listing below is read
+        # ONLY to say WHICH failure this is, and it cannot authorise adoption: both branches raise. A
+        # namesake found here belongs to another session's lifetime, so "it is visible" is the more
+        # dangerous outcome, not the recovering one.
+        namesake = probe_existence(runtime, ResourceKind.CONTAINER, name, witness=name).state
+        if namesake is Existence.EXISTS:
+            raise WitnessNameCollision(
+                f"creating the container witness {name!r} exited {r.returncode} AND a container of that "
+                "name IS listed — a STALE NAMESAKE from another session. Refusing to adopt a witness "
+                "this session did not create: its lifetime is not ours, and an actor outside this "
+                "session may destroy it mid-probe, turning every verdict derived from it into UNKNOWN "
+                "at a moment we do not control"
+            )
+        raise WitnessCreateFailed(
+            f"creating the container witness {name!r} exited {r.returncode} and NO NAMESAKE WAS "
+            f"OBSERVED (probe={namesake.value}) — refusing to proceed with a witness that exists in "
+            "NAME ONLY. Note the probe above is itself UNCALIBRATED by construction: no canary exists "
+            "at this moment, so it can prove a namesake PRESENT but never prove one ABSENT. This "
+            "subtype therefore means 'no collision seen', not 'no collision'"
+        )
+    # BOOTSTRAP-VERIFY: creating it is not the same as being able to SEE it. Prove the instrument on the
+    # very channel it will be used to read, BEFORE anything trusts a verdict derived from it. This is the
+    # calibration PROOF the first version of this increment never had: it added the calibration CHECK at
+    # probe time and left the instrument itself unverified until teardown — the worst possible moment to
+    # discover it was never on.
+    if probe_existence(runtime, ResourceKind.CONTAINER, name, witness=name).state is not Existence.EXISTS:
+        raise WitnessNotVisible(
+            f"the container witness {name!r} was created but does not appear in the listing — the probe "
+            "channel cannot see a resource that demonstrably exists, so no verdict derived from it "
+            "could be trusted"
+        )
+    return name
+
+
+def probe_container(runtime: str, name: str, *, witness: str | None) -> ProbeReading:
+    """Container-kind probe. A WRAPPER, and the kind being in the FUNCTION NAME is the point.
+
+    Passing ``(kind, name)`` created a new way to lie that the old seam did not have: probe a CONTAINER
+    name under ``ResourceKind.NETWORK`` and the network witness passes, the network listing has no such
+    name, and the verdict is ABSENT — while the container lives. Fail-open, one token long. Naming the
+    kind removes the token that could be wrong.
+    """
+    return probe_existence(runtime, ResourceKind.CONTAINER, name, witness=witness)
+
+
+def probe_network(runtime: str, name: str, *, runtime_name: str) -> ProbeReading:
+    """Network-kind probe. Its witness is the runtime's MEASURED ambient network — always present, not
+    removable, and costing no resource to create. ``runtime_name`` is the audited NAME (podman/docker),
+    not the resolved path, because the witness is a property of the runtime rather than of the binary."""
+    return probe_existence(runtime, ResourceKind.NETWORK, name,
+                           witness=ambient_network_witness(runtime_name))
 
 
 def resolve_image_id(runtime: str, image: str) -> str:
@@ -347,7 +985,14 @@ def resolve_image_id(runtime: str, image: str) -> str:
     a short prefix — a short prefix reopens id ambiguity). Raises ``ImageResolutionError`` if the
     image is absent or the runtime can't report an id, and ``RuntimePathUnresolved`` (an
     ``OCIRuntimeUnavailable``) if ``runtime`` yields no absolute binary — an unresolvable runtime is a
-    fail-closed refusal to exec, not an image-resolution outcome, so it is NOT folded into the latter."""
+    fail-closed refusal to exec, not an image-resolution outcome, so it is NOT folded into the latter.
+
+    ⚠ LOCAL-ONLY, AND THAT IS A CONTRACT RATHER THAN AN ACCIDENT. This runs ``image inspect`` and nothing
+    else: an image that is absent locally raises, it is NEVER pulled. Verified at source, and locked here
+    because the orphan reaper now resolves an image through this path — an ops tool that silently
+    acquired a registry dependency AT INCIDENT TIME would be a posture change, not a convenience.
+    ADDING PULL BEHAVIOUR HERE IS A POSTURE CHANGE REQUIRING ITS OWN DISSENT, not a quiet helper
+    improvement. A verified property becomes a constraint, or it decays into a description of one moment."""
     try:
         out = subprocess.run(
             [exec_runtime_path(runtime), "image", "inspect", "--format", "{{.Id}}", image],
@@ -527,6 +1172,14 @@ class OCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         # 3.5-close #1.1: resolve the IMMUTABLE image digest at the TOP of prepare(), ONCE, before
         # anything runs — run() then executes THIS digest, not the mutable tag (closes tag-remap).
         image_id = resolve_image_id(self._exec_runtime(), self.image)
+        # ONE session rid, shared by the witness and the sandbox container. RANDOM, never artifact-derived
+        # (an artifact-derived rid would make repeat runs of the same artifact collide BY CONSTRUCTION —
+        # see ``ensure_container_witness`` on rid provenance), and SHARED so that a leaked canary is
+        # correlatable by name to the session that leaked it. Two independent uuid4s reaped identically
+        # and diagnosed not at all.
+        rid = uuid.uuid4().hex[:16]
+        # The container-kind witness: created-never-started, so it binds ``ps -a``. Destroyed in teardown.
+        self._witness = ensure_container_witness(self._exec_runtime(), image_id, rid)
         snapshot = Path(tempfile.mkdtemp(prefix=f"{RESOURCE_PREFIX}oci-"))
         try:
             if artifact.path.is_dir():
@@ -546,7 +1199,7 @@ class OCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
             id=uuid.uuid4().hex,
             artifact_hash=artifact.tree_hash,
             snapshot=snapshot,
-            container=f"{RESOURCE_PREFIX}{uuid.uuid4().hex[:16]}",
+            container=f"{RESOURCE_PREFIX}{rid}",
             image_id=image_id,
         )
 
@@ -600,22 +1253,90 @@ class OCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
     # -- Catch 2: teardown that CONFIRMS destruction ----------------------
     def teardown(self, handle: SandboxHandle) -> None:
         if not isinstance(handle, OCIHandle):
+            # A FOREIGN HANDLE IS A PROGRAMMING ERROR, NOT A NO-OP. The silent ``return`` handed out
+            # unearned success: the caller believes its resources were torn down and verified, and the
+            # one function authorised to make that claim never looked at anything.
+            raise TypeError(
+                f"{type(self).__name__}.teardown was given a {type(handle).__name__}, which it cannot "
+                "tear down. Returning silently would report success for work never attempted"
+            )
+        prior = self._replay_verdict(handle.id, handle.container)
+        if prior is not None:
+            # REPLAY, not a fresh assertion — see ObservedOCISandbox.teardown for why a stored verdict is
+            # returned as a past measurement rather than re-probed. Reconstructed from data, stamped.
+            replayed = prior.replay()
+            if replayed is not None:
+                raise replayed
             return
+        verdict: TeardownVerdict | None = None
         try:
             self._force_remove(handle.container)
-            # PROVE destruction: teardown succeeds ONLY on a probed ABSENT. EXISTS is a survivor; UNKNOWN
-            # (the probe could not tell — timeout / error / non-zero) is ALSO a leak, because we cannot
-            # CONFIRM the container is gone (SandboxLeakError's contract). One escalation, then fail closed.
-            if self._container_state(handle.container) is not Existence.ABSENT:
-                self._force_remove(handle.container)  # reaper escalation
-                state = self._container_state(handle.container)
-                if state is not Existence.ABSENT:
-                    raise SandboxLeakError(
-                        f"container {handle.container} could not be CONFIRMED destroyed (probe={state.value}) "
-                        "— ephemerality (a security property) is violated"
-                    )
+            # PROVE destruction: teardown succeeds ONLY on a probed ABSENT. But EXISTS and UNKNOWN are NOT
+            # the same event and no longer share an exception. EXISTS is an answer about the SUBJECT (the
+            # container was observed to persist); UNKNOWN is a report about the INSTRUMENT (nothing could
+            # be observed). Both block; only one is a leak.
+            if not isinstance(self._witness, str) or not self._witness:
+                # Uncalibrated. The destroy above still ran; nothing is claimed about what remains. The
+                # predicate is the probe's own — see ``probe_existence`` on positive shape.
+                verdict = TeardownVerdict(
+                    VerdictKind.UNVERIFIED,
+                    f"container {handle.container} could not be VERIFIED destroyed: no witness was "
+                    "provisioned, so the probe was never calibrated. Destruction was attempted",
+                    time.time(),
+                    handle.container,
+                )
+            else:
+                # Only the SECOND reading is kept: the first UNKNOWN is expected on the escalation path
+                # (that is why there is an escalation), so reporting it would make every escalated
+                # teardown carry a stale cause for a state it then recovered from.
+                reading = self._container_state(handle.container)
+                if reading.state is not Existence.ABSENT:
+                    self._force_remove(handle.container)  # reaper escalation
+                    reading = self._container_state(handle.container)
+                verdict = self._verdict_for(handle.container, reading)
         finally:
-            _rmtree_resilient(handle.snapshot)
+            # THE VERDICT IS BUILT AND FINALISED BEFORE IT IS RAISED. The raise used to sit inside the
+            # ``try``, so cleanup notes were appended AFTER the exception was constructed and could never
+            # appear in it. Finalisation happens here — where it still runs if the sweep crashed — and
+            # the raise happens below, once the notes are complete.
+            verdict = self._finalise(verdict, handle.id, handle.container, handle.snapshot)
+        # Reached ONLY when the sweep did not raise. A crash propagates from the ``finally`` above with
+        # its own exception intact and never arrives here.
+        self._surface(verdict)
+
+    def _verdict_for(self, container: str, reading: ProbeReading) -> TeardownVerdict:
+        """The verdict for a probe that ANSWERED — one composition site for the live and replayed text.
+
+        Composing the two separately is how the replayed message came to say less than the live one.
+        """
+        state = reading.state
+        if state is Existence.EXISTS:
+            return TeardownVerdict(
+                VerdictKind.LEAK,
+                f"container {container} was OBSERVED TO PERSIST after teardown — ephemerality "
+                "(a security property) is violated",
+                time.time(),
+                container,
+            )
+        if state is not Existence.ABSENT:
+            why = f" — cause: {reading.describe()}" if reading.cause is not None else ""
+            return TeardownVerdict(
+                VerdictKind.UNVERIFIED,
+                f"container {container} could not be VERIFIED destroyed (probe={state.value}) — "
+                "destruction was attempted; this is a report about the instrument, NOT a claim that "
+                f"the container survived{why}",
+                time.time(),
+                container,
+            )
+        return TeardownVerdict(VerdictKind.CLEAN, f"container {container} verified ABSENT",
+                               time.time(), container)
+
+    def _drop_witness(self) -> None:
+        """Destroy this session's container witness. Best-effort: a surviving witness is itself
+        prefix-named, so the reaper can clear it — leaving it would be a leak by design."""
+        if self._witness is not None:
+            self._force_remove(self._witness)
+            self._witness = None
 
     # -- internals --------------------------------------------------------
     def _force_remove(self, name: str) -> None:
@@ -627,10 +1348,8 @@ class OCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         except (OSError, subprocess.SubprocessError):
             pass
 
-    def _container_state(self, name: str) -> Existence:
-        return probe_existence(
-            [self._exec_runtime(), "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
-            name)
+    def _container_state(self, name: str) -> ProbeReading:
+        return probe_container(self._exec_runtime(), name, witness=self._witness)
 
     def _result(
         self,

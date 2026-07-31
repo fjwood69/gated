@@ -11,13 +11,20 @@ import socket
 import tempfile
 import threading
 import time
+import subprocess
 import unittest
 from pathlib import Path
 
 import sandbox.observed as observed_mod
-from core import ArtifactSpec, Existence, Fixtures, SandboxLeakError, tree_hash
+from core import ArtifactSpec, Existence, Fixtures, SandboxLeakError, TeardownUnverifiableError, tree_hash
 from sandbox.observed import ObservedHandle, ObservedOCISandbox, reap_orphans
-from sandbox.oci import OCIHandle, OCISandbox, probe_existence
+from sandbox.oci import (
+    OCIHandle,
+    OCISandbox,
+    ResourceKind,
+    WitnessNotProvisioned,
+    probe_existence,
+)
 
 _MISSING = "/nonexistent-runtime-zzzqfx"  # an argv[0] that cannot exec -> OSError
 
@@ -64,60 +71,113 @@ def _obs_handle() -> ObservedHandle:
 
 
 class ProbeExistenceTests(unittest.TestCase):
-    def test_exists_on_zero_exit_with_name(self) -> None:
-        self.assertIs(probe_existence(["echo", "myname"], "myname"), Existence.EXISTS)
+    """The tri-state, exercised against REAL SUBPROCESSES.
 
-    def test_absent_on_zero_exit_without_name(self) -> None:
-        self.assertIs(probe_existence(["echo", "other"], "myname"), Existence.ABSENT)
+    MIGRATED, not deleted. These previously passed a hand-built argv (``["echo", "myname"]``); the probe
+    now builds its own listing argv, because a function handed a finished list cannot construct the
+    control query that would prove the list's shape works. So the old form is unreachable BY DESIGN.
+
+    What they still supply that the mock-based suite does NOT: a real fork/exec, a real exit status, a
+    real decode. The trick is that ``listing_argv`` puts the subcommand words into ``/bin/echo``'s
+    argv, so echo prints them back — giving a genuine, non-stubbed listing whose tokens are known.
+    Deleting these would have quietly traded that coverage for convenience.
+    """
+
+    _ECHO = "/bin/echo"  # prints listing_argv's own subcommand words -> a real, known, non-stubbed listing
+
+    def test_exists_when_the_channel_shows_witness_and_subject(self) -> None:
+        # echo emits: ps -a --format {{.Names}}
+        self.assertIs(probe_existence(self._ECHO, ResourceKind.CONTAINER, "-a", witness="ps").state,
+                      Existence.EXISTS)
+
+    def test_absent_when_the_channel_shows_the_witness_but_not_the_subject(self) -> None:
+        self.assertIs(probe_existence(self._ECHO, ResourceKind.CONTAINER, "zz-not-emitted", witness="ps").state,
+                      Existence.ABSENT)
+
+    def test_unknown_when_the_witness_is_not_in_a_real_listing(self) -> None:
+        """The core control, against a real process: the channel answered, but not with the witness."""
+        self.assertIs(probe_existence(self._ECHO, ResourceKind.CONTAINER, "-a", witness="zz-no-witness").state,
+                      Existence.UNKNOWN)
 
     def test_unknown_on_oserror(self) -> None:
-        self.assertIs(probe_existence([_MISSING, "ps"], "x"), Existence.UNKNOWN)
+        self.assertIs(probe_existence(_MISSING, ResourceKind.CONTAINER, "x", witness="w").state,
+                      Existence.UNKNOWN)
 
     def test_unknown_on_nonzero_exit(self) -> None:
-        # a FAILED `ps` with empty stdout is NOT proof of absence — non-zero return code -> UNKNOWN.
-        self.assertIs(probe_existence(["false"], "x"), Existence.UNKNOWN)
+        # a FAILED listing with empty stdout is NOT proof of absence — non-zero return code -> UNKNOWN.
+        self.assertIs(probe_existence("/bin/false", ResourceKind.CONTAINER, "x", witness="w").state,
+                      Existence.UNKNOWN)
 
     def test_unknown_on_timeout(self) -> None:
-        self.assertIs(probe_existence(["sleep", "5"], "x", timeout=0.05), Existence.UNKNOWN)
+        self.assertIs(probe_existence("/bin/sleep", ResourceKind.CONTAINER, "x", witness="w",
+                                      timeout=0.05).state, Existence.UNKNOWN)
+
+    def test_an_unprovisioned_witness_RAISES_rather_than_returning_a_tri_state(self) -> None:
+        """Absence of CALIBRATION is not absence of EVIDENCE, so it cannot be reported in the evidence
+        type. Raised before any subprocess runs."""
+        with self.assertRaises(WitnessNotProvisioned):
+            probe_existence(self._ECHO, ResourceKind.CONTAINER, "x", witness=None).state
 
 
 class OCITeardownFailClosedTests(unittest.TestCase):
+    # ⚠ TYPE CHANGED, DELIBERATELY. These pinned SandboxLeakError when one type carried both meanings.
+    # An unreachable runtime / a non-zero probe is the INSTRUMENT failing, not a resource observed to
+    # persist — so it is now TeardownUnverifiableError. Both remain TeardownError, so "teardown raises,
+    # fail-closed" is unchanged; what changed is that the report no longer asserts a leak it never saw.
     def test_teardown_raises_when_runtime_unreachable(self) -> None:
         sb = OCISandbox(image="x", runtime=_MISSING)  # probe -> OSError -> UNKNOWN -> cannot confirm destroyed
-        with self.assertRaises(SandboxLeakError):
+        with self.assertRaises(TeardownUnverifiableError):
             sb.teardown(_oci_handle())
 
     def test_teardown_raises_on_nonzero_probe(self) -> None:
         sb = OCISandbox(image="x", runtime="false")  # probe -> returncode 1 -> UNKNOWN
-        with self.assertRaises(SandboxLeakError):
+        with self.assertRaises(TeardownUnverifiableError):
             sb.teardown(_oci_handle())
 
 
 class ObservedTeardownFailClosedTests(unittest.TestCase):
     def test_teardown_raises_when_runtime_unreachable(self) -> None:
         sb = ObservedOCISandbox(image="x", runtime=_MISSING)
-        with self.assertRaises(SandboxLeakError):
+        with self.assertRaises(TeardownUnverifiableError):
             sb.teardown(_obs_handle())
 
 
 class PartialPrepareFailClosedTests(unittest.TestCase):
-    """Board P1 remaining hole: a partial-setup failure runs cleanup, and if that cleanup cannot PROVE
-    the infra gone the survivor list MUST surface a ``SandboxLeakError`` (fail-closed) — not be discarded
-    behind the original setup error. Uses a fake runtime (``false``): ``_create_network`` exits non-zero
-    (check=True -> CalledProcessError) after the snapshot is staged, then the real cleanup probes the
-    proxy+network as UNKNOWN and reports them as survivors."""
+    """A partial-setup failure runs cleanup, and the report must say what was actually established.
 
-    def test_partial_prepare_surfaces_survivors_chained(self) -> None:
-        sb = ObservedOCISandbox(image="x", runtime="false")  # network create -> non-zero -> setup fails
+    ⚠ THIS TEST'S FAULT-INJECTION POINT MOVED, and the move is a real consequence worth naming.
+    Previously a fake runtime (``false``) reached ``_create_network``, which exited non-zero after the
+    snapshot was staged. Bootstrap-verify now refuses EARLIER — a runtime that cannot create and show a
+    canary is refused before anything is staged — so ``false`` no longer reaches the cleanup path at all.
+    Provisioning is therefore stubbed here, legitimately: it has its own tests, and this test's subject
+    is the CLEANUP REPORT, not the guarantor.
+
+    ⚠ AND THE EXPECTED EXCEPTION CHANGED. It previously asserted ``SandboxLeakError``. With a dead
+    runtime the cleanup probes cannot answer, so the resources are UNPROVEN — not observed to persist.
+    The ORIGINAL SETUP EXCEPTION is the certain fact and stays primary; unverifiability is ATTACHED.
+    Asserting a leak here would have been the increment's own defect: lexicalising an unestablished
+    claim as a finding, and demoting the real cause to ``__cause__`` where type-branching callers miss it.
+    """
+
+    def test_partial_prepare_keeps_the_setup_error_primary_and_attaches_unverifiability(self) -> None:
+        sb = ObservedOCISandbox(image="x", runtime="false")
         art = _artifact_dir()
-        orig = observed_mod.resolve_image_id
-        observed_mod.resolve_image_id = lambda rt, img: "img-digest"  # skip the real image resolve
+        orig_resolve = observed_mod.resolve_image_id
+        orig_witness = observed_mod.ensure_container_witness
+        observed_mod.resolve_image_id = lambda rt, img: "img-digest"
+        observed_mod.ensure_container_witness = lambda rt, img, rid: f"moriverify-canary-{rid}"
         try:
-            with self.assertRaises(SandboxLeakError) as cm:
+            with self.assertRaises(subprocess.CalledProcessError) as cm:
                 sb.prepare(art, Fixtures())
-            self.assertIsNotNone(cm.exception.__cause__, "original setup error must be preserved as cause")
+            attached = " ".join(str(x) for x in getattr(cm.exception, "__notes__", ())) + \
+                       " ".join(str(a) for a in cm.exception.args)
+            self.assertIn("UNPROVEN", attached,
+                          "cleanup unverifiability must be ATTACHED to the original setup error")
+            self.assertNotIn("OBSERVED TO PERSIST", attached,
+                             "an unprobeable resource must never be reported as a proven leak")
         finally:
-            observed_mod.resolve_image_id = orig
+            observed_mod.resolve_image_id = orig_resolve
+            observed_mod.ensure_container_witness = orig_witness
 
 
 class ProxyCountAtAcceptTests(unittest.TestCase):
@@ -246,13 +306,40 @@ class ProxyCountAtAcceptTests(unittest.TestCase):
 
 
 class ReaperFailClosedTests(unittest.TestCase):
+    """The reaper's contract is UNCHANGED by the exception split: it normalises every
+    cannot-confirm-a-clean-slate condition into its OWN SandboxLeakError, which its callers pin. The
+    split applies to TEARDOWN, which reports per-resource; the reaper reports per-run."""
+
+    # ``canary_image`` is a PLACEHOLDER in these two: both refuse before the image is ever used — the
+    # first cannot resolve its runtime, the second cannot list — so the SandboxLeakError pins still pin
+    # what they always pinned. The parameter is required precisely so its absence cannot go unasked.
     def test_reap_raises_when_listing_unreachable(self) -> None:
         with self.assertRaises(SandboxLeakError):
-            reap_orphans(_MISSING)
+            reap_orphans(_MISSING, canary_image="zz-placeholder")
 
     def test_reap_raises_on_nonzero_listing(self) -> None:
         with self.assertRaises(SandboxLeakError):
-            reap_orphans("false")
+            reap_orphans("false", canary_image="zz-placeholder")
+
+    def test_reap_refuses_when_its_canary_image_cannot_be_resolved_LOCALLY(self) -> None:
+        """A NEW branch, exercised by nobody before now: a usable runtime whose canary image is absent.
+
+        Without a witness the reaper cannot tell an empty listing from a broken channel, so it must
+        REFUSE rather than report a clean slate. Resolution is local-only by contract — this image is not
+        pulled, and if it ever were, this test would stop failing for the wrong reason.
+        """
+        with self.assertRaises(SandboxLeakError):
+            reap_orphans("podman", canary_image="zz-definitely-not-a-local-image-qfx")
+
+    def test_reap_refuses_a_runtime_with_no_MEASURED_network_witness(self) -> None:
+        """Absence of SUPPORT must not look like absence of EVIDENCE. An unmeasured runtime is refused at
+        the map lookup, before any subprocess runs, so the failure says 'unsupported' and can never be
+        mistaken for a quiet channel."""
+        with self.assertRaises(SandboxLeakError) as caught:
+            reap_orphans("nerdctl", canary_image="zz-placeholder")
+        # The TYPE is the reaper's own contract; the MESSAGE is what keeps the two failures apart.
+        self.assertIn("NOT IN THE SUPPORTED SET", str(caught.exception))
+        self.assertNotIn("witness", str(caught.exception).split("(")[0])
 
 
 if __name__ == "__main__":

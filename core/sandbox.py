@@ -36,12 +36,101 @@ from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
 
-class SandboxLeakError(Exception):
-    """Raised when a backend cannot CONFIRM a run's environment was destroyed
-    (e.g. an OCI container survives teardown). Ephemerality is a security property,
-    not hygiene — a surviving environment leaks state to the next run or lets the
-    artifact outlive its verdict, so a leak must surface loudly, never be swallowed.
-    This is the one sanctioned case of teardown raising."""
+class TeardownError(Exception):
+    """Base for every way teardown can fail to end in a PROVEN-clean state.
+
+    It exists so a caller can say "any teardown problem" coherently, while the two subclasses below stay
+    DISCRIMINABLE BY DEFAULT. They are not the same event and must not share a name: one is an answer
+    about the SUBJECT (a resource was observed to persist), the other is a report about the INSTRUMENT
+    (nothing could be observed at all). Collapsing them is the standing law's exact prohibition, and it
+    would guarantee alarm fatigue that devalues the real leak alarm when it finally fires."""
+
+
+class SandboxLeakError(TeardownError):
+    """A resource was OBSERVED TO PERSIST after teardown — a PROVEN leak, on a channel proven live.
+
+    Ephemerality is a security property, not hygiene: a surviving environment leaks state to the next run
+    or lets the artifact outlive its verdict, so this must surface loudly and never be swallowed. This is
+    the one sanctioned case of teardown raising.
+
+    ⚠ RESERVED FOR ``EXISTS``. An ``UNKNOWN`` probe never justifies this type. The instrument can prove
+    ABSENT and can prove EXISTS; it can NEVER prove "leaked" from UNKNOWN, and lexicalising an
+    unestablished claim as a finding routes an operator to hunt a leak that may not exist while the true
+    fault — a dead instrument — is demoted to a cause."""
+
+
+class TeardownUnverifiableError(TeardownError):
+    """Teardown could not be VERIFIED, because the probe could not answer — not because anything survived.
+
+    Raised on ``UNKNOWN``, and on an uncalibrated sweep where no witness was ever provisioned. Still
+    blocking and still fail-closed: "could not tell" must never read as "gone". But it is HONESTLY
+    LABELLED, so the operator's first move is to check the instrument rather than to hunt a leak.
+
+    Destruction is still ATTEMPTED before this is raised — an uncalibrated probe is a reason to distrust
+    the report, not a reason to skip the work.
+
+    ⚠ NOT the type for a sweep that never finished — see ``TeardownIncompleteError``. "The instrument
+    could not answer" is itself a MEASURED outcome: the sweep ran, probed, and got nothing back. A sweep
+    that crashed produced no reading at all, and reporting the two alike would credit a computation that
+    never happened with a measurement it never took."""
+
+
+class TeardownIncompleteError(TeardownError):
+    """The teardown sweep NEVER REACHED A VERDICT — it raised somewhere the design did not anticipate.
+
+    The third state, and it exists because the second was standing in for it. Previously an unexpected
+    exception out of the sweep left the result lists at their empty initial values, and the ``finally``
+    block read those empties as "nothing present, nothing unproven" — i.e. CLEAN — and tombstoned a
+    permanent clean certificate for a computation that never completed. That is certification by silence,
+    inside the increment whose subject is refusing to certify by silence.
+
+    Distinguishable BY TYPE, not by message: a caller can branch on "did the sweep run?" separately from
+    "what did it find?". Blocking like its siblings, and — unlike them — it means the session's evidence
+    (witness, snapshot) is DELIBERATELY RETAINED, because the operator's next move is to re-probe."""
+
+
+class TeardownCleanupError(TeardownError):
+    """The verdict was reached and is CLEAN, but post-verdict cleanup failed — released witness, deleted
+    snapshot. Raised so that a clean verdict's cleanup problem is HEARD.
+
+    It exists because of a defect in its own increment's fix. Cleanup failures were recorded as notes on
+    the verdict, and on a CLEAN verdict nothing ever formatted them: both the live and the replay
+    surface return early for CLEAN, so the note reached no one. A field written by one side and read by
+    nobody is precisely the shape this module exists to eliminate, and it had been reintroduced inside
+    the remediation for it.
+
+    NOT a re-classification of the verdict. The measurement happened and was clean; what failed came
+    after, and conflating the two would corrupt replay semantics. So the verdict stays CLEAN in the
+    tombstone — a repeat call replays clean and silent — and this surfaces once, on the call that
+    actually did the cleanup. A surviving witness matters beyond tidiness: it is the precondition for
+    the namesake-collision state on the next session that draws the same rid."""
+
+
+class ReplayedSandboxLeak(SandboxLeakError):
+    """A recorded ``SandboxLeakError``, RECONSTRUCTED at replay — a past measurement, not a fresh one.
+
+    Teardown is idempotent, so a repeat call must not re-probe (by then the witness is released and every
+    resource would come back unproven, turning a defensive ``finally: teardown()`` into an error
+    generator). The verdict is therefore stored and re-raised — but stored AS DATA and reconstructed
+    here, never as the original exception object held and thrown again. A held object accumulates
+    tracebacks across replays, carries ``__notes__`` written by whoever caught it last, and is one shared
+    mutable across every caller.
+
+    The subtype is what distinguishes "the instrument is dark NOW" from "we stopped asking" — a caller
+    seeing this knows nothing was measured at this moment. It remains a ``SandboxLeakError``, so every
+    existing fail-closed handler catches it unchanged."""
+
+
+class ReplayedTeardownUnverifiable(TeardownUnverifiableError):
+    """A recorded ``TeardownUnverifiableError``, reconstructed at replay. See ``ReplayedSandboxLeak``."""
+
+
+class ReplayedTeardownIncomplete(TeardownIncompleteError):
+    """A recorded ``TeardownIncompleteError``, reconstructed at replay. See ``ReplayedSandboxLeak``.
+
+    This is the ONLY way an incomplete verdict is ever raised: the first teardown does not raise it —
+    the exception that crashed the sweep is the certain fact and stays primary — it only RECORDS it, so
+    that the repeat cannot mistake the crash for a clean result."""
 
 
 class Existence(Enum):
