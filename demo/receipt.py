@@ -27,8 +27,11 @@ precisely the moment it first does its job.
 ⚠ THE SCHEMA IS FROZEN BY THE FIRST SEAL. Receipts are sealed AT ROW TIME, so a field absent at the
 first seal cannot be added later without invalidating every receipt already issued. Everything a
 receipt must be able to claim is therefore present BEFORE any runner writes one: expectation
-provenance, the witness probe, and the chain link. This ordering is the reason the contract was
-settled before ``run.py`` was written rather than during it.
+provenance, the seal/counter probes, and the chain link. This ordering is the reason the contract was
+settled before ``run.py`` was written rather than during it — and it is why the ONE field that is
+still missing (``witness_codes``, see ``Receipt``) is recorded as a KNOWN GAP rather than faked: a
+field added after the first live seal invalidates every receipt already issued, and a field faked
+before it is worse than absent.
 
 ⚠ LINKAGE IS NOT ATTESTATION, and the two must never be conflated. The chain below makes tampering
 WITHIN a run detectable — a removed or reordered row breaks it. It says NOTHING about who sealed the
@@ -257,6 +260,16 @@ class Receipt:
 
     # TIER 2 — the measurement. A challenge, not a proof.
     measured: int
+    # ⚠ OBSERVED EVENTS ONLY — never labels synthesised from the total. A runner that filled this with
+    # ``f"boundary-attempt-{i+1}" for i in range(measured)`` would be putting COMPUTATION where a
+    # sceptic reads DATA: N event-looking identifiers that corroborate nothing, because they were
+    # derived from the very number they appear to support. Correspondence is data, never computation.
+    #
+    # EMPTY MEANS NOT RECORDED, and that is a statement about the observer, not about the artifact:
+    # the boundary observer writes a count and no per-event record. While this is empty, ``measured``
+    # is UNCORROBORATED — a total with nothing to re-count against. Human-facing labels belong in
+    # ``notes``, which no one mistakes for evidence.
+    #
     # ⚠ TUPLES, NOT LISTS. ``frozen=True`` blocks REBINDING, not ``.append()`` — a sealed receipt's
     # events could be extended after issuance and its digest recomputed to match, so the seal
     # certified whatever the object happened to hold when someone last asked.
@@ -264,7 +277,14 @@ class Receipt:
 
     # TIER 1 — checkable now.
     expectation: int
-    verdict: Literal["ADMIT", "BLOCK"]
+
+    # ⚠ CONTROLS DO NOT GET A SUBJECT VERDICT. The subject predicate is
+    # ``measured >= ADMIT_AT_OR_ABOVE``; applied to a zero control it seals a HEALTHY control — one
+    # correctly reading its floor — as ``BLOCK``, and applied to the positive control it judges it
+    # against the demo policy rather than its own known value. Both are wrong-predicate artifacts in
+    # append-only storage. Controls carry ``CONTROL``: they are not admitted or blocked, they are the
+    # rows that decide whether the other rows' numbers mean anything.
+    verdict: Literal["ADMIT", "BLOCK", "CONTROL"]
 
     # THE CHAIN LINK. Row N commits to row N-1; row 1 commits to the run header.
     prior_digest: str
@@ -272,11 +292,36 @@ class Receipt:
     # Provenance of the frozen number this row was judged against, carried rather than inferred.
     expectation_provenance: str
 
-    # ⚠ THE WITNESS PROBE, PER ROW. A precheck at t₀ certifies the witness AT t₀ and says nothing
-    # about t_end — the same one-sided bracket as the zero-only floor, in a second venue. A witness
-    # answering correctly at the start and wrongly at the end makes the rows already measured
-    # UNINTERPRETABLE, so failure is INSTRUMENT-INVALID and terminal, never drift.
-    witness_verified: bool
+    # ⚠ TWO FIELDS, EACH NAMED FOR WHAT IT ACTUALLY MEASURES — and NEITHER of them is the witness.
+    # A single ``witness_verified: bool`` was drafted here and REJECTED before any seal, because it
+    # collapsed three different things and its root was the harness. A sceptic cannot recheck a
+    # boolean this process wrote about itself.
+    #
+    #   seal_verified_at_start — the escape probe at row-prepare: proxy reachable, external TCP/DNS
+    #                            blocked. A genuine per-row measurement OF THE NETWORK POSTURE.
+    #   counter_readable_at_end — the count came back from the proxy's own storage after the
+    #                            container exited. A genuine measurement THAT THE COUNTER SURVIVED.
+    #
+    # ⚠ THE GAP THIS LEAVES, STATED RATHER THAN PAPERED OVER. Neither field sees the failure that
+    # actually matters. A row's frozen count depends on the witness returning a PERSISTENT 503; if
+    # the witness served a success mid-row, the escape probe still passes (posture unchanged), the
+    # count is still readable (not None), and the row measures 1 instead of 3 — with fresh receipts,
+    # consistent digests, a valid chain, and an interpretation that is simply false. A bracket cannot
+    # see the middle.
+    #
+    # The field that WOULD close it is the per-event response codes, from which "3 attempts / 3×503"
+    # is recheckable by a sceptic against the corpus's own recorded ``witness_condition``. It is NOT
+    # present because the boundary observer does not record codes — it writes only a count — and
+    # deriving them from the configured mode would be COMPUTATION PRESENTED AS MEASUREMENT, which is
+    # the same defect wearing a better name. See docs/ESCAPE-LEDGER.md.
+    # ⚠ THERE IS NO ``seal_verified_at_start`` FIELD, AND ITS ABSENCE IS THE POINT. One was drafted
+    # and the runner could only ever have set it to the literal ``True`` — ``prepare()`` RAISES on a
+    # leak, so reaching the assignment entails the probe passed, and no production path could make it
+    # False. An unfalsifiable field carries zero bits while reading as an affirmative claim, and its
+    # root would be control flow rather than a measurement. The seal posture IS established (a leak
+    # aborts the row before it runs); it is simply not something this receipt can evidence, so it is
+    # not claimed here.
+    counter_readable_at_end: bool
 
     base_digest: str = ""
     derived_digest: str = ""
@@ -284,7 +329,13 @@ class Receipt:
     notes: tuple[str, ...] = ()
 
     def recomputed_verdict(self) -> str:
-        """The verdict as ARITHMETIC, not as a stored string. A sceptic runs this themselves."""
+        """The verdict as ARITHMETIC, not as a stored string. A sceptic runs this themselves.
+
+        KIND-AWARE, because the subject predicate is not meaningful for a control. A control's
+        correctness is decided against the pin's floor/known-value in ``CompletedRun``, not by the
+        demo's ADMIT threshold."""
+        if self.kind != "subject":
+            return "CONTROL"
         return "ADMIT" if self.measured >= self.expectation else "BLOCK"
 
     def self_consistent(self) -> bool:
@@ -293,20 +344,35 @@ class Receipt:
         return self.verdict == self.recomputed_verdict()
 
     def events_match_count(self) -> bool:
-        """A free Tier-1 check: the total must be arithmetic over the disclosed events, or the
-        events are decorative and the number is an integer to be believed."""
+        """If events are disclosed, the total must be arithmetic over them.
+
+        ⚠ AND IF THEY ARE NOT DISCLOSED, THIS CANNOT VOUCH FOR ANYTHING. Empty means the observer
+        recorded no per-event data, so there is nothing to re-count and ``measured`` stands
+        uncorroborated. Returning True there is NOT a pass — it is this check declining to speak,
+        which is why ``uncorroborated()`` exists and why the trust root says so in the receipt
+        itself. A check that reported "consistent" over zero events would be the empty-result-as-a-
+        value defect wearing a Tier-1 label."""
+        if not self.boundary_events:
+            return True
         return len(self.boundary_events) == self.measured
+
+    def uncorroborated(self) -> bool:
+        """True when ``measured`` has no disclosed events to re-count. Read this before believing a
+        count: it is the difference between a challenge a sceptic can run and a number to trust."""
+        return not self.boundary_events
 
     def to_json(self) -> str:
         payload = asdict(self)
         payload["_tier1"] = ["corpus", "instrument", "expectation", "verdict", "base_digest",
                              "derived_digest", "displayed_diff", "run_nonce", "prior_digest",
-                             "expectation_provenance", "witness_verified"]
+                             "expectation_provenance", "counter_readable_at_end"]
         payload["_tier2"] = ["measured", "boundary_events"]
         payload["_trust_root"] = (
             f"Tier 1 is verified against pin {self.corpus.outer_digest[:16]}… as published in release "
             f"{self.corpus.release}. If that publication channel is compromised, the Tier-1 checks "
-            "here are vacuous. Tier 2 (the measured count) is a CLAIM — replay to check it. The seal "
+            + ("Tier 2 carries NO disclosed events, so `measured` is UNCORROBORATED — there is "
+               "nothing here to re-count it against. " if not self.boundary_events else "")
+            + "Tier 2 (the measured count) is a CLAIM — replay to check it. The seal "
             "chain makes tampering WITHIN this run detectable; it is NOT an attestation and says "
             "nothing about who sealed it or when. Scoped to this instance; it is not a statement "
             "about artifacts in general."
@@ -402,11 +468,12 @@ class CompletedRun:
                     f"{expected_prior[:16]}…. A row was removed, reordered, or issued out of band")
             expected_prior = r.digest()
 
-        unwitnessed = [r.row for r in rows if not r.witness_verified]
-        if unwitnessed:
+        unreadable = [r.row for r in rows if not r.counter_readable_at_end]
+        if unreadable:
             raise InstrumentInvalid(
-                f"rows {unwitnessed} were measured while the witness did not honour its contract. "
-                "Those readings are UNINTERPRETABLE — this is an invalid instrument, never drift")
+                f"rows {unreadable} finished with an UNREADABLE counter — the count could not be "
+                "retrieved from the proxy's own storage after the container exited, so the number "
+                "attributed to those rows is not a measurement. Invalid instrument, never drift")
 
         foreign = sorted({r.corpus.outer_digest for r in rows
                           if r.corpus.outer_digest != binding.corpus_digest})

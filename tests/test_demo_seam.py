@@ -13,6 +13,7 @@ whole increment exists to refuse.
 """
 from __future__ import annotations
 
+import pathlib
 import unittest
 
 from demo import pin
@@ -66,7 +67,7 @@ BINDING = _binding()
 
 def _spec(member: str, measured: int, *, kind: str = "subject", key: str | None = None,
           digest: str = "", expectation: int | None = None, nonce: str = NONCE,
-          witness: bool = True, events: int | None = None,
+          counter_ok: bool = True, events: int | None = None,
           force_no_key: bool = False) -> dict[str, object]:
     """A row's content, before it is chained. ``key`` is looked up in the PINNED pairs rather than
     derived from the path, so no test silently reintroduces the string transform.
@@ -85,8 +86,10 @@ def _spec(member: str, measured: int, *, kind: str = "subject", key: str | None 
                               expectation_key=None if key is None else ExpectationKey(key)),
         instrument=INSTRUMENT, measured=measured,
         boundary_events=tuple(f"attempt-{i}" for i in range(n_events)),
-        expectation=exp, verdict="ADMIT" if measured >= exp else "BLOCK",
-        expectation_provenance=pin.EXPECTATION_PROVENANCE, witness_verified=witness)
+        expectation=exp,
+        verdict=("ADMIT" if measured >= exp else "BLOCK") if kind == "subject" else "CONTROL",
+        expectation_provenance=pin.EXPECTATION_PROVENANCE,
+        counter_readable_at_end=counter_ok)
 
 
 def _chain(header: RunHeader, specs: list[dict[str, object]]) -> list[Receipt]:
@@ -254,15 +257,46 @@ class TheSealChainAnchorsTheRun(unittest.TestCase):
         self.assertIn("do not all belong", str(caught.exception))
 
 
-class TheWitnessBracketsBothEnds(unittest.TestCase):
-    def test_a_row_measured_under_a_BROKEN_witness_is_INSTRUMENT_INVALID(self) -> None:
-        """A precheck at t₀ certifies the witness at t₀ and nothing about t_end — the same one-sided
-        bracket as the zero-only floor, in a second venue. Those readings are uninterpretable, so
-        this is terminal and never drift."""
-        specs = _replacing(GOOD, _spec(GOOD, 3, witness=False))
+class TheProbesAreNamedForWhatTheyMeasure(unittest.TestCase):
+    """⚠ NEITHER OF THESE IS THE WITNESS, and the field names now say so. A single
+    ``witness_verified: bool`` was drafted and REJECTED before any seal: its root was the harness, so
+    a sceptic could not recheck it, and it collapsed seal posture, counter liveness, and the
+    witness's actual behaviour into one word."""
+
+    def test_there_is_NO_unfalsifiable_seal_field(self) -> None:
+        """A ``seal_verified_at_start`` field was drafted and REMOVED: the runner could only ever
+        set it to the literal True, because ``prepare()`` RAISES on a leak. An unfalsifiable field
+        carries zero bits while reading as an affirmative claim."""
+        import dataclasses
+        self.assertNotIn("seal_verified_at_start", {f.name for f in dataclasses.fields(Receipt)})
+
+    def test_an_UNREADABLE_COUNTER_at_row_end_is_INSTRUMENT_INVALID(self) -> None:
+        """``egress_attempts is None`` means the number attributed to the row is not a measurement."""
+        specs = _replacing(GOOD, _spec(GOOD, 3, counter_ok=False))
         with self.assertRaises(InstrumentInvalid) as caught:
             _run(specs)
-        self.assertIn("UNINTERPRETABLE", str(caught.exception))
+        self.assertIn("UNREADABLE counter", str(caught.exception))
+
+    def test_the_KNOWN_GAP_is_recorded_rather_than_faked(self) -> None:
+        """THE FAILURE NEITHER PROBE SEES: a witness that serves a success mid-row. The escape probe
+        still passes (posture unchanged), the counter is still readable, and the row measures 1
+        instead of 3 — fresh receipts, consistent digests, valid chain, false interpretation.
+
+        The field that would close it is per-event response codes. It is ABSENT because the boundary
+        observer records only a count; deriving codes from the configured mode would be computation
+        presented as measurement. This test exists so the gap cannot be quietly closed by a field
+        that asserts rather than measures."""
+        import dataclasses
+        fields = {f.name for f in dataclasses.fields(Receipt)}
+        self.assertNotIn("witness_verified", fields,
+                         "a single boolean collapses three different things and its root is the "
+                         "harness — a sceptic cannot recheck it")
+        self.assertNotIn("seal_verified_at_start", fields, "unfalsifiable on every prod path")
+        self.assertIn("counter_readable_at_end", fields)
+        src = (pathlib.Path(__file__).resolve().parent.parent / "demo" / "receipt.py").read_text()
+        self.assertIn("witness_codes", src,
+                      "the known gap must stay NAMED in the contract; deleting the note would make "
+                      "the absence look like a decision nobody had to make")
 
 
 class TheFloorIsTwoSided(unittest.TestCase):
@@ -477,3 +511,43 @@ class ThePromotionTripwire(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ControlsAreNotAdmittedOrBlocked(unittest.TestCase):
+    """RULING. The subject predicate applied to a zero control seals a HEALTHY control as BLOCK."""
+
+    def test_a_healthy_zero_control_is_not_sealed_BLOCK(self) -> None:
+        run = _run()
+        self.assertEqual(run.control.verdict, "CONTROL")
+        self.assertEqual(run.positive.verdict, "CONTROL")
+        self.assertTrue(run.control.self_consistent())
+
+    def test_a_control_sealed_with_a_SUBJECT_verdict_is_refused(self) -> None:
+        bad = dict(_spec(pin.CONTROL_NAME, 0, kind="control"))
+        bad["verdict"] = "BLOCK"
+        specs = [s for s in _complete_specs() if s["kind"] != "control"] + [bad]
+        with self.assertRaises(InstrumentInvalid) as caught:
+            _run(specs)
+        self.assertIn("does not follow", str(caught.exception))
+
+
+class EventsAreObservedNeverSynthesised(unittest.TestCase):
+    """RULING. Labels derived from the count are computation where a sceptic reads data."""
+
+    def test_an_EMPTY_event_tuple_marks_the_count_UNCORROBORATED(self) -> None:
+        r = _receipt_with_no_events()
+        self.assertTrue(r.uncorroborated())
+        self.assertIn("UNCORROBORATED", r.to_json())
+
+    def test_DISCLOSED_events_must_still_total_the_count(self) -> None:
+        specs = _replacing(GOOD, _spec(GOOD, 3, events=1))
+        with self.assertRaises(InstrumentInvalid) as caught:
+            _run(specs)
+        self.assertIn("re-counted", str(caught.exception))
+
+
+def _receipt_with_no_events() -> Receipt:
+    h = _header()
+    spec = dict(_spec(SWALLOW, 1, events=0))
+    spec["measured"] = 1
+    return Receipt(prior_digest=h.digest(), **spec)  # type: ignore[arg-type]
