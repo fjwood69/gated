@@ -195,3 +195,28 @@ run report with no verdict column. All five subjects matched their frozen counts
   this demo demonstrates.
 
 Nothing above this appendix was edited to match either result.
+
+## Appended 2026-08-01 — the limit this document did not name
+
+`FIRST-RUN.md` pre-registered what a successful RUN meant and said nothing about
+HOSTS. Every run recorded here — attempt 1, attempt 2, and the three determinism
+repeats — executed on a single machine: podman 4.9.3, Ubuntu 24.04, rootless, one
+kernel, one storage configuration.
+
+**n=1 hosts is a distinct limit from n=1 runs**, and repeating the run does not
+touch it. Three identical tables from one machine say the runner is deterministic
+*there*; they say nothing about a host with a different runtime major version,
+storage backend, or namespace limits.
+
+The preflight refusal carries the same gap and it matters more, because it is the
+path offered to readers who CANNOT run the demo. It has been exercised against one
+deliberately constructed denial on a disposable VM. A control demonstrated against
+a failure I chose is not evidence about the failures a stranger's machine
+produces — the same one-sided shape as a floor checked in only one direction.
+
+**The cheapest close is a SECOND HOST**, not more runs on this one. A hosted
+environment (e.g. Codespaces) would take machine diversity from one to two and
+give readers without local podman a path. If it does not work there, that is a
+finding worth having before someone else finds it.
+
+Nothing above this appendix was edited.
