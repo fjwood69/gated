@@ -89,13 +89,13 @@ class CorpusIdentity:
     member_digest: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class Receipt:
     """One row's evidence. Sealed AT ROW TIME, while the run's objects still exist."""
 
     run_nonce: str
     row: str
-    kind: Literal["subject", "control"]
+    kind: Literal["subject", "control", "positive"]
     corpus: CorpusIdentity
     instrument: Instrument
 
@@ -138,6 +138,31 @@ class Receipt:
         return hashlib.sha256(self.to_json().encode()).hexdigest()
 
 
+@dataclass(frozen=True)
+class PinBinding:
+    """The pin's authority, passed IN so it cannot be forgotten.
+
+    ⚠ THIS TYPE EXISTS BECAUSE THE WIRING WAS ABSENT AND INVISIBLE. ``pin.py`` declared that the
+    authority for expectations lives in the consumer; ``receipt.py`` never imported it, so every
+    binding lived in code that had not been written. Both modules were fully green while the
+    anti-circularity design was entirely unwired — and each module's tests passed locally, which is
+    exactly why nothing saw it.
+
+    It is a PARAMETER rather than an import on purpose. Importing ``pin`` here would couple the type
+    to one corpus and, worse, would let a test construct a ``CompletedRun`` that agrees with the pin
+    BY CONSTRUCTION. Passing it in means an adversarial binding can be handed to it, which is the
+    only way the seam itself gets tested rather than each end of it.
+    """
+
+    corpus_digest: str
+    subject_members: frozenset[str]
+    control_member: str
+    control_floor: int
+    positive_member: str
+    positive_expected: int
+    policy_expectation: int
+
+
 class CompletedRun:
     """The ONLY thing a verdict table can be rendered from.
 
@@ -150,39 +175,106 @@ class CompletedRun:
     hole in exactly the row that validates every other row's number.
     """
 
-    def __init__(self, receipts: list[Receipt], expected_rows: int) -> None:
-        if len(receipts) != expected_rows + 1:
-            raise InstrumentInvalid(
-                f"a verdict table needs {expected_rows} subject receipts AND the control receipt; "
-                f"got {len(receipts)}. A partial table is not renderable — see the RUN REPORT, which "
-                "is always emitted and shows measurements as measurements rather than as verdicts")
+    def __init__(self, receipts: list[Receipt], binding: PinBinding) -> None:
+        # ⚠ THE BINDING IS REQUIRED BY THE SIGNATURE. The previous constructor took an INT — a COUNT,
+        # not an identity — so five receipts for the SAME member plus a control satisfied every
+        # check. That is exactly the defect ``pin.py``'s own comment names about exact sets ("one
+        # member too few or one too many, and a content check cannot see that"), committed one level
+        # up at TABLE level by the code that was supposed to enforce it.
+        kinds = {"subject", "control", "positive"}
+        bad_kind = [r.row for r in receipts if r.kind not in kinds]
+        if bad_kind:
+            raise InstrumentInvalid(f"receipts {bad_kind} carry an unknown kind")
+
         nonces = {r.run_nonce for r in receipts}
         if len(nonces) != 1:
             raise InstrumentInvalid(
                 f"receipts span {len(nonces)} runs: {sorted(nonces)}. Every row must come from THIS "
                 "run — mixing them is how a stale row survives into a fresh-looking table")
-        controls = [r for r in receipts if r.kind == "control"]
-        if len(controls) != 1:
+
+        # EVERY receipt must name the pinned corpus. Carried-but-never-adjudicated was how a receipt
+        # from a superseded release could render beside fresh ones.
+        foreign = sorted({r.corpus.outer_digest for r in receipts
+                          if r.corpus.outer_digest != binding.corpus_digest})
+        if foreign:
             raise InstrumentInvalid(
-                f"expected exactly ONE control receipt, got {len(controls)}. The control is what "
-                "demonstrates the counter can read its floor; without it the other rows' numbers rest "
-                "on nothing")
-        control = controls[0]
-        if control.measured != 0:
-            # NOT drift. See InstrumentInvalid.
+                f"receipt(s) name a corpus this consumer does not pin: {foreign}; pinned is "
+                f"{binding.corpus_digest}. A table may not mix corpora — the rows would be answers "
+                "to different questions displayed as one")
+
+        # EVERY expectation must come from the POLICY, not from whatever the runner happened to pass.
+        # Three plausible sources existed (the policy, a per-row count, or the corpus's own record —
+        # the circular case the pin exists to prevent) and they yield DIFFERENT verdicts, while
+        # self_consistent() passes for all three.
+        off_policy = [(r.row, r.expectation) for r in receipts
+                      if r.kind == "subject" and r.expectation != binding.policy_expectation]
+        if off_policy:
+            raise InstrumentInvalid(
+                f"subject rows carry an expectation that is not the pinned policy "
+                f"{binding.policy_expectation}: {off_policy}. The verdict is f(measured, expectation) "
+                "and an unpinned expectation makes the verdict unpinned with it")
+
+        subjects = [r for r in receipts if r.kind == "subject"]
+        members = [r.corpus.member for r in subjects]
+        if len(members) != len(set(members)):
+            dupes = sorted({m for m in members if members.count(m) > 1})
+            raise InstrumentInvalid(
+                f"member(s) {dupes} appear more than once. A count-based check accepted five copies "
+                "of one row as a complete table")
+        if set(members) != set(binding.subject_members):
+            missing = sorted(set(binding.subject_members) - set(members))
+            extra = sorted(set(members) - set(binding.subject_members))
+            raise InstrumentInvalid(
+                f"the subject set does not match the pin — missing {missing}, unexpected {extra}. "
+                "EXACT SET, not a minimum")
+
+        controls = [r for r in receipts if r.kind == "control"]
+        positives = [r for r in receipts if r.kind == "positive"]
+        if len(controls) != 1 or len(positives) != 1:
+            raise InstrumentInvalid(
+                f"a table needs EXACTLY ONE zero control and ONE positive control; got "
+                f"{len(controls)} and {len(positives)}. Both, or the floor is one-sided")
+        control, positive = controls[0], positives[0]
+
+        if control.corpus.member != binding.control_member:
+            raise InstrumentInvalid(
+                f"the control names {control.corpus.member!r}, not the pinned "
+                f"{binding.control_member!r} — any receipt could otherwise stand in for the control")
+        if positive.corpus.member != binding.positive_member:
+            raise InstrumentInvalid(
+                f"the positive control names {positive.corpus.member!r}, not the pinned "
+                f"{binding.positive_member!r}")
+
+        # ⚠ THE FLOOR IS TWO-SIDED NOW, AND THAT IS THE WHOLE FIX. Checking only `measured != 0`
+        # detected OVER-reporting alone: a counter capturing NOTHING reads 0 here, passes, and then
+        # every subject reads 0 and surfaces as DRIFT — a displayed RESULT — while the instrument is
+        # dead. Every test this project had ever run used a live counter, so none of them could see
+        # it. The positive control is the other side: a known-nonzero that must read EXACTLY its
+        # value.
+        if control.measured != binding.control_floor:
             raise InstrumentInvalid(
                 f"THE CONTROL DID NOT READ ITS FLOOR: a zero-egress artifact measured "
-                f"{control.measured}. This is not a fact about any artifact — it is the counter "
-                "failing, and it makes every other row's number suspect. Refusing to render a table "
-                "in which one row would quietly mean 'do not believe the other five'")
+                f"{control.measured}, expected {binding.control_floor}. This is not a fact about any "
+                "artifact — it is the counter failing, and it makes every other row's number suspect")
+        if positive.measured != binding.positive_expected:
+            raise InstrumentInvalid(
+                f"THE POSITIVE CONTROL DID NOT READ ITS KNOWN VALUE: measured {positive.measured}, "
+                f"expected exactly {binding.positive_expected}. A counter reading LOW — including one "
+                "reading nothing at all — passes a zero-floor check and then reports every row as "
+                "drift. This is the other side of the floor, and it is an INVALID INSTRUMENT, not a "
+                "finding about any artifact")
+
         inconsistent = [r.row for r in receipts if not r.self_consistent()]
         if inconsistent:
             raise InstrumentInvalid(
                 f"rows {inconsistent} carry a verdict that does not follow from their own operands — "
                 "the table was not computed from the measurements it displays")
+
         self.receipts = receipts
+        self.binding = binding
         self.control = control
-        self.subjects = [r for r in receipts if r.kind == "subject"]
+        self.positive = positive
+        self.subjects = subjects
         self.nonce = nonces.pop()
 
     def drifted(self, expected: dict[str, int]) -> list[tuple[str, int, int]]:
@@ -191,11 +283,22 @@ class CompletedRun:
         This is the RESULT, not a failure. A drift detector that halts on drift detects nothing, and
         a halt-only design trains the one repair that must never be made: editing the expectation to
         match a drifted measurement so the run goes green.
+
+        ⚠ NO SOFT SKIP. The previous version did ``want = expected.get(...)`` and then
+        ``if want is not None``, so a row whose member could not be keyed was SILENTLY PASSED OVER —
+        yielding an empty drift list over ZERO PERFORMED COMPARISONS, which reads identically to
+        "everything agrees". An empty result is not a value. The constructor now guarantees the
+        subject set matches the pin exactly, so an unkeyable row is a LOGIC error and says so.
         """
-        out = []
+        out: list[tuple[str, int, int]] = []
         for r in self.subjects:
-            want = expected.get(r.corpus.member.split("/")[1] if "/" in r.corpus.member
-                                else r.corpus.member)
-            if want is not None and r.measured != want:
+            key = r.corpus.member.split("/")[1] if "/" in r.corpus.member else r.corpus.member
+            if key not in expected:
+                raise InstrumentInvalid(
+                    f"row {r.row} names member {r.corpus.member!r}, which has no frozen expectation "
+                    f"under key {key!r}. Refusing to report 'no drift' over a comparison that was "
+                    "never performed")
+            want = expected[key]
+            if r.measured != want:
                 out.append((r.row, want, r.measured))
         return out

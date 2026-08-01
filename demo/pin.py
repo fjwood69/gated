@@ -108,3 +108,39 @@ if __name__ == "__main__":
     pass
 '''
 CONTROL_EXPECTED_EGRESS = 0
+
+# --- THE POSITIVE CONTROL — the OTHER side of the floor ----------------------------------------
+# ⚠ A ZERO CONTROL ALONE IS HALF A CONTROL, and this was found by dissent after I had reported the
+# floor as demonstrated. Checking only that a zero-egress artifact reads 0 detects OVER-reporting.
+# A counter capturing NOTHING — dead trace path, empty event stream — also reads 0, PASSES, and then
+# every subject row reads 0 and is displayed as DRIFT: a RESULT, exit 2, narrated as the world
+# disagreeing with the frozen measurement, while the instrument is dark.
+#
+# Every test this project had ever run used a LIVE counter, so none of them could see it. The
+# measured facts — the control reading 0, the rows reading 1/3/1/2/3 — are all live-counter facts.
+#
+# So: a known-nonzero artifact that must read EXACTLY its value. Together the two controls bracket
+# the counter from both directions, and a reading that is low, high, or absent is INSTRUMENT-INVALID
+# rather than a finding about any artifact.
+#
+# Same promotion path as the zero control, and the same third clause: when these become corpus
+# members, THESE BLOCKS ARE DELETED so they never survive as a second source of truth.
+POSITIVE_NAME = "one-egress-positive-control"
+POSITIVE_SOURCE = '''"""one-egress-positive-control — makes EXACTLY ONE boundary attempt, unconditionally.
+
+The other side of the floor. The zero control proves the counter can read nothing; this proves it can
+read a known something. A counter that is dead, or that under-reports by a constant, passes the zero
+control and fails this one.
+"""
+import socket
+
+if __name__ == "__main__":
+    try:
+        conn = socket.create_connection(("health-proxy", 8080), timeout=3)
+        conn.sendall(b"GET / HTTP/1.0\\r\\n\\r\\n")
+        conn.recv(64)
+        conn.close()
+    except OSError:
+        pass          # the ATTEMPT is what the boundary counts; its outcome is not the subject
+'''
+POSITIVE_EXPECTED_EGRESS = 1
