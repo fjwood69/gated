@@ -15,3 +15,6 @@ dist/
 *.pem
 *.tar
 .DS_Store
+
+# Local agent tooling (gitnexus skill files, agent config) — never part of the published tree.
+.claude/
