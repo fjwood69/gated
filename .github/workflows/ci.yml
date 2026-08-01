@@ -61,7 +61,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install "mypy==2.1.0"
-      - run: mypy --strict core sandbox engine observe gate cli
+      - run: mypy --strict core sandbox engine observe gate cli demo
 
   test:
     name: Unit tests (py ${{ matrix.python-version }})
