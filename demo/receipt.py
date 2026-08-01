@@ -10,7 +10,7 @@ TWO TIERS, LABELLED IN THE RECEIPT ITSELF, because they are different KINDS of c
   TIER 1 — CHECKABLE NOW, against published roots. Digests against the release; the three-way binding
            of base + displayed diff -> derived for the mutated rows, which is a PURE FUNCTION and the
            only actual PROOF in the whole demo; the verdict recomputed as f(measured, expectation);
-           nonce equality across every receipt in the run.
+           the seal chain from the run header through every row.
 
   TIER 2 — CHECKABLE ONLY BY RE-MEASUREMENT. The measured count and the boundary events. A
            measurement receipt is not a proof — it is A CHALLENGE IN A WELL-DEFINED FORMAT. So it
@@ -23,13 +23,30 @@ not abstract: when drift first fires, every pinned quantity is exonerated BY CON
 only available hypothesis is "the artifact changed", and the real cause sits in whatever was never
 named. A drift detector that cannot exonerate its own instrument will misattribute, confidently, at
 precisely the moment it first does its job.
+
+⚠ THE SCHEMA IS FROZEN BY THE FIRST SEAL. Receipts are sealed AT ROW TIME, so a field absent at the
+first seal cannot be added later without invalidating every receipt already issued. Everything a
+receipt must be able to claim is therefore present BEFORE any runner writes one: expectation
+provenance, the witness probe, and the chain link. This ordering is the reason the contract was
+settled before ``run.py`` was written rather than during it.
+
+⚠ LINKAGE IS NOT ATTESTATION, and the two must never be conflated. The chain below makes tampering
+WITHIN a run detectable — a removed or reordered row breaks it. It says NOTHING about who sealed the
+run, when, or on what machine. ``seal_mode`` remains SELF-REPORTED until an attestation exists.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
-from typing import Literal
+from dataclasses import asdict, dataclass
+from typing import Literal, Mapping, NewType, Sequence
+
+# ⚠ CORRESPONDENCE IS DATA, NEVER COMPUTATION. These two namespaces relate to each other through a
+# literal table in the pin and nowhere else. Making them distinct types means a member path used
+# where a key is expected is a TYPE ERROR rather than a review finding — which is the mechanical
+# form of the rule, and the reason the previous defect (``member.split("/")[1]``) was invisible.
+MemberPath = NewType("MemberPath", str)
+ExpectationKey = NewType("ExpectationKey", str)
 
 # Exit codes are DISTINCT so that automation never routes a real finding into an infrastructure
 # failure handler. Drift is a RESULT; the other two are refusals to produce one.
@@ -45,7 +62,11 @@ class PinInconsistent(Exception):
     Terminal, and detected BEFORE any container starts, because no measurement can adjudicate a
     contradiction between two things that were both written down in advance. The message must name
     both provenances and adjudicate NEITHER: the answer is not in either file, it is in a
-    re-measurement, and a message that points at a side will be resolved by whoever edited last."""
+    re-measurement, and a message that points at a side will be resolved by whoever edited last.
+
+    ⚠ THIS CLASS WAS ORNAMENTAL FOR ONE INCREMENT — defined, documented, and raised NOWHERE. It is
+    raised now by ``verify_measured_against_pin``, which is the case it was always for: the pin's
+    frozen expectations against the corpus's own ``MEASURED.json``."""
 
 
 class InstrumentInvalid(Exception):
@@ -74,68 +95,23 @@ class Instrument:
 
     def render(self) -> str:
         return (f"gate {self.gate_commit[:12]} · image {self.image_digest[:19]}… · "
-                f"{self.runtime} {self.runtime_version} · seal {self.seal_mode} · "
+                f"{self.runtime} {self.runtime_version} · seal {self.seal_mode} (SELF-REPORTED) · "
                 f"witness {self.witness_identity}")
 
 
 @dataclass(frozen=True)
-class CorpusIdentity:
-    """WHICH pinned artifact this row was drawn from. A receipt that cannot name its corpus cannot be
-    tied to anything after a supersession, and every historical receipt becomes unattributable."""
+class SubjectPin:
+    """ONE pinned subject: its member path, the key it answers to, and its FROZEN expectation.
 
-    release: str
-    outer_digest: str
-    member: str
-    member_digest: str
+    ⚠ THE EXPECTATION LIVES HERE, INSIDE THE BINDING. It used to arrive as a bare ``expected`` dict
+    parameter to ``drifted()`` — a SECOND, unauthenticated input to the one computation the tool
+    exists to perform, while the brief claimed the table's only input was a ``CompletedRun``. Nothing
+    checked it, so a tampered dict could fabricate or erase drift undetectably, and keys it omitted
+    were simply never compared."""
 
-
-@dataclass(frozen=True)
-class Receipt:
-    """One row's evidence. Sealed AT ROW TIME, while the run's objects still exist."""
-
-    run_nonce: str
-    row: str
-    kind: Literal["subject", "control", "positive"]
-    corpus: CorpusIdentity
-    instrument: Instrument
-
-    # TIER 2 — the measurement. A challenge, not a proof.
-    measured: int
-    boundary_events: list[str]
-
-    # TIER 1 — checkable now.
-    expectation: int
-    verdict: Literal["ADMIT", "BLOCK"]
-    base_digest: str = ""
-    derived_digest: str = ""
-    displayed_diff: str = ""
-
-    notes: list[str] = field(default_factory=list)
-
-    def recomputed_verdict(self) -> str:
-        """The verdict as ARITHMETIC, not as a stored string. A sceptic runs this themselves."""
-        return "ADMIT" if self.measured >= self.expectation else "BLOCK"
-
-    def self_consistent(self) -> bool:
-        """Does the stored verdict follow from the stored operands? If not, something composed the
-        table by hand — which is the defect the no-hardcoded-verdicts rule exists to prevent."""
-        return self.verdict == self.recomputed_verdict()
-
-    def to_json(self) -> str:
-        payload = asdict(self)
-        payload["_tier1"] = ["corpus", "instrument", "expectation", "verdict", "base_digest",
-                             "derived_digest", "displayed_diff", "run_nonce"]
-        payload["_tier2"] = ["measured", "boundary_events"]
-        payload["_trust_root"] = (
-            f"Tier 1 is verified against pin {self.corpus.outer_digest[:16]}… as published in release "
-            f"{self.corpus.release}. If that publication channel is compromised, the Tier-1 checks "
-            "here are vacuous. Tier 2 (the measured count) is a CLAIM — replay to check it. Scoped to "
-            "this instance; it is not a statement about artifacts in general."
-        )
-        return json.dumps(payload, indent=2, sort_keys=True)
-
-    def digest(self) -> str:
-        return hashlib.sha256(self.to_json().encode()).hexdigest()
+    member: MemberPath
+    key: ExpectationKey
+    expected_egress: int
 
 
 @dataclass(frozen=True)
@@ -152,49 +128,287 @@ class PinBinding:
     to one corpus and, worse, would let a test construct a ``CompletedRun`` that agrees with the pin
     BY CONSTRUCTION. Passing it in means an adversarial binding can be handed to it, which is the
     only way the seam itself gets tested rather than each end of it.
+
+    ⚠ AND ITS OWN WELL-FORMEDNESS IS ENFORCED, not assumed. Every downstream check reads as a control
+    over malformed pins; a control whose PRECONDITION nothing enforces is the claim-not-a-control
+    shape. A pin naming one fixture as both the zero and the positive control demands that one
+    artifact read both 0 and 1 — unsatisfiable, and previously constructed without complaint.
     """
 
     corpus_digest: str
-    subject_members: frozenset[str]
-    control_member: str
+    subject_rows: frozenset[SubjectPin]
+
+    # ⚠ THE EXACT CARDINALITY, NOT A MINIMUM. ``>= 1`` accepts a one-row table that renders and means
+    # nothing — the empty-set defect at reduced volume. The number is pinned so that a table missing
+    # four of five rows is refused as loudly as one missing all five.
+    expected_cardinality: int
+
+    control_member: MemberPath
     control_floor: int
-    positive_member: str
+    positive_member: MemberPath
     positive_expected: int
     policy_expectation: int
+
+    # Provenance, recorded onto every receipt so a reader is never left inferring where a frozen
+    # number came from.
+    expectation_provenance: str
+
+    def __post_init__(self) -> None:
+        if not self.subject_rows:
+            raise PinInconsistent(
+                "the binding pins ZERO subject rows. Every set check then passes trivially — "
+                "set() == set() — and the drift report returns [] over zero comparisons, which reads "
+                "identically to 'everything agrees'. An empty result is not a value")
+        if self.expected_cardinality != len(self.subject_rows):
+            raise PinInconsistent(
+                f"the binding pins {len(self.subject_rows)} subject rows but declares a cardinality "
+                f"of {self.expected_cardinality}. Two frozen claims in one object disagree")
+
+        members = [r.member for r in self.subject_rows]
+        keys = [r.key for r in self.subject_rows]
+        if len(set(members)) != len(members) or len(set(keys)) != len(keys):
+            raise PinInconsistent(
+                "the binding is not a bijection between members and keys — a member is pinned twice, "
+                "or two members answer to one frozen expectation")
+
+        if self.control_member == self.positive_member:
+            raise PinInconsistent(
+                f"the zero control and the positive control are the SAME member "
+                f"{self.control_member!r}, which demands that one artifact read both "
+                f"{self.control_floor} and {self.positive_expected}. Unsatisfiable")
+        if self.control_member in set(members) or self.positive_member in set(members):
+            raise PinInconsistent(
+                "a control member is also pinned as a subject — the row that validates the other "
+                "rows' numbers cannot also be one of the rows being validated")
+        if self.positive_expected <= 0:
+            raise PinInconsistent(
+                f"the positive control expects {self.positive_expected}, which is not positive. A "
+                "second zero control brackets the same direction twice and certifies nothing about "
+                "under-reporting — the exact half-floor this control exists to close")
+
+    def digest(self) -> str:
+        """A stable identity for the authority itself, committed to by the run header."""
+        payload = {
+            "corpus_digest": self.corpus_digest,
+            "subject_rows": sorted([r.member, r.key, str(r.expected_egress)]
+                                   for r in self.subject_rows),
+            "expected_cardinality": self.expected_cardinality,
+            "control": [self.control_member, self.control_floor],
+            "positive": [self.positive_member, self.positive_expected],
+            "policy_expectation": self.policy_expectation,
+            "expectation_provenance": self.expectation_provenance,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def expectations(self) -> Mapping[ExpectationKey, int]:
+        return {r.key: r.expected_egress for r in self.subject_rows}
+
+
+@dataclass(frozen=True)
+class RunHeader:
+    """THE FIRST SEALED OBJECT, written before any row runs.
+
+    ⚠ WITHOUT IT, ROW 1 HAS NOTHING TO CHAIN TO. A chain that starts at row 1 leaves the first row
+    unanchored, and — more importantly — leaves the whole SET unanchored: a uniformly stale run whose
+    receipts all share one old nonce is internally consistent and passes every equality check. The
+    header closes that structurally rather than by process hygiene, because it commits to the nonce,
+    the instrument, and the binding digest BEFORE any measurement exists to be tempted by.
+    """
+
+    run_nonce: str
+    instrument: Instrument
+    binding_digest: str
+
+    def digest(self) -> str:
+        payload = {"run_nonce": self.run_nonce, "instrument": asdict(self.instrument),
+                   "binding_digest": self.binding_digest, "_kind": "run-header"}
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class CorpusIdentity:
+    """WHICH pinned artifact this row was drawn from. A receipt that cannot name its corpus cannot be
+    tied to anything after a supersession, and every historical receipt becomes unattributable."""
+
+    release: str
+    outer_digest: str
+    member: MemberPath
+    member_digest: str
+
+    # ⚠ THE ROW DECLARES WHICH FROZEN EXPECTATION IT ANSWERS TO. It is not inferred from ``member``.
+    # The previous code derived it at the point of comparison with ``member.split("/")[1]`` — identity
+    # by string surgery, shape-dependent and silent about it.
+    #
+    # ``None`` for control rows, NOT "": an empty string is indistinguishable from a caller who forgot
+    # the field, and the default deferred that failure to table time — after ``run.py`` had already
+    # SEALED the row. Absence is now explicit and fails fast.
+    expectation_key: ExpectationKey | None = None
+
+
+@dataclass(frozen=True)
+class Receipt:
+    """One row's evidence. Sealed AT ROW TIME, while the run's objects still exist."""
+
+    run_nonce: str
+    row: str
+    kind: Literal["subject", "control", "positive"]
+    corpus: CorpusIdentity
+    instrument: Instrument
+
+    # TIER 2 — the measurement. A challenge, not a proof.
+    measured: int
+    # ⚠ TUPLES, NOT LISTS. ``frozen=True`` blocks REBINDING, not ``.append()`` — a sealed receipt's
+    # events could be extended after issuance and its digest recomputed to match, so the seal
+    # certified whatever the object happened to hold when someone last asked.
+    boundary_events: tuple[str, ...]
+
+    # TIER 1 — checkable now.
+    expectation: int
+    verdict: Literal["ADMIT", "BLOCK"]
+
+    # THE CHAIN LINK. Row N commits to row N-1; row 1 commits to the run header.
+    prior_digest: str
+
+    # Provenance of the frozen number this row was judged against, carried rather than inferred.
+    expectation_provenance: str
+
+    # ⚠ THE WITNESS PROBE, PER ROW. A precheck at t₀ certifies the witness AT t₀ and says nothing
+    # about t_end — the same one-sided bracket as the zero-only floor, in a second venue. A witness
+    # answering correctly at the start and wrongly at the end makes the rows already measured
+    # UNINTERPRETABLE, so failure is INSTRUMENT-INVALID and terminal, never drift.
+    witness_verified: bool
+
+    base_digest: str = ""
+    derived_digest: str = ""
+    displayed_diff: str = ""
+    notes: tuple[str, ...] = ()
+
+    def recomputed_verdict(self) -> str:
+        """The verdict as ARITHMETIC, not as a stored string. A sceptic runs this themselves."""
+        return "ADMIT" if self.measured >= self.expectation else "BLOCK"
+
+    def self_consistent(self) -> bool:
+        """Does the stored verdict follow from the stored operands? If not, something composed the
+        table by hand — which is the defect the no-hardcoded-verdicts rule exists to prevent."""
+        return self.verdict == self.recomputed_verdict()
+
+    def events_match_count(self) -> bool:
+        """A free Tier-1 check: the total must be arithmetic over the disclosed events, or the
+        events are decorative and the number is an integer to be believed."""
+        return len(self.boundary_events) == self.measured
+
+    def to_json(self) -> str:
+        payload = asdict(self)
+        payload["_tier1"] = ["corpus", "instrument", "expectation", "verdict", "base_digest",
+                             "derived_digest", "displayed_diff", "run_nonce", "prior_digest",
+                             "expectation_provenance", "witness_verified"]
+        payload["_tier2"] = ["measured", "boundary_events"]
+        payload["_trust_root"] = (
+            f"Tier 1 is verified against pin {self.corpus.outer_digest[:16]}… as published in release "
+            f"{self.corpus.release}. If that publication channel is compromised, the Tier-1 checks "
+            "here are vacuous. Tier 2 (the measured count) is a CLAIM — replay to check it. The seal "
+            "chain makes tampering WITHIN this run detectable; it is NOT an attestation and says "
+            "nothing about who sealed it or when. Scoped to this instance; it is not a statement "
+            "about artifacts in general."
+        )
+        return json.dumps(payload, indent=2, sort_keys=True)
+
+    def digest(self) -> str:
+        """Deterministic over frozen bytes — every field is immutable, so this cannot drift."""
+        return hashlib.sha256(self.to_json().encode()).hexdigest()
+
+
+def verify_measured_against_pin(measured: Mapping[str, int], binding: PinBinding) -> None:
+    """Cross-check the corpus's OWN record against the consumer's frozen expectations. PRE-RUN.
+
+    ⚠ THIS IS THE CASE ``PinInconsistent`` WAS ALWAYS FOR, and until now it had no caller anywhere —
+    the class was defined, documented, and ornamental. ``pin.py``'s docstring already CLAIMED this
+    cross-check existed ("the corpus's own ``MEASURED.json`` is cross-checked against it"); it did
+    not. A claim in prose that no code implements is the defect this repo keeps finding.
+
+    Both sides are FROZEN, written in advance, and neither is measurement. So a disagreement cannot
+    be adjudicated by running anything, and this function deliberately does not try: it names both
+    provenances and refuses. It is TWO-DIRECTIONAL — a key the corpus records but the pin does not
+    demand is as much a contradiction as the reverse, and the one-directional version let the corpus
+    carry frozen claims that were never compared to anything.
+    """
+    want = binding.expectations()
+    ours = {str(k) for k in want}
+    theirs = set(measured)
+
+    only_pin = sorted(ours - theirs)
+    only_corpus = sorted(theirs - ours)
+    if only_pin or only_corpus:
+        raise PinInconsistent(
+            f"the consumer's pin and the corpus's own record name different keys — "
+            f"pinned-but-unrecorded {only_pin}, recorded-but-unpinned {only_corpus}. Both are frozen "
+            f"claims written in advance ({binding.expectation_provenance} vs the corpus record), so "
+            "no measurement can settle which is right. Re-measure and correct the wrong one")
+
+    disagree = sorted((k, want[ExpectationKey(k)], measured[k]) for k in ours
+                      if measured[k] != want[ExpectationKey(k)])
+    if disagree:
+        raise PinInconsistent(
+            f"the consumer's pin and the corpus's own record disagree on frozen counts: "
+            f"{disagree} (key, pinned, recorded). Provenances are {binding.expectation_provenance} "
+            "and the corpus record. This is not drift — neither side is a fresh measurement")
 
 
 class CompletedRun:
     """The ONLY thing a verdict table can be rendered from.
 
-    ⚠ CONSTRUCTIBLE ONLY FROM A COMPLETE SET. Five subject receipts AND the control, all sharing one
-    run nonce. The renderer takes this type as its input rather than reading a directory, so a
-    half-populated table is not something that has to be prevented — it is something that cannot be
-    expressed. Parse, do not validate.
+    ⚠ CONSTRUCTIBLE ONLY FROM A COMPLETE SET, in order, chained to a run header. The renderer takes
+    this type as its input rather than reading a directory, so a half-populated table is not
+    something that has to be prevented — it is something that cannot be expressed. Parse, do not
+    validate.
 
-    The control is part of the construction contract deliberately: without it the guarantee has a
-    hole in exactly the row that validates every other row's number.
+    The controls are part of the construction contract deliberately: without them the guarantee has a
+    hole in exactly the rows that validate every other row's number.
     """
 
-    def __init__(self, receipts: list[Receipt], binding: PinBinding) -> None:
-        # ⚠ THE BINDING IS REQUIRED BY THE SIGNATURE. The previous constructor took an INT — a COUNT,
-        # not an identity — so five receipts for the SAME member plus a control satisfied every
-        # check. That is exactly the defect ``pin.py``'s own comment names about exact sets ("one
-        # member too few or one too many, and a content check cannot see that"), committed one level
-        # up at TABLE level by the code that was supposed to enforce it.
+    def __init__(self, header: RunHeader, receipts: Sequence[Receipt],
+                 binding: PinBinding) -> None:
+        # ⚠ IMMUTABLE FROM THE FIRST LINE. The previous constructor did ``self.receipts = receipts``,
+        # aliasing the CALLER'S list — so a post-construction ``append`` injected unvalidated rows
+        # into the very collection the table renders. The parsed object must be immutable, or the
+        # parse is not a gate.
+        rows = tuple(receipts)
+
+        if header.binding_digest != binding.digest():
+            raise InstrumentInvalid(
+                f"the run header commits to binding {header.binding_digest[:16]}… but the binding "
+                f"supplied is {binding.digest()[:16]}…. The authority changed after the run started")
+
         kinds = {"subject", "control", "positive"}
-        bad_kind = [r.row for r in receipts if r.kind not in kinds]
+        bad_kind = [r.row for r in rows if r.kind not in kinds]
         if bad_kind:
             raise InstrumentInvalid(f"receipts {bad_kind} carry an unknown kind")
 
-        nonces = {r.run_nonce for r in receipts}
-        if len(nonces) != 1:
+        nonces = {r.run_nonce for r in rows}
+        if nonces != {header.run_nonce}:
             raise InstrumentInvalid(
-                f"receipts span {len(nonces)} runs: {sorted(nonces)}. Every row must come from THIS "
-                "run — mixing them is how a stale row survives into a fresh-looking table")
+                f"receipts do not all belong to the header's run: header {header.run_nonce!r}, "
+                f"receipts {sorted(nonces)}. Mixing them is how a stale row survives into a "
+                "fresh-looking table")
 
-        # EVERY receipt must name the pinned corpus. Carried-but-never-adjudicated was how a receipt
-        # from a superseded release could render beside fresh ones.
-        foreign = sorted({r.corpus.outer_digest for r in receipts
+        # THE CHAIN. Row 1 commits to the header, row N to row N-1. A removed or reordered row breaks
+        # it. This is LINKAGE, not attestation.
+        expected_prior = header.digest()
+        for r in rows:
+            if r.prior_digest != expected_prior:
+                raise InstrumentInvalid(
+                    f"the seal chain is broken at row {r.row!r}: it commits to prior "
+                    f"{r.prior_digest[:16]}… but the preceding sealed object is "
+                    f"{expected_prior[:16]}…. A row was removed, reordered, or issued out of band")
+            expected_prior = r.digest()
+
+        unwitnessed = [r.row for r in rows if not r.witness_verified]
+        if unwitnessed:
+            raise InstrumentInvalid(
+                f"rows {unwitnessed} were measured while the witness did not honour its contract. "
+                "Those readings are UNINTERPRETABLE — this is an invalid instrument, never drift")
+
+        foreign = sorted({r.corpus.outer_digest for r in rows
                           if r.corpus.outer_digest != binding.corpus_digest})
         if foreign:
             raise InstrumentInvalid(
@@ -202,11 +416,7 @@ class CompletedRun:
                 f"{binding.corpus_digest}. A table may not mix corpora — the rows would be answers "
                 "to different questions displayed as one")
 
-        # EVERY expectation must come from the POLICY, not from whatever the runner happened to pass.
-        # Three plausible sources existed (the policy, a per-row count, or the corpus's own record —
-        # the circular case the pin exists to prevent) and they yield DIFFERENT verdicts, while
-        # self_consistent() passes for all three.
-        off_policy = [(r.row, r.expectation) for r in receipts
+        off_policy = [(r.row, r.expectation) for r in rows
                       if r.kind == "subject" and r.expectation != binding.policy_expectation]
         if off_policy:
             raise InstrumentInvalid(
@@ -214,22 +424,44 @@ class CompletedRun:
                 f"{binding.policy_expectation}: {off_policy}. The verdict is f(measured, expectation) "
                 "and an unpinned expectation makes the verdict unpinned with it")
 
-        subjects = [r for r in receipts if r.kind == "subject"]
+        subjects = [r for r in rows if r.kind == "subject"]
+
+        # A CONTROL ROW MUST NOT CARRY AN EXPECTATION KEY, and a subject MUST carry a NON-EMPTY one.
+        # Truthiness alone admitted a whitespace key, which then reached a lookup.
+        miskeyed = [r.row for r in rows
+                    if (r.kind == "subject") != (r.corpus.expectation_key is not None
+                                                 and r.corpus.expectation_key.strip() != "")]
+        if miskeyed:
+            raise InstrumentInvalid(
+                f"rows {miskeyed} carry an expectation key inconsistent with their kind: subjects "
+                "must name the frozen expectation they answer to, controls must name none")
+
+        if len(subjects) != binding.expected_cardinality:
+            raise InstrumentInvalid(
+                f"the table has {len(subjects)} subject rows; the pin declares exactly "
+                f"{binding.expected_cardinality}. Not a minimum — a table missing four of five rows "
+                "renders and means nothing, which is the empty-set defect at reduced volume")
+
         members = [r.corpus.member for r in subjects]
         if len(members) != len(set(members)):
             dupes = sorted({m for m in members if members.count(m) > 1})
             raise InstrumentInvalid(
                 f"member(s) {dupes} appear more than once. A count-based check accepted five copies "
                 "of one row as a complete table")
-        if set(members) != set(binding.subject_members):
-            missing = sorted(set(binding.subject_members) - set(members))
-            extra = sorted(set(members) - set(binding.subject_members))
-            raise InstrumentInvalid(
-                f"the subject set does not match the pin — missing {missing}, unexpected {extra}. "
-                "EXACT SET, not a minimum")
 
-        controls = [r for r in receipts if r.kind == "control"]
-        positives = [r for r in receipts if r.kind == "positive"]
+        # EXACT SET OVER PAIRS. A member-only set cannot see a row that names a pinned member under
+        # another pinned row's key; that row would then be compared against the wrong frozen number
+        # and the disagreement would surface as DRIFT — a result — rather than as a broken table.
+        pairs = {(r.corpus.member, r.corpus.expectation_key) for r in subjects}
+        pinned_pairs = {(r.member, r.key) for r in binding.subject_rows}
+        if pairs != pinned_pairs:
+            raise InstrumentInvalid(
+                f"the subject (member, key) set does not match the pin — missing "
+                f"{sorted(pinned_pairs - pairs)}, unexpected {sorted(pairs - pinned_pairs)}. "
+                "EXACT SET of PAIRS, not a minimum and not members alone")
+
+        controls = [r for r in rows if r.kind == "control"]
+        positives = [r for r in rows if r.kind == "positive"]
         if len(controls) != 1 or len(positives) != 1:
             raise InstrumentInvalid(
                 f"a table needs EXACTLY ONE zero control and ONE positive control; got "
@@ -245,12 +477,10 @@ class CompletedRun:
                 f"the positive control names {positive.corpus.member!r}, not the pinned "
                 f"{binding.positive_member!r}")
 
-        # ⚠ THE FLOOR IS TWO-SIDED NOW, AND THAT IS THE WHOLE FIX. Checking only `measured != 0`
+        # ⚠ THE FLOOR IS TWO-SIDED, AND THAT IS THE WHOLE POINT. Checking only `measured != 0`
         # detected OVER-reporting alone: a counter capturing NOTHING reads 0 here, passes, and then
         # every subject reads 0 and surfaces as DRIFT — a displayed RESULT — while the instrument is
-        # dead. Every test this project had ever run used a live counter, so none of them could see
-        # it. The positive control is the other side: a known-nonzero that must read EXACTLY its
-        # value.
+        # dead. Every test this project had ever run used a live counter, so none could see it.
         if control.measured != binding.control_floor:
             raise InstrumentInvalid(
                 f"THE CONTROL DID NOT READ ITS FLOOR: a zero-egress artifact measured "
@@ -264,41 +494,54 @@ class CompletedRun:
                 "drift. This is the other side of the floor, and it is an INVALID INSTRUMENT, not a "
                 "finding about any artifact")
 
-        inconsistent = [r.row for r in receipts if not r.self_consistent()]
+        inconsistent = [r.row for r in rows if not r.self_consistent()]
         if inconsistent:
             raise InstrumentInvalid(
                 f"rows {inconsistent} carry a verdict that does not follow from their own operands — "
                 "the table was not computed from the measurements it displays")
 
-        self.receipts = receipts
+        miscounted = [r.row for r in rows if not r.events_match_count()]
+        if miscounted:
+            raise InstrumentInvalid(
+                f"rows {miscounted} report a total that is not the length of the events they "
+                "disclose — the events are decorative and the number cannot be re-counted")
+
+        self.header = header
+        self.receipts = rows
         self.binding = binding
         self.control = control
         self.positive = positive
-        self.subjects = subjects
-        self.nonce = nonces.pop()
+        self.subjects = tuple(subjects)
+        self.nonce = header.run_nonce
 
-    def drifted(self, expected: dict[str, int]) -> list[tuple[str, int, int]]:
+    def drifted(self) -> list[tuple[str, int, int]]:
         """Rows whose fresh measurement disagrees with the frozen expectation.
 
         This is the RESULT, not a failure. A drift detector that halts on drift detects nothing, and
         a halt-only design trains the one repair that must never be made: editing the expectation to
         match a drifted measurement so the run goes green.
 
-        ⚠ NO SOFT SKIP. The previous version did ``want = expected.get(...)`` and then
-        ``if want is not None``, so a row whose member could not be keyed was SILENTLY PASSED OVER —
-        yielding an empty drift list over ZERO PERFORMED COMPARISONS, which reads identically to
-        "everything agrees". An empty result is not a value. The constructor now guarantees the
-        subject set matches the pin exactly, so an unkeyable row is a LOGIC error and says so.
+        ⚠ NO PARAMETER. The expectations were a bare dict argument — a second, unauthenticated input
+        to the one computation this tool exists to perform, while the design claimed a
+        ``CompletedRun`` was the table's only input. A tampered dict could fabricate or erase drift
+        undetectably, and omitted keys were silently never compared. The authority now arrives inside
+        the binding, committed to by the run header, so the claim is true rather than aspirational.
+
+        ⚠ NO KEY DERIVATION and NO SOFT SKIP. The key is carried on the row and checked against the
+        pin as a PAIR at construction, so nothing here transforms a string, and the exact-cardinality
+        and exact-pair checks make an unkeyed or uncompared row unconstructible rather than skipped.
         """
+        expected = self.binding.expectations()
         out: list[tuple[str, int, int]] = []
         for r in self.subjects:
-            key = r.corpus.member.split("/")[1] if "/" in r.corpus.member else r.corpus.member
-            if key not in expected:
+            key = r.corpus.expectation_key
+            if key is None:                                  # unreachable via the gate; not assumed
                 raise InstrumentInvalid(
-                    f"row {r.row} names member {r.corpus.member!r}, which has no frozen expectation "
-                    f"under key {key!r}. Refusing to report 'no drift' over a comparison that was "
-                    "never performed")
+                    f"row {r.row} reached the drift report with no expectation key. Refusing to "
+                    "report 'no drift' over a comparison that was never performed")
             want = expected[key]
             if r.measured != want:
                 out.append((r.row, want, r.measured))
+        if len(out) > len(self.subjects):                    # arithmetic guard, never expected
+            raise InstrumentInvalid("more drift rows than subjects — the report is not a projection")
         return out

@@ -70,6 +70,45 @@ EXPECTED_EGRESS: dict[str, int] = {
     "retry-good-v2": 3,
 }
 
+# --- THE ROWS, as (member path, expectation key) PAIRS written out literally --------------------
+# ⚠ WRITTEN OUT, NOT DERIVED, AND THAT IS THE ENTIRE POINT. ``EXPECTED_MEMBERS`` above names members
+# by PATH; ``EXPECTED_EGRESS`` names them by KEY. The relationship between the two was previously
+# inferred at the point of use by a string transform — ``member.split("/")[1]``, falling back to the
+# whole string when there was no slash. That is identity by string surgery, and it has the same shape
+# as every other defect this project keeps finding: TWO PLACES DERIVING THE SAME NAME BY DIFFERENT
+# MEANS.
+#
+# Concretely, the transform is not merely fragile, it is SILENTLY shape-dependent: a member at
+# ``a/b/c`` keys on ``b``, while a member with no slash keys on ITSELF. Two naming conventions produce
+# two key spaces with nothing announcing the switch. The member names are frozen contract as of the
+# tag, so today it happens to be right — which is precisely the condition under which a latent
+# derivation bug survives review.
+#
+# So the pairing is DATA, declared once, here, beside the two sets it relates. It is deliberately NOT
+# generated from either of them: generating it would make the cross-check agree BY CONSTRUCTION and
+# test nothing. Two independent literal declarations, cross-checked by a test, is the shape that can
+# actually go red.
+SUBJECT_ROWS: frozenset[tuple[str, str]] = frozenset({
+    ("fixtures/retry-swallow-v2/main.py", "retry-swallow-v2"),
+    ("fixtures/retry-swallow-v2-mutated-behavioural/main.py", "retry-swallow-v2-mutated-behavioural"),
+    ("fixtures/retry-swallow-v2-mutated-cosmetic/main.py", "retry-swallow-v2-mutated-cosmetic"),
+    ("fixtures/two-unconditional-egresses-v1/main.py", "two-unconditional-egresses-v1"),
+    ("fixtures/retry-good-v2/main.py", "retry-good-v2"),
+})
+
+# ⚠ THE EXACT CARDINALITY, PINNED. Not a minimum and not derived by ``len()`` of the set above —
+# deriving it would make the check agree BY CONSTRUCTION with whatever the set happens to hold, so a
+# row silently dropped from SUBJECT_ROWS would take the expected count down with it and nothing would
+# notice. Written as a literal, it is a second frozen claim that a dropped row must contradict.
+#
+# ``>= 1`` was considered and REFUSED: a one-row table renders, reports "no drift", and means nothing
+# — the empty-set defect at reduced volume rather than a different defect.
+SUBJECT_CARDINALITY = 5
+
+# THE PROVENANCE STRING carried onto every receipt, so a reader is never left inferring where a
+# frozen number came from.
+EXPECTATION_PROVENANCE = "demo/pin.py::EXPECTED_EGRESS (consumer-side authority, not the corpus)"
+
 # DEMO POLICY, and only that. Deliberately NOT in the corpus: freezing a threshold into a public
 # digest-pinned artifact would make one demo's policy into corpus truth that every later consumer
 # conforms to. The corpus records COUNTS; the verdict rule lives with the consumer that applies it.
