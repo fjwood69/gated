@@ -157,3 +157,41 @@ resolver is deleted (not aliased), and the guard that caught it is discharged tw
 fixing the false positive did not remove its ability to fire.
 
 Nothing above was edited to match the result.
+
+## Appended 2026-08-01 — RESULT
+
+Both attempts are recorded here. A pre-registration that records only the run it
+accepted never rejected anything, which is the shape it exists to avoid.
+
+**Attempt 1 — `18:10 BST, commit 5ec5433` — EXIT 3, NOT a first run.**
+Fired at stage `[measure]` on row 1, the P1 branch. This module carried its own
+image resolver returning bare hex while the sandbox used `resolve_image_id`
+returning `sha256:`-prefixed: one image, two derivations, and the comparison read
+a format disagreement as "the image changed mid-run". Zero rows sealed, nothing
+written, taxonomy held. Per this document the attempt establishes nothing, and it
+is not recorded as a first run. Artifacts: `/tmp/firstrun/`.
+
+**Attempt 2 — `18:20 BST, commit 18dad77` — EXIT 0, the first run.**
+Every checklist item above ticks: preflight, both digest layers, pin↔corpus
+cross-check, an instrument that named itself (`sha256:b9943e88…`), a header sealed
+before any row, 7 of 7 rows sealed with an unbroken chain, `CompletedRun`
+constructed, **zero control read exactly 0 and positive control exactly 1**, both
+mutated rows' diffs reproducing their derived bytes, and a verdict table plus a
+run report with no verdict column. All five subjects matched their frozen counts
+(3, 3, 1, 1, 2) — exit 0, no drift. Artifacts: `/tmp/firstrun2/`.
+
+### What attempt 2 did NOT establish — recorded as prominently as what it did
+
+- **Not determinism.** n=1. The runner has never repeated itself. The
+  fifteen-runs-zero-variance figure elsewhere in this project is fixtures through
+  the ENGINE, not through this runner, and is the limit most likely to be read as
+  already-established because the number exists and is attached to something else.
+  Three greens through the full runner path would close it cheaply.
+- **Not the witness contract.** A witness serving a success mid-row remains
+  invisible to every probe a receipt carries.
+- **Not attestation.** `seal_mode` is self-reported; the chain is linkage only.
+- **Not the retry-engine flake.** One red in three full-suite runs, never
+  reproduced, five subsequent greens banked, root cause unknown — in the engine
+  this demo demonstrates.
+
+Nothing above this appendix was edited to match either result.

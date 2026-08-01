@@ -56,6 +56,97 @@ passed.
 Your test asked whether a usable value came back — it did. `gated` asked whether
 the retry happened — it didn't.
 
+## Run it yourself
+
+Everything above was measured by someone else. This part you can run.
+
+```bash
+git clone https://github.com/fjwood69/gated && cd gated
+python -m demo.run          # needs rootless podman and ~2 minutes
+```
+
+It downloads a digest-pinned corpus of five fixtures, runs each one sealed, counts
+the boundary attempts, and compares them against counts frozen at a published
+release. **The table below is the real output of a real run — not a mock-up:**
+commit `18dad77`, exit `0`, artifacts retained.
+
+```
+  row                                                     frozen  measured  verdict
+  fixtures/retry-good-v2/main.py                               3         3    ADMIT
+  fixtures/retry-swallow-v2-mutated-behavioural/main.py        3         3    ADMIT
+  fixtures/retry-swallow-v2-mutated-cosmetic/main.py           1         1    BLOCK
+  fixtures/retry-swallow-v2/main.py                            1         1    BLOCK
+  fixtures/two-unconditional-egresses-v1/main.py               2         2    ADMIT
+
+  control  zero-egress-control              floor 0, read 0
+  positive one-egress-positive-control      known 1, read 1
+```
+
+Read the middle two rows together. Both are edits of the same file. **The cosmetic
+edit moved nothing — 1, still BLOCK. The behavioural edit moved the count from 1
+to 3.** That is the entire "runtime, not static" claim in two rows, measured rather
+than asserted.
+
+The last two rows are the instrument checking itself. A zero-egress artifact must
+read exactly 0 and a known-one-egress artifact exactly 1 — bracketing the counter
+from both directions. A reading that is low, high, or absent is an **invalid
+instrument**, not a finding about any artifact, and the run refuses rather than
+publishing a table.
+
+### Exit 2 is a result, not a failure
+
+**This is a drift detector.** If a fresh measurement disagrees with a frozen count
+it exits `2` and prints the disagreement. That is the tool working, not breaking.
+
+| exit | meaning |
+|---:|---|
+| `0` | every row matched its frozen count |
+| `2` | **drift — the result.** Something moved; go find out what |
+| `3` | invalid instrument. Nothing was measured; no claim is made about any artifact |
+| `4` | two frozen claims contradict each other, detected before anything runs |
+| `5` / `6` | corpus unreachable / corpus obtained and wrong |
+
+A drift detector that halted on drift would detect nothing. The one repair that
+must never be made is editing the frozen expectation until the run goes green.
+
+### What you can re-derive, and what you must re-measure
+
+Each row writes a `receipt.json`, and the two are not the same kind of claim:
+
+- **Re-derivable now, from the receipt alone** — digests against the published
+  release; for the mutated rows, the displayed diff applied to the base
+  reproducing the derived bytes exactly; the verdict recomputed as
+  `f(measured, expectation)`; the seal chain from the run header through every row.
+- **Only checkable by re-measuring** — the counts. Every receipt stamps them
+  `UNCORROBORATED`, because the boundary observer records a total and no per-event
+  record. A count you cannot re-count is a challenge, not a proof, and the receipt
+  says so rather than letting the number pass as evidence.
+
+The seal chain makes tampering *within* a run detectable. It is **not** an
+attestation: it says nothing about who ran it or when, and `seal_mode` is recorded
+as self-reported.
+
+### What this demo does not do
+
+- **Bring your own artifact — named, not built.** There is no `--my-repo` flag. The
+  corpus is five pinned fixtures, and pointing this at your own code is the next
+  increment, not a missing switch. A demo that generalises is the reasonable
+  assumption; this one does not yet.
+- **It is not a PBGF-CS §4.3 preregistration record.** Expectations are pinned and
+  cross-checked before execution; they are not signed.
+- **One run is n=1.** The runner has been executed end-to-end once. The
+  fifteen-runs-zero-variance figure elsewhere in this project is fixtures through
+  the *engine*, not through this runner — the runner has never repeated itself.
+- **The witness contract is not verified.** A boundary observer that answered
+  correctly at the start and served a success mid-row would be invisible to every
+  probe a receipt carries. Closing that needs per-event response codes.
+- **An unexplained test failure stands.** One red in the retry-engine suite,
+  in three full-suite runs, never reproduced, five subsequent runs green. Root
+  cause unknown.
+
+`demo/FIRST-RUN.md` records what counted as a successful first run — written and
+committed *before* the run, and it rejected the first attempt.
+
 ## Why runtime, not static
 
 Static analysis reasons about the *text* of a program. Any check that reads
@@ -122,6 +213,11 @@ anyway."* It records only what the gate itself can attest, never more. Every
 merge is then either gate-approved or consciously overridden, with a record.
 
 ## Where to check the claims
+
+Two doors, and they answer different questions. **[Run it yourself](#run-it-yourself)**
+above is a gate you can re-derive. Below is the reviewer comparison, which the demo
+does not do: a frontier model's opinion on the same files, published by someone
+other than this engine.
 
 The demonstrations on this page were produced by a separate repository:
 **[gated-uat](https://github.com/fjwood69/gated-uat)**, an external harness that
