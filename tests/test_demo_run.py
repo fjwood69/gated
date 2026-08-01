@@ -419,3 +419,127 @@ class OneCanonicalResolver(unittest.TestCase):
         from demo.receipt import Instrument
         r = Instrument("g", "sha256:i", "podman", "podman version 4.9.3", "sealed", "w").render()
         self.assertNotIn("podman podman", r)
+
+
+class TheNoVCSRefusalTellsYouWhatToDo(unittest.TestCase):
+    """Three real stranger paths reach this refusal and need DIFFERENT fixes. A single generic hint
+    would be wrong for two of them, so the hint is DERIVED from git's own stderr — the same contract
+    preflight keeps: a remediation wherever one is mechanically derivable."""
+
+    CASES = [
+        ("fatal: not a git repository (or any of the parent directories): .git",
+         "no `.git` here at all", "zip / vendored copy"),
+        ("fatal: not a git repository: /nonexistent/path",
+         "git WORKTREE", "worktree whose gitdir is absent"),
+        ("fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.",
+         "NO COMMITS", "checkout with no history"),
+        ("fatal: detected dubious ownership in repository at '/x'",
+         "owned by another user", "foreign-owned checkout"),
+    ]
+
+    def test_each_failure_mode_gets_its_OWN_remediation(self) -> None:
+        seen = set()
+        for stderr, expected, label in self.CASES:
+            hint = run.vcs_hint(stderr)
+            self.assertIn(expected, hint, f"wrong hint for {label}")
+            seen.add(hint)
+        self.assertEqual(len(seen), len(self.CASES),
+                         "two failure modes produced the SAME hint — then it is generic, and generic "
+                         "is wrong for at least one of them")
+
+    def test_an_EMPTY_stderr_does_not_invent_a_diagnosis(self) -> None:
+        """Silence where nothing is derivable, rather than a guess presented as a finding."""
+        self.assertIn("no diagnostic", run.vcs_hint(""))
+
+    def test_the_REFUSAL_still_refuses(self) -> None:
+        """The guard is right and does not soften: an unidentified instrument must not seal."""
+        with self.assertRaises(InstrumentInvalid) as c:
+            run.require_nameable("unknown", "podman 4.9.3", "sha256:aa",
+                                 "fatal: not a git repository (or any of the parent directories): .git")
+        msg = str(c.exception)
+        self.assertIn("cannot name itself", msg)
+        self.assertIn("hint", msg)
+        self.assertIn("git clone", msg)
+
+    def test_a_RESOLVED_instrument_still_passes(self) -> None:
+        run.require_nameable("abc123", "podman 4.9.3", "sha256:aa", "")
+
+    def test_git_commit_returns_its_own_diagnostic(self) -> None:
+        """The stderr is carried, not swallowed — that is what makes the hint derivable."""
+        commit, diag = run._git_commit()
+        self.assertIsInstance(commit, str)
+        self.assertIsInstance(diag, str)
+
+    def test_git_stderr_is_CARRIED_from_the_probe_to_the_hint(self) -> None:
+        """THE SEAM. Reverting `_git_commit` to swallow stderr left every other test green, because
+        they all hand the stderr to `require_nameable` directly. This drives the real probe against a
+        real non-repository and requires the derived hint to come out the other end."""
+        import tempfile
+        commit, diag = run._git_commit(Path(tempfile.mkdtemp()))
+        self.assertIsNone(commit, "absence must be typed, not spelled")
+        self.assertTrue(diag, "git's diagnostic was swallowed — the hint cannot be derived from it")
+        self.assertIn("no `.git` here at all", run.vcs_hint(diag))
+
+
+class TheProbeIsDrivenNotJustItsMapper(unittest.TestCase):
+    """⚠ THE TESTS THAT MISSED A P1. Every earlier test fed ``vcs_hint`` a string directly, so the
+    mapping was verified and the CONTROL was not. Dissent found that ``git rev-parse HEAD`` in a
+    repository with NO COMMITS prints the literal "HEAD" to stdout while exiting 128 — so reading
+    stdout alone returned "HEAD" as a commit: truthy, not a sentinel, refusal never fires, and
+    receipts seal under the identity "HEAD". Measured, not assumed.
+
+    These drive the real probe against real git states, end to end, and assert refusal."""
+
+    def _repo(self, *cmds: list[str]) -> Path:
+        import subprocess
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        for c in cmds:
+            subprocess.run(c, cwd=d, capture_output=True)
+        return d
+
+    def test_an_UNBORN_repo_does_NOT_seal_under_the_string_HEAD(self) -> None:
+        d = self._repo(["git", "init", "-q", "."])
+        commit, diag = run._git_commit(d)
+        self.assertIsNone(commit, "stdout said 'HEAD'; the exit status said 128 and it is authority")
+        with self.assertRaises(InstrumentInvalid):
+            run.require_nameable(commit, "podman 4.9.3", "sha256:aa", diag)
+        self.assertIn("NO COMMITS", run.vcs_hint(diag))
+
+    def test_a_NON_REPO_refuses_end_to_end_with_the_right_hint(self) -> None:
+        import tempfile
+        commit, diag = run._git_commit(Path(tempfile.mkdtemp()))
+        with self.assertRaises(InstrumentInvalid) as c:
+            run.require_nameable(commit, "podman 4.9.3", "sha256:aa", diag)
+        self.assertIn("no `.git` here at all", str(c.exception))
+
+    def test_a_REAL_repo_resolves_and_the_guard_RETURNS_the_triple(self) -> None:
+        """Without this every refusal above is indistinguishable from a probe that never succeeds."""
+        d = self._repo(["git", "init", "-q", "."],
+                       ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+                        "commit", "-q", "--allow-empty", "-m", "x"])
+        commit, diag = run._git_commit(d)
+        self.assertIsNotNone(commit)
+        assert commit is not None
+        self.assertEqual(len(commit), 40, "a resolved commit is a full sha")
+        triple = run.require_nameable(commit, "podman 4.9.3", "sha256:aa", diag)
+        self.assertEqual(triple, (commit, "podman 4.9.3", "sha256:aa"))
+
+    def test_a_BOGUS_GIT_DIR_is_not_misdiagnosed_as_a_worktree(self) -> None:
+        """The colon branch claimed 'worktree, re-clone' for GIT_DIR too — a WRONG claim, not a
+        degradation. Git quotes the path in the GIT_DIR form and leaves it bare for a worktree."""
+        self.assertIn("GIT_DIR", run.vcs_hint("fatal: not a git repository: '/nonexistent/x'"))
+        self.assertIn("WORKTREE", run.vcs_hint("fatal: not a git repository: /nonexistent/x"))
+
+    def test_git_MISSING_and_git_TIMEOUT_get_their_own_remediations(self) -> None:
+        self.assertIn("not installed", run.vcs_hint("FileNotFoundError: [Errno 2] ... 'git'"))
+        self.assertIn("did not respond", run.vcs_hint("TimeoutExpired: Command ... timed out"))
+
+    def test_the_ownership_hint_leads_with_the_SAFE_remedies(self) -> None:
+        """It is the one hint that could teach disabling a security control."""
+        for spelling in ("fatal: detected dubious ownership in repository at '/x'",
+                         "fatal: unsafe repository ('/x' is owned by someone else)"):
+            h = run.vcs_hint(spelling)
+            self.assertLess(h.index("Re-clone"), h.index("safe.directory"),
+                            "the override must not be the first thing a hurried reader copies")
+            self.assertIn("IF YOU TRUST", h)

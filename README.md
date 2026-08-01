@@ -134,9 +134,20 @@ as self-reported.
   assumption; this one does not yet.
 - **It is not a PBGF-CS §4.3 preregistration record.** Expectations are pinned and
   cross-checked before execution; they are not signed.
-- **One run is n=1.** The runner has been executed end-to-end once. The
-  fifteen-runs-zero-variance figure elsewhere in this project is fixtures through
-  the *engine*, not through this runner — the runner has never repeated itself.
+- **It has run on ONE MACHINE.** Podman 4.9.3, Ubuntu 24.04, rootless, one
+  kernel, one storage configuration. Fedora with podman 5.x, a different storage
+  backend, or a host where `user.max_net_namespaces` is constrained are entirely
+  unexercised. If it fails on yours, that is a finding and I would like the
+  report — it is not a claim I have tested and it is not one you should assume.
+- **The preflight refusal is under-tested in the same way.** If your host cannot
+  run this, preflight is supposed to refuse legibly and tell you why. That has
+  been demonstrated against one deliberately constructed failure, not against the
+  variety a real machine produces.
+- **Three runs is n=3, on that one machine.** The runner produced byte-identical
+  verdict tables across three consecutive runs with three distinct run nonces —
+  same reading three times, from three readings. That is determinism observed on
+  one host, not a general claim. The fifteen-runs-zero-variance figure elsewhere
+  in this project measured fixtures through the *engine*, not through this runner.
 - **The witness contract is not verified.** A boundary observer that answered
   correctly at the start and served a success mid-row would be invisible to every
   probe a receipt carries. Closing that needs per-event response codes.

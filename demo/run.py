@@ -34,6 +34,7 @@ import argparse
 import difflib
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import uuid
@@ -207,28 +208,102 @@ def render_and_prove(base_bytes: bytes, derived_bytes: bytes, base_name: str,
 # --------------------------------------------------------------------------------------------
 # Instrument identity
 # --------------------------------------------------------------------------------------------
-def _git_commit() -> str:
+def _git_commit(cwd: Path | None = None) -> tuple[str | None, str]:
+    """Return (commit, diagnostic). The diagnostic is git's OWN stderr, kept so the refusal can
+    derive a remediation instead of guessing one.
+
+    ``cwd`` is a parameter so a test can point this at a REAL non-repository and get REAL git stderr.
+    Without it the carrying of the diagnostic was untestable — a revert that swallowed stderr left
+    the suite green, because every test handed the stderr to the refusal directly and none exercised
+    the path that produces it."""
     try:
-        out = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-                             cwd=Path(__file__).resolve().parent.parent, timeout=10)
-        return out.stdout.strip() or "unknown"
-    except (OSError, subprocess.SubprocessError):
-        return "unknown"
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+            cwd=cwd or Path(__file__).resolve().parent.parent, timeout=10,
+            # LC_ALL=C pins the child's locale so the messages below are the ones actually
+            # matched. MERGED into the environment, never replacing it — a bare env= would drop
+            # PATH and manufacture the git-not-found case this function is meant to detect.
+            env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (None, f"{type(exc).__name__}: {exc}")
+    # ⚠ THE EXIT STATUS IS THE AUTHORITY, NOT stdout. ``git rev-parse HEAD`` in a repository with
+    # NO COMMITS prints the literal "HEAD" to stdout and exits 128 — measured, not assumed. Reading
+    # stdout alone therefore returned the string "HEAD" as a commit: truthy, not a sentinel, and so
+    # the refusal NEVER FIRED and receipts would have sealed under the identity "HEAD". That is
+    # precisely the failure this guard exists to prevent, and no test could see it because every
+    # test fed the hint mapper directly rather than driving this probe.
+    if out.returncode != 0:
+        return (None, out.stderr.strip())
+    return (out.stdout.strip() or None, out.stderr.strip())
 
 
-def _runtime_version(runtime: str) -> str:
+def vcs_hint(stderr: str) -> str:
+    """DERIVE the remediation from git's own failure, rather than printing one generic line.
+
+    ⚠ THREE REAL STRANGER PATHS REACH THIS REFUSAL AND THEY NEED DIFFERENT FIXES: a zip or vendored
+    copy has no ``.git`` at all; a git worktree's ``.git`` is a FILE pointing at a gitdir that may be
+    absent; a fresh checkout may have no commits. A single generic hint would be wrong for two of
+    them. Git distinguishes the cases in its own stderr, so the hint is derived from the failure
+    rather than guessed at — which is the contract preflight already keeps: a remediation wherever
+    one is MECHANICALLY DERIVABLE, and silence rather than invention where it is not.
+    """
+    s = stderr.lower()
+    if "filenotfounderror" in s or "no such file or directory: 'git'" in s:
+        return "`git` is not installed or not on PATH. Install git, or run from a host that has it"
+    if "timeoutexpired" in s:
+        return ("`git` did not respond within the timeout. A very large repository or a stalled "
+                "filesystem can do this; retry, or run from a healthy checkout")
+    # "dubious ownership" (modern git) and "unsafe repository" (Git-for-Windows and some backports)
+    # are the same condition under two spellings.
+    if "dubious ownership" in s or "unsafe repository" in s:
+        # ⚠ THIS IS THE ONE HINT THAT COULD TEACH DISABLING A SECURITY CONTROL. Git's ownership
+        # guard exists against hostile checkouts, and a repository's own config can name executables.
+        # So the safe remedies lead, and the override is offered LAST and CONDITIONALLY — never as
+        # the first thing a hurried reader copies.
+        return ("this checkout is owned by another user and git refuses to read it. Re-clone it "
+                "yourself, or run as the owner. Only IF YOU TRUST this checkout, "
+                "`git config --global --add safe.directory <path>` — that grant is permanent and "
+                "lets the repository's own config run programs on your behalf")
+    if "ambiguous argument 'head'" in s or "needed a single revision" in s:
+        return ("this usually means a git repository with NO COMMITS, so there is no commit to "
+                "name. Run from a checkout that has history — a fresh `git clone` of the repo")
+    if "not a git repository: '" in s:
+        # QUOTED path == the GIT_DIR form. The worktree form prints the path unquoted. Measured.
+        return ("GIT_DIR appears to point somewhere that is not a repository. `unset GIT_DIR` (some "
+                "CI images export it), or run from a checkout where git resolves normally")
+    if "not a git repository:" in s:
+        return ("this usually means a git WORKTREE whose `.git` file points at a gitdir that is not "
+                "present here (copying a worktree without its parent repository does this). Run "
+                "from the main checkout, or `git clone` the repo fresh")
+    if "not a git repository" in s:
+        return ("there is no `.git` here at all — a zip download, a vendored copy, or an extracted "
+                "tarball. Run from a git checkout: `git clone https://github.com/fjwood69/gated`")
+    if not stderr:
+        return ("`git` produced no diagnostic. Check that git is installed and that this directory "
+                "is a checkout with at least one commit")
+    return ("git could not name this commit. Run from a git checkout where `git rev-parse HEAD` "
+            "succeeds")
+
+
+def _runtime_version(runtime: str) -> str | None:
+    """``None`` when it could not be found out — the same typed absence as ``_git_commit``."""
     try:
-        out = subprocess.run([runtime, "--version"], capture_output=True, text=True, timeout=10)
-        return out.stdout.strip() or "unknown"
+        out = subprocess.run([runtime, "--version"], capture_output=True, text=True, timeout=10,
+                             env={**os.environ, "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):
-        return "unknown"
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
 
 
-# Values that mean "I could not find out". They must never be SEALED as an identity.
-UNRESOLVED = ("", "unknown", "pending")
+# Legacy spellings of "I could not find out", kept ONLY because a caller may still produce them.
+# ``None`` is the sanctioned form; these are refused as well so an old spelling cannot slip through.
+UNRESOLVED = ("unknown", "pending")
 
 
-def require_nameable(gate_commit: str, runtime_version: str, image_digest: str) -> None:
+def require_nameable(gate_commit: str | None, runtime_version: str | None,
+                     image_digest: str | None, vcs_stderr: str = "") -> tuple[str, str, str]:
     """Refuse BEFORE any row runs if the instrument cannot name itself.
 
     ⚠ THIS EXISTS AS A FUNCTION BECAUSE THE INLINE VERSION WAS UNTESTABLE. Its only test was a
@@ -239,16 +314,32 @@ def require_nameable(gate_commit: str, runtime_version: str, image_digest: str) 
     could. So the resolution needs its own refusal, and this is the cheapest possible place to stop:
     nothing has been measured, nothing has been sealed.
     """
+    # ⚠ ABSENCE IS TYPED, NOT SPELLED. Membership of a sentinel TUPLE meant any failed resolution
+    # whose value was not one of those exact strings sealed silently — ``None`` (Python's idiomatic
+    # failure value) passed the gate, as would "error" or "n/a". The vocabulary was open across
+    # three producers and the coupling was invisible. ``None`` or blank is now the only way to say
+    # "I could not find out", and it is unrepresentable as a resolved value.
     unnameable = [n for n, v in (("gate commit", gate_commit),
                                  ("runtime version", runtime_version),
                                  ("image digest", image_digest))
-                  if v in UNRESOLVED]
+                  if v is None or not v.strip() or v.strip() in UNRESOLVED]
     if unnameable:
+        # The REFUSAL stands — an unidentified instrument must not seal. What changes is that it now
+        # tells the reader what to do, which is preflight's contract and was missing here: three real
+        # stranger paths hit this message and got a correct diagnosis with no next step.
+        hint = f"\n  hint    : {vcs_hint(vcs_stderr)}" if "gate commit" in unnameable else ""
+        detail = f"\n  git     | {vcs_stderr}" if vcs_stderr else ""
         raise InstrumentInvalid(
             f"the instrument cannot name itself: {unnameable} did not resolve. Receipts sealed under "
             "an unidentified instrument are bound to nothing — when drift first fires, every pinned "
             "quantity is exonerated by construction and the real cause sits in whatever was never "
-            "named. Refusing before any row runs")
+            f"named. Refusing before any row runs.{detail}{hint}")
+    # ⚠ RETURNS THE VALIDATED TRIPLE so the caller cannot reach a sealed identity WITHOUT passing
+    # through this gate. A guard that only raises leaves the optional values in the caller's hand and
+    # the type checker unconvinced; handing back non-optional values makes "identity that skipped the
+    # check" unrepresentable rather than merely discouraged.
+    assert gate_commit is not None and runtime_version is not None and image_digest is not None
+    return (gate_commit, runtime_version, image_digest)
 
 
 def read_recorded_counts(path: Path) -> dict[str, int]:
@@ -548,7 +639,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         #
         # A gate that cannot name itself must refuse rather than attest. Each of these degraded
         # silently to "unknown" and was sealed as the gate's identity.
-        gate_commit = _git_commit()
+        gate_commit, vcs_stderr = _git_commit()
         runtime_version = _runtime_version(args.runtime)
         # ⚠ THE ENGINE'S OWN RESOLVER, NOT A SECOND ONE. The first live run died here: this module
         # had its own ``_resolve_image_digest`` returning bare hex from ``{{.Id}}`` while the sandbox
@@ -562,7 +653,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise InstrumentInvalid(
                 f"the image identity could not be resolved: {type(exc).__name__}: {exc}. Nothing "
                 "will be sealed under an unidentified instrument") from exc
-        require_nameable(gate_commit, runtime_version, image_digest)
+        gate_commit, runtime_version, image_digest = require_nameable(
+            gate_commit, runtime_version, image_digest, vcs_stderr)
 
         stage("seal-run-header")
         instrument = Instrument(
