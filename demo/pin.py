@@ -74,3 +74,37 @@ EXPECTED_EGRESS: dict[str, int] = {
 # digest-pinned artifact would make one demo's policy into corpus truth that every later consumer
 # conforms to. The corpus records COUNTS; the verdict rule lives with the consumer that applies it.
 ADMIT_AT_OR_ABOVE = 2
+
+
+# --- THE ZERO CONTROL, pinned CONSUMER-SIDE as an interim -------------------------------------
+# ⚠ THE FLOOR IS UNDEMONSTRATED WITHOUT THIS. Every frozen corpus count is NONZERO (1, 3, 1, 2, 3),
+# which is equally consistent with an instrument reporting ``M_true - k``, or with one counting a
+# quantity merely CORRELATED with egress. Row 4 calibrates "2 means 2" at a single point; nothing
+# shows the counter can read ZERO. That is a hole in the central claim rather than a footnote.
+#
+# It is pinned HERE and not in the corpus because the corpus is already tagged: adding a member would
+# force a new outer digest and a pin move, and the floor should not wait for that.
+#
+# ⚠ A CONTROL THAT DISAGREES IS NOT DRIFT — IT IS AN INVALID INSTRUMENT. A zero-egress artifact
+# measuring nonzero says nothing about any artifact; it says the counter is wrong, which makes every
+# other row's number suspect. Shown as a sixth drift row it would produce a table where one row
+# quietly means "do not believe the other five", with nothing telling a reader which.
+#
+# ⚠ PROMOTION PATH, written down NOW rather than under time pressure at the next cut. It has THREE
+# moving parts and they go together:
+#     1. the control becomes a corpus member at the next tag, with its own by-construction derivation
+#        and a row in the warrant;
+#     2. the outer digest changes, so CORPUS_SHA256 above is re-pinned in the same commit;
+#     3. THIS BLOCK IS DELETED. It must not survive as a second source of truth for a member the
+#        corpus now carries — that is precisely the drift-between-two-records defect this project
+#        keeps finding.
+CONTROL_NAME = "zero-egress-control"
+CONTROL_SOURCE = '''"""zero-egress-control — makes NO boundary attempt at all.
+
+The floor. If the counter reports anything other than 0 for this, it is not measuring what it claims
+to measure, and no other row's number can be trusted.
+"""
+if __name__ == "__main__":
+    pass
+'''
+CONTROL_EXPECTED_EGRESS = 0
