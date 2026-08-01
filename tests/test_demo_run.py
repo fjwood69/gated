@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import difflib
 import unittest
+from pathlib import Path
 
 from demo import pin, run
+from demo.fetch import CorpusIntegrityError
 from demo.receipt import InstrumentInvalid
 
 BASE = """import socket
@@ -143,7 +145,7 @@ class CorrespondenceIsDataNotComputation(unittest.TestCase):
         every metadata key in the file ("format_version", "note", "witness_condition") as though they
         were expectation keys. Written from memory of the schema instead of from the file."""
         src = open(run.__file__).read()
-        self.assertIn('measured_json["egress_counts"]', src)
+        self.assertIn('raw["egress_counts"]', src)
         self.assertNotIn('.get("egress"', src)
 
 
@@ -289,3 +291,69 @@ class NothingIsSealedThatWasNotMeasured(unittest.TestCase):
                     if isinstance(node, ast.Call) for kw in node.keywords
                     if kw.arg == "image_digest" and isinstance(kw.value, ast.Constant)]
         self.assertNotIn("pending", literals, "the header must not seal a placeholder digest")
+
+
+class AMalformedCorpusIsINTEGRITYNotATraceback(unittest.TestCase):
+    """P3-3. `json.loads`, `["egress_counts"]` and `int(v)` raised OUTSIDE the four refusal classes,
+    so a corpus that matched its pinned digest perfectly and then carried unusable contents produced
+    a raw traceback and exit 1. A digest pins BYTES, NOT SEMANTICS."""
+
+    def _write(self, text: str) -> Path:
+        import tempfile
+        p = Path(tempfile.mkdtemp()) / "MEASURED.json"
+        p.write_text(text)
+        return p
+
+    def test_unparseable_json_is_CORPUS_INTEGRITY(self) -> None:
+        with self.assertRaises(CorpusIntegrityError):
+            run.read_recorded_counts(self._write("{not json"))
+
+    def test_a_MISSING_egress_counts_key_is_CORPUS_INTEGRITY(self) -> None:
+        with self.assertRaises(CorpusIntegrityError) as c:
+            run.read_recorded_counts(self._write('{"format_version": 1}'))
+        self.assertIn("BYTES, NOT SEMANTICS", str(c.exception))
+
+    def test_an_EMPTY_counts_object_is_refused(self) -> None:
+        """It would cross-check against nothing and pass — an empty result is not a value."""
+        with self.assertRaises(CorpusIntegrityError) as c:
+            run.read_recorded_counts(self._write('{"egress_counts": {}}'))
+        self.assertIn("empty result is not a value", str(c.exception))
+
+    def test_a_NON_INTEGER_count_is_refused_rather_than_coerced(self) -> None:
+        for bad in ('"3"', "3.5", "null", "true"):
+            with self.assertRaises(CorpusIntegrityError, msg=bad):
+                run.read_recorded_counts(self._write('{"egress_counts": {"a": %s}}' % bad))
+
+    def test_a_WELL_FORMED_record_is_accepted(self) -> None:
+        """Without this every refusal above is indistinguishable from a function that refuses all."""
+        got = run.read_recorded_counts(self._write('{"egress_counts": {"a": 3, "b": 0}}'))
+        self.assertEqual(got, {"a": 3, "b": 0})
+
+    def test_the_parse_is_INSIDE_the_taxonomy(self) -> None:
+        """CorpusIntegrityError is one of main()'s four caught classes, so this maps to exit 6."""
+        src = open(run.__file__).read()
+        self.assertIn("except CorpusIntegrityError", src)
+        self.assertIn("read_recorded_counts(corpus", src)
+
+
+class TheDocstringsDoNotOverclaim(unittest.TestCase):
+    def test_apply_unified_does_NOT_call_itself_the_proof(self) -> None:
+        """The demo's whole subject is what constitutes proof. A reader following the code to find
+        the proof would land on the parser and stop."""
+        doc = run.apply_unified.__doc__ or ""
+        self.assertNotIn("ONLY THING HERE THAT PROVES", doc)
+        # The SECTION BANNER above it carried the same overclaim — a docstring-only check would
+        # have passed while the file still told a reader the applier was the proof.
+        self.assertNotIn("the only actual proof", open(run.__file__).read())
+        self.assertIn("NOT THE PROOF", doc)
+        self.assertIn("render_and_prove", doc)
+
+    def test_receipt_does_not_narrate_a_field_it_does_not_have(self) -> None:
+        import dataclasses
+        from demo.receipt import Receipt
+        src = open(__import__("demo.receipt", fromlist=["x"]).__file__).read()
+        fields = {f.name for f in dataclasses.fields(Receipt)}
+        self.assertNotIn("seal_verified_at_start", fields)
+        # It may be NAMED in the paragraph explaining its absence, but must not be described as a
+        # field the receipt carries.
+        self.assertNotIn("seal_verified_at_start — the escape probe", src)

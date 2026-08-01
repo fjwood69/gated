@@ -93,15 +93,21 @@ def stage(name: str) -> None:
 
 
 # --------------------------------------------------------------------------------------------
-# THE PURE FUNCTION — the only actual proof in the whole demo
+# THE RECOMPUTABLE HALF — a pure function a sceptic can rerun offline.
+# The PROOF is the comparison in render_and_prove(), not the applier below.
 # --------------------------------------------------------------------------------------------
 def apply_unified(base: Sequence[str], diff: Sequence[str]) -> list[str]:
     """Apply a unified diff to ``base`` and return the derived lines. STRICT.
 
-    ⚠ THIS IS THE ONLY THING HERE THAT PROVES ANYTHING WITHOUT RE-MEASUREMENT. Everything else in a
-    receipt is either a digest against a published root or a claim to be replayed. The three-way
-    binding base + displayed diff -> derived is a PURE FUNCTION over disclosed inputs: a reader can
-    recompute it offline, from the receipt alone, with no container and no trust in this process.
+    ⚠ THIS FUNCTION IS NOT THE PROOF, and an earlier version of this docstring said it was. It
+    APPLIES a diff; it decides nothing. The proof is the COMPARISON in ``render_and_prove``: the
+    reconstructed text set equal to the derived bytes. A reader following the code to find out what
+    proves the transformation would have landed here and stopped — an overclaim about what
+    constitutes proof, in the demo whose entire subject is what constitutes proof.
+
+    What this contributes is the recomputable half: base + displayed diff -> derived is a PURE
+    FUNCTION over disclosed inputs, so a sceptic can rerun it offline from the receipt alone, with no
+    container and no trust in this process. The verdict on whether it MATCHED is the caller's.
 
     It is deliberately strict rather than lenient. A permissive applier that resynchronises on
     mismatch would "succeed" against a diff that does not actually describe the transformation, and
@@ -254,6 +260,38 @@ def require_nameable(gate_commit: str, runtime_version: str, image_digest: str) 
             "an unidentified instrument are bound to nothing — when drift first fires, every pinned "
             "quantity is exonerated by construction and the real cause sits in whatever was never "
             "named. Refusing before any row runs")
+
+
+def read_recorded_counts(path: Path) -> dict[str, int]:
+    """The corpus's OWN record, parsed strictly. TERMINAL on anything malformed.
+
+    Every failure here is ``CorpusIntegrityError`` (exit 6), never a traceback and never
+    ``CorpusUnavailable``: the artifact WAS obtained and its digest DID match, so retrying cannot
+    help — the bytes are the pinned bytes and their contents are unusable."""
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CorpusIntegrityError(
+            f"{path.name} could not be parsed as JSON: {exc}. The archive matched its pinned digest, "
+            "so this is not a transport problem and retrying will not change it") from exc
+    if not isinstance(raw, dict) or "egress_counts" not in raw:
+        raise CorpusIntegrityError(
+            f"{path.name} has no 'egress_counts' object. A digest pins BYTES, NOT SEMANTICS — the "
+            "archive is the one we pinned and its contents are not usable")
+    counts = raw["egress_counts"]
+    if not isinstance(counts, dict) or not counts:
+        raise CorpusIntegrityError(
+            f"{path.name} 'egress_counts' is not a non-empty object. An empty record would cross-"
+            "check against nothing and pass — an empty result is not a value")
+    out: dict[str, int] = {}
+    for k, v in counts.items():
+        if isinstance(v, bool) or not isinstance(v, int):
+            # bool is an int subclass; `true` must not silently become 1.
+            raise CorpusIntegrityError(
+                f"{path.name} records a non-integer count for {k!r}: {v!r}. A count that needs "
+                "coercion is not a count")
+        out[str(k)] = v
+    return out
 
 
 def build_binding() -> PinBinding:
@@ -472,13 +510,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         corpus = ensure_corpus(args.cache)
 
         stage("cross-check-pin-against-corpus")
-        measured_json = json.loads((corpus / "MEASURED.json").read_text())
-        # The KEY IS READ FROM THE REAL FILE, not guessed. A ``.get(k, whole_dict)`` fallback
-        # would have silently handed the cross-check every metadata key in the file
-        # ("format_version", "note", "witness_condition") as if they were expectation keys.
-        recorded = measured_json["egress_counts"]
-        verify_measured_against_pin(
-            {str(k): int(v) for k, v in recorded.items()}, binding)
+        # ⚠ A DIGEST-VALID BUT STRUCTURALLY UNUSABLE CORPUS IS AN INTEGRITY FAILURE, NOT A CRASH.
+        # These three — JSONDecodeError, KeyError, and int()'s ValueError — were raised OUTSIDE the
+        # four refusal classes, so a corpus that matched its pinned digest perfectly and then carried
+        # malformed contents produced a raw traceback and exit 1 instead of CORPUS INTEGRITY (6).
+        # Same shape as the seal-leak escape: a real, classifiable condition falling outside the
+        # taxonomy because nothing named it. A digest pins BYTES, NOT SEMANTICS.
+        #
+        # The KEY IS READ FROM THE REAL FILE, not guessed. A ``.get(k, whole_dict)`` fallback would
+        # have silently handed the cross-check every metadata key in the file ("format_version",
+        # "note", "witness_condition") as if they were expectation keys.
+        recorded = read_recorded_counts(corpus / "MEASURED.json")
+        verify_measured_against_pin(recorded, binding)
 
         stage("resolve-instrument-identity")
         # ⚠ THE HEADER CAN NOW FAIL, AND THAT IS THE POINT. It previously sealed

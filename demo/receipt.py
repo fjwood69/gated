@@ -297,12 +297,10 @@ class Receipt:
     # collapsed three different things and its root was the harness. A sceptic cannot recheck a
     # boolean this process wrote about itself.
     #
-    #   seal_verified_at_start — the escape probe at row-prepare: proxy reachable, external TCP/DNS
-    #                            blocked. A genuine per-row measurement OF THE NETWORK POSTURE.
     #   counter_readable_at_end — the count came back from the proxy's own storage after the
     #                            container exited. A genuine measurement THAT THE COUNTER SURVIVED.
     #
-    # ⚠ THE GAP THIS LEAVES, STATED RATHER THAN PAPERED OVER. Neither field sees the failure that
+    # ⚠ THE GAP THIS LEAVES, STATED RATHER THAN PAPERED OVER. This does not see the failure that
     # actually matters. A row's frozen count depends on the witness returning a PERSISTENT 503; if
     # the witness served a success mid-row, the escape probe still passes (posture unchanged), the
     # count is still readable (not None), and the row measures 1 instead of 3 — with fresh receipts,
