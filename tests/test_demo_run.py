@@ -1,9 +1,16 @@
-"""The runner's checkable parts — above all, the ONE pure function that proves anything.
+"""The runner's checkable parts — above all, the diff correspondence that a sceptic can recompute.
 
-⚠ A PROOF FUNCTION NEVER SEEN TO REJECT IS A CLAIM. ``apply_unified`` is described in ``run.py`` as
-the only actual proof in the whole demo: base + displayed diff -> derived, recomputable offline by a
-reader who trusts nothing about the process that produced it. That description is worth exactly as
-much as the evidence that it can FAIL, so most of this file is doctored diffs it must refuse.
+⚠ A PROOF NEVER SEEN TO REJECT IS A CLAIM. The proof is the COMPARISON in ``render_and_prove``:
+reconstructed text set equal to the derived bytes. ``apply_unified`` supplies the recomputable half —
+base + displayed diff -> derived, rerunnable offline by a reader who trusts nothing about the process
+that produced it — but it decides nothing on its own. That distinction is worth exactly as much as
+the evidence that the refusals FIRE, so most of this file is doctored diffs that must be refused.
+
+⚠ AND THIS DOCSTRING WAS ITSELF STALE — the fourth prose-scan of the session. It described
+``apply_unified`` as "the only actual proof" for a full commit after that claim was corrected in
+``run.py``, and the guard below could not see it, because the guard only scans ``run.__file__``. The
+test against stale prose carried stale prose, invisible to itself. Any test that reads a source file
+must PARSE it, and no test file may make claims about source it does not scan.
 """
 from __future__ import annotations
 

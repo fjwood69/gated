@@ -67,13 +67,36 @@ the run goes green**. That repair is banned. If drift fires:
 |---:|---|---|
 | **0** | AGREEMENT | Success. Every row matched its frozen count. |
 | **2** | DRIFT | **Success.** The detector detected. See above. |
-| **3** | INSTRUMENT-INVALID | **Not a result.** Terminal, and no claim is made about any artifact. |
+| **3** | INSTRUMENT-INVALID | **Neither success nor P1** — see below. The instrument refused; the runner behaved correctly and the run establishes nothing. |
 | **4** | PIN-INCONSISTENT | **Not a result.** Two frozen claims contradict; no measurement can settle it. |
 | **5** | CORPUS UNAVAILABLE | Transport. Retryable, says nothing about integrity. |
 | **6** | CORPUS INTEGRITY | Terminal. The bytes are pinned and their contents are unusable. |
 | **1 / traceback** | **UNCLASSIFIED** | **The finding.** A condition escaping the taxonomy — the same defect class as the seal-leak escape. Any occurrence is a P1 regardless of what triggered it. |
 
 ## Named failure classes, decided now
+
+### ⚠ EXIT 3 IS NEITHER A SUCCESSFUL RUN NOR A P1 — and that is why it is written down
+
+Exit 2 is named a success and any traceback is named a P1, which leaves exit 3 sitting between them.
+An unclassified middle is exactly what gets read generously late at night, and exit 3 is the outcome
+most available to a generous reading: the taxonomy WORKED, the refusal was correct, nothing crashed —
+so it feels like a pass. It is not.
+
+**Exit 3 means the instrument refused. The runner behaved correctly and the run establishes nothing.**
+No verdict table was produced, so no claim was made about any artifact, and NOTHING in the success
+checklist above can be ticked on its evidence. The response is to diagnose the instrument and re-run —
+never to record the attempt as a first run.
+
+And exit 3 has two very different causes, which must not be conflated:
+
+- **BENIGN** — preflight refused before anything ran (no rootless podman, image absent). The host is
+  not ready; the runner is fine. Fix the host, re-run.
+- **P1** — the instrument refused *after* rows began: a control mis-reading, an unreadable counter, a
+  seal leak, an unnameable header. These say a measurement apparatus that was believed sound is not,
+  and they are P1 exactly as listed below.
+
+A single exit code covers both, so the class is decided by WHERE it fired, and the run report names
+the stage. Read the stage before deciding which one happened.
 
 **Expected-and-fine, not defects in the runner:**
 - exit 3 from preflight on a host without a working rootless podman
