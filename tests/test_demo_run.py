@@ -419,3 +419,63 @@ class OneCanonicalResolver(unittest.TestCase):
         from demo.receipt import Instrument
         r = Instrument("g", "sha256:i", "podman", "podman version 4.9.3", "sealed", "w").render()
         self.assertNotIn("podman podman", r)
+
+
+class TheNoVCSRefusalTellsYouWhatToDo(unittest.TestCase):
+    """Three real stranger paths reach this refusal and need DIFFERENT fixes. A single generic hint
+    would be wrong for two of them, so the hint is DERIVED from git's own stderr — the same contract
+    preflight keeps: a remediation wherever one is mechanically derivable."""
+
+    CASES = [
+        ("fatal: not a git repository (or any of the parent directories): .git",
+         "no `.git` here at all", "zip / vendored copy"),
+        ("fatal: not a git repository: /nonexistent/path",
+         "git WORKTREE", "worktree whose gitdir is absent"),
+        ("fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.",
+         "NO COMMITS", "checkout with no history"),
+        ("fatal: detected dubious ownership in repository at '/x'",
+         "owned by another user", "foreign-owned checkout"),
+    ]
+
+    def test_each_failure_mode_gets_its_OWN_remediation(self) -> None:
+        seen = set()
+        for stderr, expected, label in self.CASES:
+            hint = run.vcs_hint(stderr)
+            self.assertIn(expected, hint, f"wrong hint for {label}")
+            seen.add(hint)
+        self.assertEqual(len(seen), len(self.CASES),
+                         "two failure modes produced the SAME hint — then it is generic, and generic "
+                         "is wrong for at least one of them")
+
+    def test_an_EMPTY_stderr_does_not_invent_a_diagnosis(self) -> None:
+        """Silence where nothing is derivable, rather than a guess presented as a finding."""
+        self.assertIn("no diagnostic", run.vcs_hint(""))
+
+    def test_the_REFUSAL_still_refuses(self) -> None:
+        """The guard is right and does not soften: an unidentified instrument must not seal."""
+        with self.assertRaises(InstrumentInvalid) as c:
+            run.require_nameable("unknown", "podman 4.9.3", "sha256:aa",
+                                 "fatal: not a git repository (or any of the parent directories): .git")
+        msg = str(c.exception)
+        self.assertIn("cannot name itself", msg)
+        self.assertIn("hint", msg)
+        self.assertIn("git clone", msg)
+
+    def test_a_RESOLVED_instrument_still_passes(self) -> None:
+        run.require_nameable("abc123", "podman 4.9.3", "sha256:aa", "")
+
+    def test_git_commit_returns_its_own_diagnostic(self) -> None:
+        """The stderr is carried, not swallowed — that is what makes the hint derivable."""
+        commit, diag = run._git_commit()
+        self.assertIsInstance(commit, str)
+        self.assertIsInstance(diag, str)
+
+    def test_git_stderr_is_CARRIED_from_the_probe_to_the_hint(self) -> None:
+        """THE SEAM. Reverting `_git_commit` to swallow stderr left every other test green, because
+        they all hand the stderr to `require_nameable` directly. This drives the real probe against a
+        real non-repository and requires the derived hint to come out the other end."""
+        import tempfile
+        commit, diag = run._git_commit(Path(tempfile.mkdtemp()))
+        self.assertEqual(commit, "unknown")
+        self.assertTrue(diag, "git's diagnostic was swallowed — the hint cannot be derived from it")
+        self.assertIn("no `.git` here at all", run.vcs_hint(diag))

@@ -207,13 +207,51 @@ def render_and_prove(base_bytes: bytes, derived_bytes: bytes, base_name: str,
 # --------------------------------------------------------------------------------------------
 # Instrument identity
 # --------------------------------------------------------------------------------------------
-def _git_commit() -> str:
+def _git_commit(cwd: Path | None = None) -> tuple[str, str]:
+    """Return (commit, diagnostic). The diagnostic is git's OWN stderr, kept so the refusal can
+    derive a remediation instead of guessing one.
+
+    ``cwd`` is a parameter so a test can point this at a REAL non-repository and get REAL git stderr.
+    Without it the carrying of the diagnostic was untestable — a revert that swallowed stderr left
+    the suite green, because every test handed the stderr to the refusal directly and none exercised
+    the path that produces it."""
     try:
         out = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-                             cwd=Path(__file__).resolve().parent.parent, timeout=10)
-        return out.stdout.strip() or "unknown"
-    except (OSError, subprocess.SubprocessError):
-        return "unknown"
+                             cwd=cwd or Path(__file__).resolve().parent.parent, timeout=10)
+        return (out.stdout.strip() or "unknown", out.stderr.strip())
+    except (OSError, subprocess.SubprocessError) as exc:
+        return ("unknown", f"{type(exc).__name__}: {exc}")
+
+
+def vcs_hint(stderr: str) -> str:
+    """DERIVE the remediation from git's own failure, rather than printing one generic line.
+
+    ⚠ THREE REAL STRANGER PATHS REACH THIS REFUSAL AND THEY NEED DIFFERENT FIXES: a zip or vendored
+    copy has no ``.git`` at all; a git worktree's ``.git`` is a FILE pointing at a gitdir that may be
+    absent; a fresh checkout may have no commits. A single generic hint would be wrong for two of
+    them. Git distinguishes the cases in its own stderr, so the hint is derived from the failure
+    rather than guessed at — which is the contract preflight already keeps: a remediation wherever
+    one is MECHANICALLY DERIVABLE, and silence rather than invention where it is not.
+    """
+    s = stderr.lower()
+    if "dubious ownership" in s:
+        return ("this checkout is owned by another user, so git refuses to read it. Either run as "
+                "the owner, or `git config --global --add safe.directory <path>`")
+    if "ambiguous argument 'head'" in s or "unknown revision" in s:
+        return ("this is a git repository with NO COMMITS, so there is no commit to name. Run from "
+                "a checkout that has history — a fresh `git clone` of the repo")
+    if "not a git repository:" in s:
+        return ("this looks like a git WORKTREE whose `.git` file points at a gitdir that is not "
+                "present here (copying a worktree without its parent repository does this). Run "
+                "from the main checkout, or `git clone` the repo fresh")
+    if "not a git repository" in s:
+        return ("there is no `.git` here at all — a zip download, a vendored copy, or an extracted "
+                "tarball. Run from a git checkout: `git clone https://github.com/fjwood69/gated`")
+    if not stderr:
+        return ("`git` produced no diagnostic. Check that git is installed and that this directory "
+                "is a checkout with at least one commit")
+    return ("git could not name this commit. Run from a git checkout where `git rev-parse HEAD` "
+            "succeeds")
 
 
 def _runtime_version(runtime: str) -> str:
@@ -228,7 +266,8 @@ def _runtime_version(runtime: str) -> str:
 UNRESOLVED = ("", "unknown", "pending")
 
 
-def require_nameable(gate_commit: str, runtime_version: str, image_digest: str) -> None:
+def require_nameable(gate_commit: str, runtime_version: str, image_digest: str,
+                     vcs_stderr: str = "") -> None:
     """Refuse BEFORE any row runs if the instrument cannot name itself.
 
     ⚠ THIS EXISTS AS A FUNCTION BECAUSE THE INLINE VERSION WAS UNTESTABLE. Its only test was a
@@ -244,11 +283,16 @@ def require_nameable(gate_commit: str, runtime_version: str, image_digest: str) 
                                  ("image digest", image_digest))
                   if v in UNRESOLVED]
     if unnameable:
+        # The REFUSAL stands — an unidentified instrument must not seal. What changes is that it now
+        # tells the reader what to do, which is preflight's contract and was missing here: three real
+        # stranger paths hit this message and got a correct diagnosis with no next step.
+        hint = f"\n  hint    : {vcs_hint(vcs_stderr)}" if "gate commit" in unnameable else ""
+        detail = f"\n  git     | {vcs_stderr}" if vcs_stderr else ""
         raise InstrumentInvalid(
             f"the instrument cannot name itself: {unnameable} did not resolve. Receipts sealed under "
             "an unidentified instrument are bound to nothing — when drift first fires, every pinned "
             "quantity is exonerated by construction and the real cause sits in whatever was never "
-            "named. Refusing before any row runs")
+            f"named. Refusing before any row runs.{detail}{hint}")
 
 
 def read_recorded_counts(path: Path) -> dict[str, int]:
@@ -548,7 +592,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         #
         # A gate that cannot name itself must refuse rather than attest. Each of these degraded
         # silently to "unknown" and was sealed as the gate's identity.
-        gate_commit = _git_commit()
+        gate_commit, vcs_stderr = _git_commit()
         runtime_version = _runtime_version(args.runtime)
         # ⚠ THE ENGINE'S OWN RESOLVER, NOT A SECOND ONE. The first live run died here: this module
         # had its own ``_resolve_image_digest`` returning bare hex from ``{{.Id}}`` while the sandbox
@@ -562,7 +606,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise InstrumentInvalid(
                 f"the image identity could not be resolved: {type(exc).__name__}: {exc}. Nothing "
                 "will be sealed under an unidentified instrument") from exc
-        require_nameable(gate_commit, runtime_version, image_digest)
+        require_nameable(gate_commit, runtime_version, image_digest, vcs_stderr)
 
         stage("seal-run-header")
         instrument = Instrument(
