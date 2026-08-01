@@ -305,8 +305,12 @@ class TheOneWayBoundaryIsMECHANICAL(unittest.TestCase):
             parts = rel.parts
             if parts[0] in ("demo", ".git", ".gitnexus"):
                 continue
-            # this file is demo's OWN test and is allowed to import it; nothing else is
-            if rel.as_posix() == "tests/test_demo_fetch.py":
+            # demo's OWN tests may import it; nothing else may. Keyed by a PREFIX rather than a
+            # single filename — the first version named only this file, so adding a second demo test
+            # tripped the boundary check on legitimate work. A control whose exemption list is
+            # narrower than the legitimate set produces false refusals, which is how controls get
+            # disabled by the people they inconvenience.
+            if rel.as_posix().startswith("tests/test_demo_"):
                 continue
             for mod in self._imports_of(py):
                 if mod == "demo" or mod.startswith("demo."):
