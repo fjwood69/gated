@@ -364,3 +364,58 @@ class TheDocstringsDoNotOverclaim(unittest.TestCase):
         # It may be NAMED in the paragraph explaining its absence, but must not be described as a
         # field the receipt carries.
         self.assertNotIn("seal_verified_at_start — the escape probe", src)
+
+
+class OneCanonicalResolver(unittest.TestCase):
+    """The first live run died on TWO derivations of one identity: this module's own
+    `_resolve_image_digest` returned bare hex from `{{.Id}}` while the sandbox used
+    `resolve_image_id` returning `sha256:`-prefixed. Same image, format disagreement, and the
+    comparison declared "the image changed mid-run"."""
+
+    def test_the_second_resolver_is_DELETED_not_aliased(self) -> None:
+        """An alias is one refactor away from acquiring its own normalisation and becoming a second
+        derivation wearing one name."""
+        self.assertFalse(hasattr(run, "_resolve_image_digest"))
+
+    def test_the_header_uses_the_ENGINES_resolver(self) -> None:
+        import ast
+        tree = ast.parse(open(run.__file__).read())
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        self.assertIn("resolve_image_id", called)
+
+    def test_the_two_paths_now_AGREE_on_the_same_image(self) -> None:
+        """THE FALSE POSITIVE, closed. This is the exact pair that failed the first live run."""
+        run.require_same_image("row", "sha256:abc", "sha256:abc")   # must not raise
+
+    def test_a_REAL_mid_run_image_change_is_STILL_refused(self) -> None:
+        """⚠ THE GUARD MUST NOT BE LOST WHILE THE FALSE POSITIVE IS FIXED. Both sides now call one
+        function, so in production this compares two calls to `resolve_image_id` and always agrees —
+        the fix removed the guard's ability to fire on its own. It earned its place by catching a
+        real defect on first contact with a runtime; it does not get demoted in the commit that
+        fixes it."""
+        with self.assertRaises(InstrumentInvalid) as c:
+            run.require_same_image("row", "sha256:aaa", "sha256:bbb")
+        self.assertIn("changed mid-run", str(c.exception))
+
+    def test_NO_normalisation_papers_over_a_format_disagreement(self) -> None:
+        """Stripping/adding `sha256:` would treat a FORMAT disagreement as equality and leave the two
+        derivations in place — the next divergence reopens silently, or hides a real change."""
+        with self.assertRaises(InstrumentInvalid):
+            run.require_same_image("row", "abc", "sha256:abc")
+
+    def test_the_report_does_not_claim_sealed_rows_when_there_are_none(self) -> None:
+        """Observed on the first live run: the note said "the rows above are sealed" with
+        `sealed rows 0` four lines above it."""
+        from demo.receipt import Instrument, RunHeader
+        h = RunHeader("n" * 32, Instrument("g", "sha256:i", "podman", "podman v1", "sealed", "w"),
+                      "d" * 64)
+        out = run.run_report(h, [], [], "the rows above are sealed but carry NO verdicts")
+        self.assertNotIn("rows above are sealed", out)
+        self.assertIn("before ANY row was sealed", out)
+
+    def test_the_runtime_name_is_not_doubled(self) -> None:
+        """Rendered as "podman podman version 4.9.3" — `--version` already names the runtime."""
+        from demo.receipt import Instrument
+        r = Instrument("g", "sha256:i", "podman", "podman version 4.9.3", "sealed", "w").render()
+        self.assertNotIn("podman podman", r)

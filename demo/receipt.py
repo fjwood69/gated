@@ -98,7 +98,7 @@ class Instrument:
 
     def render(self) -> str:
         return (f"gate {self.gate_commit[:12]} · image {self.image_digest[:19]}… · "
-                f"{self.runtime} {self.runtime_version} · seal {self.seal_mode} (SELF-REPORTED) · "
+                f"{self.runtime_version} · seal {self.seal_mode} (SELF-REPORTED) · "
                 f"witness {self.witness_identity}")
 
 

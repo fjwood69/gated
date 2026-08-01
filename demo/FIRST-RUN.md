@@ -26,6 +26,11 @@ python -m demo.run --cache ~/.cache/gated-demo --workspace /tmp/gated-demo-first
 Recorded before the run: `gated` commit, `podman --version`, the resolved image digest, and the
 corpus digest `810e2f8f7c07269445fdfa89e2875ce907c091ffe54c8dbbd62c15936978088a`.
 
+⚠ The image digest is recorded in the ENGINE'S form — `sha256:`-prefixed, as `resolve_image_id`
+returns it. The first attempt (2026-08-01, exit 3) recorded bare hex from a second resolver that has
+since been deleted; a pre-run record in a different format from the sealed one is the same
+two-derivations defect displaced one layer out, into the evidence.
+
 ## What counts as a SUCCESSFUL first run
 
 The run is a success if the pipeline **reaches a verdict table and every structural invariant holds**
@@ -136,3 +141,19 @@ the stage. Read the stage before deciding which one happened.
 The run's stdout/stderr, the workspace, and every `receipt.json` are kept **whether it passes or
 fails** — including the failing artifact if it fails. The last time an unexplained red appeared this
 week only the final four lines survived, and the diagnosis died with the rest.
+
+
+---
+
+## Appended 2026-08-01 — attempt 1 did not become a first run
+
+Exit 3 at stage `[measure]` on row 1, the P1 branch. Cause: this module carried its OWN image
+resolver returning bare hex while the sandbox used `resolve_image_id` returning `sha256:`-prefixed —
+one image, two derivations, and the comparison read a FORMAT disagreement as "the image changed
+mid-run". Zero rows sealed; the taxonomy held; no verdict table.
+
+Per this document, that attempt establishes nothing and is not recorded as a first run. The second
+resolver is deleted (not aliased), and the guard that caught it is discharged two-sided so that
+fixing the false positive did not remove its ability to fire.
+
+Nothing above was edited to match the result.

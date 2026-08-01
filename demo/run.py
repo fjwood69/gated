@@ -62,6 +62,7 @@ from demo.receipt import (
     SubjectPin,
     verify_measured_against_pin,
 )
+from sandbox.oci import resolve_image_id
 from sandbox.observed import NetworkIsolationError, ObservedOCISandbox
 
 # The corpus fetch's two failure modes get their OWN codes. They are NOT the same event: one is
@@ -215,18 +216,6 @@ def _git_commit() -> str:
         return "unknown"
 
 
-def _resolve_image_digest(runtime: str, image: str) -> str:
-    """The IMMUTABLE image identity, resolved BEFORE the header is sealed.
-
-    Returns "" when it cannot be resolved — the caller refuses rather than sealing a placeholder."""
-    try:
-        out = subprocess.run([runtime, "image", "inspect", "--format", "{{.Id}}", image],
-                             capture_output=True, text=True, timeout=30)
-        return out.stdout.strip() if out.returncode == 0 else ""
-    except (OSError, subprocess.SubprocessError):
-        return ""
-
-
 def _runtime_version(runtime: str) -> str:
     try:
         out = subprocess.run([runtime, "--version"], capture_output=True, text=True, timeout=10)
@@ -292,6 +281,29 @@ def read_recorded_counts(path: Path) -> dict[str, int]:
                 "coercion is not a count")
         out[str(k)] = v
     return out
+
+
+def require_same_image(row: str, row_digest: str, header_digest: str) -> None:
+    """The row must have run on the image the header committed to.
+
+    ⚠ EXTRACTED SO IT CAN STILL BE SEEN TO FAIL. Both sides now obtain identity from ONE function,
+    so in production this compares two calls to ``resolve_image_id`` and will always agree — which
+    means fixing the false positive removed the guard's ability to fire on its own. A guard that
+    cannot be observed failing is a claim, and this one earned its place by catching a real defect on
+    first contact with a runtime; it does not get demoted in the same commit that fixes it.
+
+    So it takes its operands as ARGUMENTS: a test hands it two different digests and requires the
+    refusal, and hands it two equal ones and requires silence. Two-sided, like the floor.
+
+    NO NORMALISATION HERE, deliberately. Stripping or adding ``sha256:`` would treat a FORMAT
+    disagreement as equality and leave the two derivations in place — the next silent divergence
+    would reopen as a false "image changed mid-run", or hide a real one.
+    """
+    if row_digest and row_digest != header_digest:
+        raise InstrumentInvalid(
+            f"row {row} ran on image {row_digest!r} but the run header committed to "
+            f"{header_digest!r}. The image changed mid-run — every row must run on the identity the "
+            "header sealed, or the receipts describe more than one instrument")
 
 
 def build_binding() -> PinBinding:
@@ -443,7 +455,12 @@ def run_report(header: RunHeader, receipts: Sequence[Receipt], planned: Sequence
                      f"{'UNCORROBORATED ' if r.uncorroborated() else ''}"
                      f"receipt={r.digest()[:12]}…")
     if note:
-        lines += ["", f"  {note}"]
+        # The note claimed "the rows above are sealed" while `sealed rows 0` sat four lines up —
+        # observed on the first live run. A note that contradicts the count above it is the
+        # comment-shaped version of the class this whole increment is about.
+        lines += ["", f"  {note}" if receipts else
+                  "  the run halted before ANY row was sealed — nothing was measured and nothing "
+                  "was written"]
     return "\n".join(lines)
 
 
@@ -533,7 +550,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         # silently to "unknown" and was sealed as the gate's identity.
         gate_commit = _git_commit()
         runtime_version = _runtime_version(args.runtime)
-        image_digest = _resolve_image_digest(args.runtime, IMAGE)
+        # ⚠ THE ENGINE'S OWN RESOLVER, NOT A SECOND ONE. The first live run died here: this module
+        # had its own ``_resolve_image_digest`` returning bare hex from ``{{.Id}}`` while the sandbox
+        # used ``resolve_image_id`` returning ``sha256:``-prefixed. Same image, two derivations, and
+        # the comparison below declared "the image changed mid-run" over a FORMAT disagreement.
+        # The second resolver is DELETED rather than aliased: an alias is one refactor away from
+        # acquiring its own normalisation and becoming a second derivation wearing one name.
+        try:
+            image_digest = resolve_image_id(args.runtime, IMAGE)
+        except Exception as exc:                      # ImageResolutionError / runtime unavailable
+            raise InstrumentInvalid(
+                f"the image identity could not be resolved: {type(exc).__name__}: {exc}. Nothing "
+                "will be sealed under an unidentified instrument") from exc
         require_nameable(gate_commit, runtime_version, image_digest)
 
         stage("seal-run-header")
@@ -575,10 +603,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stage("measure")
             measured, events, row_image_digest, counter_ok, seal_mode = measure_row(
                 plan, workspace, args.runtime)
-            if row_image_digest and row_image_digest != image_digest:
-                raise InstrumentInvalid(
-                    f"row {plan.name} ran on image {row_image_digest} but the run header committed "
-                    f"to {image_digest}. The image changed mid-run")
+            require_same_image(plan.name, row_image_digest, image_digest)
 
             stage("seal-row")
             row_instrument = Instrument(
