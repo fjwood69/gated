@@ -268,5 +268,71 @@ class ThereIsNoWayToTurnVerificationOff(unittest.TestCase):
         self.assertLess(body.index("_verify_digest"), body.index("return"))
 
 
+class TheOneWayBoundaryIsMECHANICAL(unittest.TestCase):
+    """The trust boundary is: THE ENGINE NEVER CONSUMES UAT CONTENT.
+
+    ⚠ THIS TEST WAS MISSING and I had described the boundary as enforced. It held only because
+    nothing had yet imported across it — true today, and a claim about tomorrow. A boundary that
+    depends on nobody having crossed it yet is not a boundary; a docstring saying "demo-scoped" is
+    documentation, and documentation does not refuse anything.
+
+    Two directions, and they fail differently:
+      * something OUTSIDE demo/ importing the fetch would put corpus consumption on a path the engine
+        can reach;
+      * the fetch importing ENGINE INTERNALS would let engine behaviour become corpus-dependent
+        through a shared code path — the same coupling arriving from the other side.
+    """
+
+    _ROOT = Path(__file__).resolve().parent.parent
+    _ENGINE_PACKAGES = ("core", "sandbox", "engine", "observe", "gate", "cli")
+
+    def _imports_of(self, path: Path) -> set[str]:
+        import ast
+
+        tree = ast.parse(path.read_text())
+        found: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                found.update(a.name for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                found.add(node.module)
+        return found
+
+    def test_nothing_outside_demo_imports_the_fetch(self) -> None:
+        offenders: list[str] = []
+        for py in self._ROOT.rglob("*.py"):
+            rel = py.relative_to(self._ROOT)
+            parts = rel.parts
+            if parts[0] in ("demo", ".git", ".gitnexus"):
+                continue
+            # this file is demo's OWN test and is allowed to import it; nothing else is
+            if rel.as_posix() == "tests/test_demo_fetch.py":
+                continue
+            for mod in self._imports_of(py):
+                if mod == "demo" or mod.startswith("demo."):
+                    offenders.append(f"{rel.as_posix()} imports {mod}")
+        self.assertEqual(offenders, [],
+                         "the demo is reachable from outside demo/ — corpus consumption has escaped "
+                         f"its scope: {offenders}")
+
+    def test_the_fetch_imports_NO_engine_internals(self) -> None:
+        """The other direction, and the more consequential one: if the fetch reached into the engine,
+        engine behaviour could become corpus-dependent through a shared code path."""
+        offenders = [
+            mod for mod in self._imports_of(self._ROOT / "demo" / "fetch.py")
+            if mod.split(".")[0] in self._ENGINE_PACKAGES
+        ]
+        self.assertEqual(offenders, [],
+                         f"demo/fetch.py reaches into the engine: {offenders}. The boundary is "
+                         "one-way; the engine must never become dependent on corpus content")
+
+    def test_the_pin_module_imports_nothing_at_all(self) -> None:
+        """The trust root should be inert DATA. An import in it is a way for the pinned value to be
+        computed rather than stated — and a computed trust root is not a pinned one."""
+        imports = self._imports_of(self._ROOT / "demo" / "pin.py")
+        self.assertEqual(imports, {"__future__"},
+                         f"demo/pin.py imports {imports - {'__future__'}} — the pin must be data")
+
+
 if __name__ == "__main__":
     unittest.main()
