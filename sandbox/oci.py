@@ -105,7 +105,9 @@ RESOURCE_PREFIX = "moriverify-"
 # Clause M. Builder-SOURCE hashing would also have covered it, but that mechanism IS NOT BUILT (see the
 # attestation note further down this module: "this increment does not attest anything and does not claim
 # to"), so relying on it here would ship a Clause-M control with ZERO IDENTITY MOVEMENT — the fossil
-# class that the vestigial ``baseline`` field already proves can happen.
+# class that the ``ObservedHandle.baseline`` field proved can happen. (That field has since been
+# DELETED; the precedent is cited from its removal commit rather than from live code, because a
+# reference to a vestige outlives the vestige and then points at nothing.)
 NO_HEALTHCHECK_FLAGS = ("--no-healthcheck",)
 
 

@@ -66,7 +66,7 @@ def _oci_handle(container: str = "mv-eph-ctr") -> OCIHandle:
 def _obs_handle() -> ObservedHandle:
     snap = Path(tempfile.mkdtemp(prefix="mv-eph-o-"))
     return ObservedHandle(id="i", artifact_hash="h", snapshot=snap, container="mv-eph-c",
-                          network="mv-eph-n", proxy="mv-eph-p", proxy_ip="10.0.0.2", baseline=0,
+                          network="mv-eph-n", proxy="mv-eph-p", proxy_ip="10.0.0.2",
                           image_id="img")
 
 
