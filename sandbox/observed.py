@@ -92,6 +92,19 @@ PROXY_PORT = 8080
 _COUNTFILE = "/tmp/mv_egress_count"
 _PROXY_SRC = Path(__file__).resolve().parent.parent / "observe" / "proxy.py"
 
+# READINESS BUDGET — a WALL-CLOCK DEADLINE, and the message quotes THIS constant rather than a second
+# literal. The previous shape was ``for _ in range(50): ... time.sleep(0.1)`` with a message reading
+# "within 5s", which silently assumed each ``_read_count`` was FREE. It never was — every iteration runs a
+# real ``exec`` round-trip — so the stated budget was already wrong before anything absorbed a timeout, and
+# once ``TimeoutExpired`` mapped to "no reading" the same loop could run 50 x 30s and still say "within 5s".
+#
+# TWO LITERALS AGREEING BY CONVENTION IS THE DEFECT THIS TREE KEEPS FINDING (``_SEALED_NETWORK_FLAGS``,
+# ``NO_HEALTHCHECK_FLAGS``): the budget and the sentence describing it are ONE value here, so they cannot
+# drift apart. The refusal additionally reports MEASURED elapsed, because a message that states what it
+# observed cannot misdescribe its own budget the way a hardcoded figure can.
+_READINESS_DEADLINE_SECONDS = 5.0
+_READINESS_POLL_INTERVAL_SECONDS = 0.1
+
 # Escape probe: each residual channel MUST fail; the proxy MUST be reachable.
 # Exit 0 = sealed; non-zero = a channel leaked (refuse to run the artifact).
 _ESCAPE_SCRIPT = f"""
@@ -615,13 +628,35 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         # its first egress attempts refused, and a refused connection is never accept()ed so never
         # counted — under-counting the verdict input exactly as the pre-fix race did (same polarity,
         # different trigger: signal never observed, rather than signal published too early).
-        for _ in range(50):
+        #
+        # ⚠ THE BUDGET IS WALL-CLOCK, NOT AN ITERATION COUNT, and that distinction is load-bearing rather
+        # than tidy. ``_read_count`` maps a wedged runtime's ``TimeoutExpired`` to "no reading" — correct
+        # for ``_egress``, where the fact really is "the observer could not be read". But THIS caller wants
+        # the opposite response to the same event: a broken instrument means STOP, not wait longer. Under
+        # the old iteration count each absorbed timeout bought another attempt, so a wedged runtime turned
+        # a ~30s abort into 50 x 30s = ~25 MINUTES, ending in a refusal that claimed it had waited 5s.
+        #
+        # The two callers wanting DIFFERENT semantics from one return value is exactly how the timeout path
+        # was missed before — it inherited the normal path's shape. Resolved here, at the caller that has
+        # the differing requirement, rather than by splitting ``_read_count``'s contract per caller.
+        #
+        # WHAT THE DEADLINE BOUNDS, STATED PRECISELY: the number of ATTEMPTS, not the duration of one. A
+        # single wedged ``exec`` can still consume its own 30s subprocess timeout, so the worst case is
+        # roughly one exec timeout past the deadline — bounded and ~35s, not unbounded and ~1500s. Saying
+        # "the deadline bounds the wait" without that sentence would be the adjacent-property defect again.
+        started = time.monotonic()
+        while True:
             if self._read_count(name) is not None:
                 return ip
-            time.sleep(0.1)
+            if time.monotonic() - started >= _READINESS_DEADLINE_SECONDS:
+                break
+            time.sleep(_READINESS_POLL_INTERVAL_SECONDS)
         raise NetworkIsolationError(
-            f"proxy {name} never published its readiness countfile within 5s — refusing to run an "
-            f"artifact against a proxy that is not proven to be serving")
+            f"proxy {name} never published its readiness countfile — refusing to run an artifact "
+            f"against a proxy that is not proven to be serving. Waited "
+            f"{time.monotonic() - started:.1f}s against a {_READINESS_DEADLINE_SECONDS:g}s deadline "
+            f"(elapsed is MEASURED, not the budget restated: a single wedged runtime call can overrun "
+            f"the deadline by its own subprocess timeout)")
 
     def _escape_probe(self, network: str, proxy_ip: str, image_id: str) -> None:
         p = subprocess.run(
@@ -649,18 +684,33 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         MEASURED 2026-08-02 on podman 4.9.3: exec against a stopped container exits 255 and writes its error
         to STDERR, leaving stdout EMPTY, so ``int("")`` raised and the old code happened to return ``None``.
         THAT IS A PROPERTY OF ONE RUNTIME'S STREAM BEHAVIOUR, NOT OF THIS FUNCTION. ``_RUNTIMES`` admits
-        ``nerdctl`` and ``docker``; a runtime that put anything numeric on stdout on an error path would have
-        been PARSED INTO A COUNT. Same class as reading ``git rev-parse HEAD``'s stdout without its exit
-        status — which echoes the literal ``HEAD`` at rc 128 and has already bitten this tree once.
+        ``nerdctl`` and ``docker``, AND NEITHER WAS MEASURED — the podman observation is why the defect was
+        noticed, never evidence about the other two. A runtime that put anything numeric on stdout on an
+        error path would have been PARSED INTO A COUNT. Same class as reading ``git rev-parse HEAD``'s stdout
+        without its exit status — which echoes the literal ``HEAD`` at rc 128 and has already bitten this
+        tree once. The returncode check makes the outcome runtime-INDEPENDENT, which is the point: the fix
+        does not rest on the unmeasured stacks behaving like the measured one.
 
         ``TimeoutExpired`` is mapped here rather than left to propagate: a wedged runtime is exactly "the
         observer could not be read", and letting it escape ``_egress`` would reintroduce the raw-exception
         shape that the typed-absence taxonomy exists to replace.
 
+        ⚠ BUT "NO READING" IS NOT THE RESPONSE EVERY CALLER WANTS TO THAT EVENT. ``_start_proxy``'s readiness
+        poll reads "no reading" as "not ready yet, keep waiting", so absorbing a timeout HERE bought it
+        another attempt THERE — turning a ~30s abort into ~25 minutes and a refusal that claimed to have
+        waited 5s. That is repaired at the readiness caller with a wall-clock deadline, NOT by giving this
+        function a per-caller contract. Recorded because the mapping looks locally obvious and its cost is
+        one call site away.
+
         ``OSError`` is DELIBERATELY NOT caught, and the exclusion is stated rather than left to inference.
         A vanished runtime binary is not "the observer could not be read" — it is the executor losing its own
-        tooling, and the readiness poll would silently absorb it into 50 retries and then report that the
-        PROXY never published its countfile. That message would name the wrong subject. It stays loud.
+        tooling, and a readiness poll that absorbed it would keep retrying and then report that the PROXY
+        never published its countfile. That message would name the wrong subject. It stays loud.
+
+        THE IRONY IS WORTH KEEPING: the paragraph above described this exact absorption failure mode as the
+        reason to exclude ``OSError`` — and ``TimeoutExpired`` was then mapped straight into it, in the same
+        diff, four lines away. A stated rule does not enforce itself, and the case it was written about is
+        the one most likely to be read as already handled.
 
         ``AttributeError`` was removed from the except set: ``text=True`` with ``capture_output=True``
         guarantees ``r.stdout`` is a ``str``, so that arm was dead. A guessed except-set is a small thing
