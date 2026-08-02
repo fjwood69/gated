@@ -243,9 +243,11 @@ def escape_probe_argv(runtime: str, *, network: str, proxy_ip: str, image_id: st
 
 # ``no_healthcheck_flags`` IS A VALUE MEMBER, and it lands in the SAME COMMIT as the flag reaching the
 # three builders. The ordering is deliberate: a Clause-M control that is live for even one commit while
-# unattested is a fossil in the making, and this tree already carries the archaeology — the vestigial
-# ``baseline`` field records a behaviour change that moved no identity because the local half is
-# unattested and nobody was structurally obliged to notice.
+# unattested is a fossil in the making, and this tree carried the archaeology until recently — the
+# ``ObservedHandle.baseline`` field recorded a behaviour change that moved no identity, because the
+# local half is unattested and nobody was structurally obliged to notice. THAT FIELD IS NOW DELETED,
+# and this sentence is written in the past tense on purpose: it was updated in the same diff that
+# removed it, having been caught pointing at a vestige that no longer existed.
 #
 # WHY A VALUE AND NOT BUILDER SOURCE. Builder-source hashing would cover these three CONSTRUCT sites, and
 # it is the mechanism the NARROW ruling kept — but the ruling kept its DESIGN, not a live implementation.
@@ -393,7 +395,6 @@ class ObservedHandle:
     network: str     # --internal --disable-dns network name
     proxy: str       # proxy sidecar container name
     proxy_ip: str
-    baseline: int    # proxy count after the escape probe (subtracted from the final)
     image_id: str    # 3.5-close #1.1: the immutable digest resolved once at prepare()
 
 
@@ -471,7 +472,6 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
             # observer (count 0, the first failure intact). Seal already validated.
             self._force_remove(proxy)
             proxy_ip = self._start_proxy(network, proxy, fault_mode, image_id)
-            baseline = 0
         except BaseException as setup_exc:
             # Partial-setup cleanup is under the SAME fail-closed contract as teardown(): the survivor
             # list is authority, not decoration. If cleanup cannot PROVE the infra gone (EXISTS/UNKNOWN),
@@ -503,7 +503,7 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         return ObservedHandle(
             id=uuid.uuid4().hex, artifact_hash=artifact.tree_hash, snapshot=snapshot,
             container=f"{_PREFIX}sbx-{rid}", network=network, proxy=proxy,
-            proxy_ip=proxy_ip, baseline=baseline, image_id=image_id,
+            proxy_ip=proxy_ip, image_id=image_id,
         )
 
     # -- run: hermetic container on the sealed net; read the count from OUTSIDE ---
@@ -645,20 +645,38 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
             return None
 
     def _egress(self, h: ObservedHandle) -> int | EgressAbsence:
-        """Artifact's attempts = final proxy count minus the escape-probe baseline.
+        """The artifact's egress attempts: THE COUNT THE OBSERVER REPORTS. No arithmetic.
 
         An unreadable counter is OBSERVER_UNREADABLE, never a number. This backend declares
         ``observes_egress = True``, so NOT_OBSERVED is not even obtainable here — an observer that ran
         and could not be read is a different fact from a backend that never had one, and the count is
         UNKNOWN rather than zero.
 
-        (The ``baseline`` term is inert — it is a literal 0 on every path — and its removal is a
-        SEPARATE diff by ruling, so the taxonomy change and the arithmetic deletion do not share one.)
+        ⚠ THE SUBTRACTION IS GONE, AND IT WAS ALREADY INERT. ``ObservedHandle`` carried a ``baseline``
+        field whose comment read "proxy count after the escape probe (subtracted from the final)" — but
+        it was assigned the literal ``0`` on every path, so ``final - baseline`` was identically
+        ``final``. The comment described the PRE-RESTART design: the escape probe's reachability hit used
+        to bump the counter, and the baseline subtracted it. That was superseded when ``prepare()`` began
+        RESTARTING the proxy after the probe, so the artifact faces a fresh observer at zero — and the
+        field survived the design that justified it.
+
+        SUBTRACTION WOULD BE WRONG EVEN IF THE FIELD WERE LIVE, which is why this is a deletion rather
+        than a repair. A one-shot contamination is contamination, and subtracting it LAUNDERS it into a
+        clean number; an ONGOING source contributes at T1..Tn, so a baseline measured at T0
+        UNDER-corrects by exactly the post-start events. Contamination is eliminated or discriminated AT
+        THE OBSERVER — never corrected arithmetically after the fact.
+
+        NOT IN THIS DIFF: the witness chain that would give the count a two-sided floor on the live
+        engine (start -> 0, post-probe -> exactly the pinned probe cardinality, restart -> 0, post-run ->
+        final). That is a DESIGN with its own pins — chiefly that the probe's connection count must be
+        ONE CONSTANT expanded at both the escape script and the check, or it is two literals agreeing by
+        convention. Deleting an inert term is mechanical; adding a floor is not, and bundling them would
+        smuggle an unbuilt design into a subtraction removal.
         """
         final = self._read_count(h.proxy)
         if final is None:
             return EgressAbsence.OBSERVER_UNREADABLE
-        return final - h.baseline
+        return final
 
     def _teardown_infra(
         self, network: str, proxy: str, sandbox: str | None = None

@@ -110,7 +110,8 @@ class EveryRunBuilderDisablesHealthchecks(unittest.TestCase):
 
     def test_the_flag_is_a_member_of_the_attested_identity(self) -> None:
         """THE FOSSIL GUARD. A Clause-M control that is live but unattested is invisible to every
-        receipt — which is precisely how the vestigial ``baseline`` field came to exist. Recomputing the
+        receipt — which is precisely how the ``ObservedHandle.baseline`` field came to exist and survive
+        long after the design that justified it (now deleted). Recomputing the
         digest WITHOUT this member must produce a DIFFERENT hash; if it does not, the member is
         decorative and the control is a fossil."""
         import hashlib

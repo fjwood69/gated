@@ -376,8 +376,7 @@ class TheWitnessSurvivesAFailedTeardown(unittest.TestCase):
     def _handle(self):  # type: ignore[no-untyped-def]
         from sandbox.observed import ObservedHandle
         return ObservedHandle(id="h1", artifact_hash="a", snapshot=pathlib.Path("/tmp/zz-nonexistent"),
-                              container="c1", network="n1", proxy="p1", proxy_ip="10.0.0.2",
-                              baseline=0, image_id="sha256:zz")
+                              container="c1", network="n1", proxy="p1", proxy_ip="10.0.0.2", image_id="sha256:zz")
 
     def test_the_witness_is_RETAINED_when_teardown_could_not_be_verified(self) -> None:
         sbx, h = self._sandbox(), self._handle()
@@ -614,7 +613,7 @@ class ACrashedSweepNeverMintsACleanVerdict(unittest.TestCase):
     def _handle(self, snapshot: pathlib.Path):  # type: ignore[no-untyped-def]
         from sandbox.observed import ObservedHandle
         return ObservedHandle(id="h-crash", artifact_hash="a", snapshot=snapshot, container="c1",
-                              network="n1", proxy="p1", proxy_ip="10.0.0.2", baseline=0,
+                              network="n1", proxy="p1", proxy_ip="10.0.0.2",
                               image_id="sha256:zz")
 
     def _snapshot(self) -> pathlib.Path:
@@ -759,8 +758,7 @@ class UnverifiableIsNotALeak(unittest.TestCase):
         sbx = obs_mod.ObservedOCISandbox.__new__(obs_mod.ObservedOCISandbox)
         sbx._runtime, sbx._runtime_path, sbx._witness = "podman", _RT, _WITNESS
         h = ObservedHandle(id="h9", artifact_hash="a", snapshot=pathlib.Path("/tmp/zz-none"),
-                           container="c1", network="n1", proxy="p1", proxy_ip="10.0.0.2",
-                           baseline=0, image_id="sha256:zz")
+                           container="c1", network="n1", proxy="p1", proxy_ip="10.0.0.2", image_id="sha256:zz")
         with mock.patch.object(sbx, "_teardown_infra", return_value=_SweepReport([], ["c1"], [])):
             with self.assertRaises(TeardownUnverifiableError) as caught:
                 sbx.teardown(h)
@@ -810,8 +808,7 @@ class TheVerdictIsStoredAsDataNotAsAnException(unittest.TestCase):
     def _handle(self):  # type: ignore[no-untyped-def]
         from sandbox.observed import ObservedHandle
         return ObservedHandle(id="h2", artifact_hash="a", snapshot=pathlib.Path("/tmp/zz-nonexistent"),
-                              container="c1", network="n1", proxy="p1", proxy_ip="10.0.0.2",
-                              baseline=0, image_id="sha256:zz")
+                              container="c1", network="n1", proxy="p1", proxy_ip="10.0.0.2", image_id="sha256:zz")
 
     def _leaked(self):  # type: ignore[no-untyped-def]
         sbx, h = self._sandbox(), self._handle()
@@ -893,7 +890,7 @@ class TheSnapshotIsDestroyedOnlyOnAReachedVerdict(unittest.TestCase):
         from sandbox.observed import ObservedHandle
         sbx, snap = self._sandbox(), self._snapshot()
         h = ObservedHandle(id="h3", artifact_hash="a", snapshot=snap, container="c1", network="n1",
-                           proxy="p1", proxy_ip="10.0.0.2", baseline=0, image_id="sha256:zz")
+                           proxy="p1", proxy_ip="10.0.0.2", image_id="sha256:zz")
         with mock.patch.object(sbx, "_teardown_infra", return_value=report), \
              mock.patch.object(sbx, "_force_remove"):
             try:
@@ -936,7 +933,7 @@ class TheSnapshotIsDestroyedOnlyOnAReachedVerdict(unittest.TestCase):
         from sandbox.observed import ObservedHandle
         sbx, snap = self._sandbox(), self._snapshot()
         h = ObservedHandle(id="h5", artifact_hash="a", snapshot=snap, container="c1", network="n1",
-                           proxy="p1", proxy_ip="10.0.0.2", baseline=0, image_id="sha256:zz")
+                           proxy="p1", proxy_ip="10.0.0.2", image_id="sha256:zz")
         with mock.patch.object(sbx, "_teardown_infra", return_value=_SweepReport()), \
              mock.patch.object(sbx, "_drop_witness", side_effect=RuntimeError("runtime vanished")):
             with self.assertRaises(TeardownCleanupError) as caught:
@@ -953,7 +950,7 @@ class TheSnapshotIsDestroyedOnlyOnAReachedVerdict(unittest.TestCase):
         from sandbox.observed import ObservedHandle
         sbx, snap = self._sandbox(), self._snapshot()
         h = ObservedHandle(id="h6", artifact_hash="a", snapshot=snap, container="c1", network="n1",
-                           proxy="p1", proxy_ip="10.0.0.2", baseline=0, image_id="sha256:zz")
+                           proxy="p1", proxy_ip="10.0.0.2", image_id="sha256:zz")
         with mock.patch.object(sbx, "_teardown_infra", return_value=_SweepReport()), \
              mock.patch.object(sbx, "_drop_witness", side_effect=RuntimeError("x")):
             with self.assertRaises(TeardownCleanupError):
@@ -967,7 +964,7 @@ class TheSnapshotIsDestroyedOnlyOnAReachedVerdict(unittest.TestCase):
         import sandbox.oci as oci_mod
         sbx, snap = self._sandbox(), self._snapshot()
         h = ObservedHandle(id="h4", artifact_hash="a", snapshot=snap, container="c1", network="n1",
-                           proxy="p1", proxy_ip="10.0.0.2", baseline=0, image_id="sha256:zz")
+                           proxy="p1", proxy_ip="10.0.0.2", image_id="sha256:zz")
         with mock.patch.object(sbx, "_teardown_infra", return_value=_SweepReport(["c1"], [], [])), \
              mock.patch.object(sbx, "_force_remove"), \
              mock.patch.object(oci_mod, "_rmtree_resilient", side_effect=OSError("disk gone")):
@@ -1092,8 +1089,7 @@ class TheFoldFirstFixesAreThemselvesDischarged(unittest.TestCase):
         sbx = obs_mod.ObservedOCISandbox.__new__(obs_mod.ObservedOCISandbox)
         sbx._runtime, sbx._runtime_path, sbx._witness = "podman", _RT, _WITNESS
         h = ObservedHandle(id="f1", artifact_hash="a", snapshot=pathlib.Path("/tmp/zz-none"),
-                           container="c1", network="n1", proxy="p1", proxy_ip="10.0.0.2",
-                           baseline=0, image_id="sha256:zz")
+                           container="c1", network="n1", proxy="p1", proxy_ip="10.0.0.2", image_id="sha256:zz")
         with mock.patch.object(sbx, "_teardown_infra", return_value=_SweepReport(["c1"], [], [])), \
              mock.patch.object(sbx, "_force_remove"), \
              mock.patch.object(oci_mod, "_rmtree_resilient", side_effect=OSError("disk gone")):
@@ -1136,8 +1132,7 @@ class TheFoldFirstFixesAreThemselvesDischarged(unittest.TestCase):
         sbx = obs_mod.ObservedOCISandbox.__new__(obs_mod.ObservedOCISandbox)
         sbx._runtime, sbx._runtime_path, sbx._witness = "podman", _RT, _WITNESS
         h = ObservedHandle(id="f2", artifact_hash="a", snapshot=pathlib.Path("/tmp/zz-none"),
-                           container="c1", network="n1", proxy="p1", proxy_ip="10.0.0.2",
-                           baseline=0, image_id="sha256:zz")
+                           container="c1", network="n1", proxy="p1", proxy_ip="10.0.0.2", image_id="sha256:zz")
         with mock.patch.object(sbx, "_teardown_infra", side_effect=RuntimeError("x")):
             with self.assertRaises(RuntimeError):
                 sbx.teardown(h)
@@ -1155,8 +1150,7 @@ class AForeignHandleIsRefusedNotIgnored(unittest.TestCase):
         oci_h = OCIHandle(id="x", artifact_hash="a", snapshot=pathlib.Path("/tmp/zz"),
                           container="c", image_id="sha256:zz")
         obs_h = ObservedHandle(id="y", artifact_hash="a", snapshot=pathlib.Path("/tmp/zz"),
-                               container="c", network="n", proxy="p", proxy_ip="10.0.0.2",
-                               baseline=0, image_id="sha256:zz")
+                               container="c", network="n", proxy="p", proxy_ip="10.0.0.2", image_id="sha256:zz")
         for cls, foreign in ((OCISandbox, obs_h), (ObservedOCISandbox, oci_h)):
             sbx = cls.__new__(cls)
             sbx._runtime, sbx._runtime_path, sbx._witness = "podman", _RT, _WITNESS

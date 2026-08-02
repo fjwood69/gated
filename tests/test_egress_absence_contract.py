@@ -360,6 +360,57 @@ class TheGuardPostureMustBeSpelled(unittest.TestCase):
         self.assertIs(param.kind, _inspect.Parameter.KEYWORD_ONLY)
 
 
+class TheReportedCountIsNotComputed(unittest.TestCase):
+    """``_egress`` REPORTS the observer's count. It does not adjust it.
+
+    ``ObservedHandle`` carried a ``baseline`` field documented as "proxy count after the escape probe
+    (subtracted from the final)". It was assigned the literal ``0`` on every path, so the subtraction was
+    identically the identity function — the comment described the PRE-RESTART design, superseded when
+    ``prepare()`` began restarting the proxy after the probe so the artifact faces a fresh observer at
+    zero. The field outlived the design that justified it.
+
+    SUBTRACTION WOULD BE WRONG EVEN IF THE FIELD WERE LIVE, which is why the fix was deletion rather than
+    repair: a one-shot contamination is contamination, and subtracting it LAUNDERS it into a clean
+    number; an ONGOING source contributes at T1..Tn, so a baseline measured at T0 under-corrects by
+    exactly the post-start events. Contamination is eliminated or discriminated AT THE OBSERVER, never
+    corrected arithmetically afterwards.
+
+    A DELETION WITH NO GUARD CAN BE SILENTLY UNDONE, and this one is easy to reintroduce because a
+    correction term reads as prudence. Parsed, not scanned.
+    """
+
+    def test_ObservedHandle_carries_no_baseline_field(self) -> None:
+        import dataclasses
+
+        from sandbox.observed import ObservedHandle
+        names = {f.name for f in dataclasses.fields(ObservedHandle)}
+        self.assertNotIn(
+            "baseline", names,
+            "ObservedHandle has a baseline field again — a correction term on the verdict input, which "
+            "launders a one-shot contamination and under-corrects an ongoing one",
+        )
+
+    def test_the_egress_read_performs_no_arithmetic(self) -> None:
+        import ast
+
+        src = (Path(__file__).resolve().parent.parent / "sandbox" / "observed.py").read_text()
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.FunctionDef) and n.name == "_egress")
+        # ARITHMETIC operators only. A first version flagged every BinOp and immediately tripped on the
+        # return annotation ``int | EgressAbsence``, whose ``|`` parses as BitOr — the guard accusing the
+        # type of doing arithmetic. Naming the operators is the positive shape; "any BinOp" was a
+        # convenient over-approximation that happened to be wrong on the very function it guards.
+        _ARITH = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow)
+        ops = [type(n.op).__name__ for n in ast.walk(fn)
+               if isinstance(n, ast.BinOp) and isinstance(n.op, _ARITH)]
+        self.assertEqual(
+            ops, [],
+            f"_egress performs arithmetic on the observer's count ({ops}). The reported number is the "
+            "number the observer produced; anything else is a correction, and a correction is a claim "
+            "about contamination that the reader cannot check",
+        )
+
+
 class AbsenceCannotBeStatedByAccident(unittest.TestCase):
     def test_the_field_has_no_default(self) -> None:
         """A default is spelled absence AT THE CONSTRUCTION SITE: it lets a backend omit the field and
