@@ -39,7 +39,18 @@ _ROOT = Path(__file__).resolve().parent.parent
 _PROD_PKGS = ("core", "sandbox", "engine", "observe", "gate", "cli")
 # The proxy-bytes golden (shared with the execution-identity golden): re-verified after a REAL install to
 # prove observe/proxy.py shipped and its bytes are unchanged (confound #7).
-_GOLDEN_OBSERVER_CONFIG_HASH = "2a7f8953c53eb12ad2353884410adbab5b1f79ab176de4738b8e5cc301dba760"
+#
+# ⚠ "shared with" IS ASPIRATIONAL — this is a RESTATED LITERAL, not a shared value, and P3 step 0 had to
+# edit both copies by hand to keep them agreeing. A literal is CORRECT here (importing the golden from the
+# source tree would compare the installed package against the dev tree instead of against a pinned
+# expectation); TWO literals are not. The fix is one shared test constant, and it is deliberately NOT done
+# in this increment: it is the test-side instance of exactly the defect P3 step 3 already carries — "the
+# receipt must carry the module's CURRENT hash rather than a restated copy" — and this tree has already
+# named the law: "the two must be one value rather than two that agree today".
+#
+# RE-PINNED — P3 step 0, 2026-08-02: write_count publishes by atomic rename; see the execution-identity
+# golden for the measurement.
+_GOLDEN_OBSERVER_CONFIG_HASH = "6605652a4c75592c1678aca75e547a6276e4c8cce10c57ff6651cca58ad7e8b0"
 
 
 def _iter_prod_py() -> "list[Path]":

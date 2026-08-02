@@ -20,6 +20,7 @@ Usage (inside the proxy container): ``python3 proxy.py <port> <countfile>``
 """
 from __future__ import annotations
 
+import os
 import socket
 import sys
 import threading
@@ -43,8 +44,42 @@ def serve(port: int, countfile: str, mode: str = "fail_always") -> None:
 
     def write_count(n: int) -> None:
         # the count lives in the proxy's OWN fs — never shared with the artifact.
-        with open(countfile, "w") as f:
+        #
+        # ATOMIC BY RENAME, never truncate-then-write. ``open(countfile, "w")`` truncates FIRST and
+        # the value lands only at flush, so a reader can observe an EMPTY file. That reader is
+        # ``<rt> exec <proxy> cat <countfile>`` in ANOTHER PROCESS, and it parses with
+        # ``int(stdout.strip())`` -> ``None`` on ValueError. The writes here serialise under ``lock``;
+        # the reader holds no lock and CANNOT be made to, because it is not in this process. So the
+        # window is closed by CONSTRUCTION rather than classified after the fact: a reader now sees
+        # either the whole old value or the whole new one.
+        #
+        # MEASURED before the fix, hammering a writer thread against 4000 separate-process reads:
+        # 2687 of 4000 read EMPTY and parsed to None; with the rename, 0 of 4000. The RATE is an
+        # artifact of the hot loop (production writes once per connection) — what it establishes is
+        # that the window is real, not how often it fires. No partial numeral was ever observed, so
+        # the failure is a benign None, not a silently wrong count.
+        #
+        # SAME DIRECTORY IS LOAD-BEARING, which is why the temp is spelled as a suffix ON the
+        # countfile rather than assembled from a temp dir: ``os.replace`` is atomic only WITHIN a
+        # filesystem, and a temp under /tmp against a countfile on a mounted volume degrades to
+        # copy-and-delete, silently reopening the exact window this exists to close.
+        #
+        # NO fsync, deliberately. The hazard is a CONCURRENT READER through the same kernel, which the
+        # rename already orders. fsync buys durability across power loss — a different failure, and not
+        # one this gate makes any claim about. (If fsync is ever added it must be file-fsync BEFORE the
+        # rename AND directory-fsync AFTER; without the second the rename itself is not durable.)
+        #
+        # A FIXED temp name is safe because every write_count call is TOTALLY ORDERED: the readiness
+        # write runs single-threaded before the accept loop, and every later write is under ``lock``. So
+        # one process can never race its own temp. THE INVARIANT THAT MAKES THAT TRUE IS ONE PROXY
+        # PROCESS PER COUNTFILE, stated here because nothing else states it. Two processes sharing a
+        # countfile directory is already broken for a worse reason — the in-memory ``count`` races and
+        # last-writer-wins — and the temp collision merely surfaces it as a loud FileNotFoundError out
+        # of ``os.replace``, i.e. proxy death rather than a silently wrong verdict input.
+        tmp = f"{countfile}.tmp"
+        with open(tmp, "w") as f:
             f.write(str(n))
+        os.replace(tmp, countfile)
 
     # NOTE: the initial write_count(0) is deliberately NOT here. The countfile is the READINESS
     # SIGNAL every caller polls (sandbox/observed.py waits for it, then starts the artifact), so it
@@ -83,6 +118,12 @@ def serve(port: int, countfile: str, mode: str = "fail_always") -> None:
     # so "countfile exists" now entails "a connection will be accepted" — the property every caller
     # actually depends on. A bind/listen failure therefore leaves NO countfile and the caller times
     # out, rather than proceeding on a file that lied about readiness.
+    #
+    # The atomic-rename publication above SHARPENS this, and the sharpening is why readiness is named
+    # as number-forming semantics rather than mere plumbing. Under truncate-then-write the countfile
+    # could EXIST while momentarily empty, so the caller's poll (which reads content, not existence)
+    # could see no-reading on a proxy that was already serving. Now the file's FIRST APPEARANCE
+    # already carries its value: existence and readability become the same event.
     write_count(0)
     while True:
         conn, _ = srv.accept()
