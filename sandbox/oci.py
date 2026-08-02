@@ -84,6 +84,30 @@ WORK_DIR = "/work"            # writable tmpfs — scratch/audit only, NEVER gra
 # maintained strings happening to agree. Defined once here and imported by ``sandbox/observed.py``.
 RESOURCE_PREFIX = "moriverify-"
 
+# Disable engine-run healthchecks on EVERY container gated creates. This is a VERDICT control, not
+# hygiene, and it is defined once here for the same reason ``RESOURCE_PREFIX`` is: three builders across
+# two modules apply it, and three independently maintained literals would be three chances to drift.
+#
+# WHY IT IS LOAD-BEARING. A HEALTHCHECK makes the ENGINE open periodic connections. The proxy counts
+# CONNECTIONS at accept, so engine traffic lands in the verdict input as if the artifact had made it —
+# and worse, ``fail_once`` is a GLOBAL counter, so a single stray connection consumes attempt 1 and
+# silently upgrades the artifact's first retry from 503 to 200. That changes what the artifact DOES,
+# changes the number, and nothing notices. The artifact container is the dangerous surface: it holds
+# ``--add-host health-proxy`` on the sealed network, so its healthcheck can reach the proxy directly.
+#
+# MEASURED 2026-08-02: the configured image (``python:3.11-alpine``) has ``Config.Healthcheck = null``,
+# so this is not firing today. THAT IS THE FINDING, NOT THE REASSURANCE — the safety rested entirely on
+# the configured image happening to lack one, and NOTHING CHECKED IT. Accidental protection, not
+# structural. An image swap is an ordinary act and would have made it live silently.
+#
+# ATTESTED AS A VALUE, deliberately. It is a member of ``_OBSERVER_CONFIG_HASH`` (see sandbox/observed.py)
+# because it is a value whose change alters what the instrument reports on a run that STILL SUCCEEDS —
+# Clause M. Builder-SOURCE hashing would also have covered it, but that mechanism IS NOT BUILT (see the
+# attestation note further down this module: "this increment does not attest anything and does not claim
+# to"), so relying on it here would ship a Clause-M control with ZERO IDENTITY MOVEMENT — the fossil
+# class that the vestigial ``baseline`` field already proves can happen.
+NO_HEALTHCHECK_FLAGS = ("--no-healthcheck",)
+
 
 class OCIRuntimeUnavailable(Exception):
     """No OCI runtime can actually run a hermetic (rootless, --network=none)
@@ -1099,7 +1123,7 @@ def artifact_run_argv(
     reaped. ``image_id`` is the IMMUTABLE digest resolved at prepare(), never the mutable tag.
     """
     return [
-        runtime, "run", "--rm", "--init", "--name", container,
+        runtime, "run", "--rm", "--init", *NO_HEALTHCHECK_FLAGS, "--name", container,
         *network,
         "--mount", artifact_mount_spec(snapshot),
         "--tmpfs", WORK_DIR,
