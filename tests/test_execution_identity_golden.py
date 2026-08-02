@@ -32,11 +32,16 @@ _GOLDEN_BACKEND_NAMES = {
 # (confound #7 — the proxy source is part of identity; pin it and re-verify after a wheel install).
 # rebaked when observe/proxy.py moved the egress count to accept-time (3.5 security dissent, count-at-accept);
 # the proxy source bytes are part of the observer identity, so a legitimate proxy change re-pins this golden.
-_GOLDEN_OBSERVER_CONFIG_HASH = "2a7f8953c53eb12ad2353884410adbab5b1f79ab176de4738b8e5cc301dba760"
+# RE-PINNED AGAIN — P3 step 0, 2026-08-02: write_count now publishes the countfile by ATOMIC RENAME
+# (sibling temp + os.replace) instead of truncate-then-write. The old shape truncated the file before the
+# value landed, so the executor's out-of-process ``cat`` could read it EMPTY and parse it to None —
+# measured at 2687 of 4000 reads under a hammering writer, 0 of 4000 after. This is a deliberate,
+# behaviour-changing proxy edit, so the re-pin is the identity working as designed rather than noise.
+_GOLDEN_OBSERVER_CONFIG_HASH = "6605652a4c75592c1678aca75e547a6276e4c8cce10c57ff6651cca58ad7e8b0"
 # A representative FULL Observed identity (image_ref a fixed sentinel) and its digest — the tuple AND the
 # digest are pinned so neither a coordinate change nor a digest-formula change slips through.
 _GOLDEN_OBSERVED_IMAGE_REF = "sha256:GOLDEN"
-_GOLDEN_OBSERVED_DIGEST = "bc555ca3a53a63e15fb2cf4eef2081a37f782651ec2e13525eb29f0fb0b4d183"
+_GOLDEN_OBSERVED_DIGEST = "91b9f6fbb788e7bd4ce4224997fcd235ecf8847eb41ffb1ee3113b0e7d9503ed"
 
 
 class ExecutionIdentityGoldenTests(unittest.TestCase):
