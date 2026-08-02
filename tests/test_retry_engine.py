@@ -103,7 +103,7 @@ class DemoRegressionTests(unittest.TestCase):
         return ObservedOCISandbox(image=IMAGE, runtime="podman")
 
     def _run(self, script: str) -> Verdict:
-        return run_check(self._mk, RetryCheck(_ENTRY), _artifact(script), _BUDGET, trials=2).verdict
+        return run_check(self._mk, RetryCheck(_ENTRY), _artifact(script), _BUDGET, trials=2, backend_guard=None).verdict
 
     def test_A_retry_PASS(self) -> None:
         self.assertIs(self._run(_A).status, VerdictType.PASS)

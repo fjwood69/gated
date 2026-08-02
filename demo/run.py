@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Sequence
 
 from core.artifact_hash import tree_hash
-from core.sandbox import ArtifactSpec, Command, Fixtures, ResourceBudget
+from core.sandbox import ArtifactSpec, Command, EgressAbsence, Fixtures, ResourceBudget
 from demo import pin, preflight
 from demo.fetch import CorpusIntegrityError, CorpusUnavailable, ensure_corpus
 from demo.receipt import (
@@ -453,8 +453,12 @@ def measure_row(plan: RowPlan, workspace: Path, runtime: str,
                      sealed, so a leaking row never runs. This is a CONTROL-FLOW guarantee, not a
                      receipt claim — which is why no ``seal_verified_at_start`` field exists: the
                      runner could only ever have written the literal ``True``.
-      counter liveness ``egress_attempts`` comes back ``None`` if the proxy's storage cannot be read
-                     after the container exits. That raises here rather than sealing a number.
+      counter liveness ``egress_attempts`` comes back as an ``EgressAbsence`` variant if no count is
+                     certifiable — ``OBSERVER_UNREADABLE`` when the proxy's storage cannot be read after
+                     the container exits, ``NOT_OBSERVED`` from a backend with no observer at all. Either
+                     raises here rather than sealing a number. (This previously said ``None``, which the
+                     type no longer has — a docstring describing a design the code does not have, found
+                     by running the check rather than by reading the diff.)
 
     ⚠ WHAT IS NOT ESTABLISHED, STATED PLAINLY. A witness that answered correctly at the start and
     served a SUCCESS mid-row is invisible to both: the posture is unchanged, the counter is readable,
@@ -499,11 +503,14 @@ def measure_row(plan: RowPlan, workspace: Path, runtime: str,
     # it at table time (exit 3, not drift), but the LYING BYTES were already on disk and this
     # function's own docstring promised terminal-invalid where it in fact continued. Zero is a
     # measurement; an outage is not.
-    if result.egress_attempts is None:
+    if isinstance(result.egress_attempts, EgressAbsence):
         raise InstrumentInvalid(
-            f"the boundary counter was UNREADABLE after {plan.name} exited — the count could not be "
-            "retrieved from the proxy's own storage. No number is attributable to this row, and none "
-            "will be sealed. This is an invalid instrument, never drift")
+            f"NO MEASUREMENT is attributable to {plan.name}: the sandbox reported "
+            f"{result.egress_attempts.name} rather than a count. Nothing will be sealed. This is an "
+            "invalid instrument, never drift. Both variants land here deliberately — a backend with no "
+            "observer at all is as unusable for this table as an observer whose product cannot be read. "
+            "The demo requires a MEASUREMENT; which absence occurred is a fact for the log, not a "
+            "licence to seal a number.")
     measured = result.egress_attempts
     # ⚠ NO SYNTHESISED EVENTS. The observer records a COUNT and no per-event data, so this is EMPTY
     # and the receipt says the count is uncorroborated. Labels derived from the count would put

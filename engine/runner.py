@@ -34,6 +34,10 @@ from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
 from core import (
+    EgressAbsence,
+    EgressCapabilityContradiction,
+    EgressCapabilityUndeclared,
+    SandboxStartError,
     ArtifactSpec,
     Command,
     ExecutionResult,
@@ -169,6 +173,60 @@ def aggregate(verdicts: Sequence[Verdict]) -> Verdict:
     return Verdict(VerdictType.PASS, Reason.UNANIMOUS_PASS)
 
 
+def _require_consistent_egress_capability(
+    sandbox: Sandbox, result: ExecutionResult, completed: tuple[Verdict, ...] = (),
+) -> None:
+    """Bracket the capability claim in both directions, at the one site that sees the pair.
+
+    A DIFFERENT CONTROL TYPE from the audited-backend admission in ``gate/backends.py`` — NOT its backup.
+    That audit establishes DECLARATION-TRUTH for a closed set of reviewed backends; this brackets
+    RESULT-VS-DECLARATION CONSISTENCY on EVERY run of ANY backend, including one that satisfies the
+    ``Sandbox`` Protocol without inheriting ``BaseSandbox`` and therefore inherits none of its guards.
+    Neither substitutes for the other, and calling one the other's defence-in-depth would credit a
+    control with a property adjacent to the one it has.
+
+    THE READ IS HARD, NOT DEFAULTED. ``getattr(sandbox, "observes_egress", False)`` would COALESCE
+    UNDECLARED INTO DECLARED-FALSE — a spelled absence manufactured at the consumption site, and an
+    undeclared backend holding a live observer would pass by inheriting a claim it never made. Absence of
+    output is not output of absence. ``Sandbox`` declares the attribute, so the hard read converts
+    Protocol conformance from assumed to enforced at the one site that consumes the value.
+
+    ⚠ WHAT THIS DOES NOT BRACKET, stated so the coverage is not read as total. It refuses
+    ``NOT_OBSERVED`` from an observing backend and an ``int`` from a non-observing one. It does NOT refuse
+    ``OBSERVER_UNREADABLE`` from a NON-observing backend built through the RAW constructor. That path is
+    COVERED BY TWO CONVENTIONS, NOT BY THIS CHECK: ``ExecutionResult.from_run`` refuses it — for code that
+    uses ``from_run``; and detectors refuse the variant — for detectors that refuse it, which today is
+    ``RetryCheck``'s IMPLEMENTATION rather than a property of the layer. That is precisely the reasoning
+    that made this increment necessary, so it is recorded as CONVENTIONS rather than COVERAGE, and the
+    follow-up must not be judged unnecessary later by someone reading a coverage claim.
+
+    WHAT THIS DOES NOT DO: it does not verify that the declaration is TRUE. A backend declaring ``False``
+    while holding a live observer is CONSISTENT here and wrong. That residual is answered by admission
+    audit, is currently harmless because every ``EgressAbsence`` variant refuses downstream, and becomes
+    live the moment any detector treats a variant as anything other than a refusal.
+    """
+    try:
+        observes = sandbox.observes_egress
+    except AttributeError as exc:
+        raise EgressCapabilityUndeclared(
+            f"{type(sandbox).__name__} does not declare observes_egress. The Sandbox Protocol requires "
+            "it, and defaulting the read would silently convert 'never answered' into 'answered False' — "
+            "letting an undeclared backend with a live observer inherit a claim it never made"
+        ) from exc
+    if not isinstance(observes, bool):
+        raise EgressCapabilityUndeclared(
+            f"{type(sandbox).__name__}.observes_egress is {observes!r}, not a bool — a capability claim "
+            "must be answered, not approximated")
+
+    egress = result.egress_attempts
+    if egress is EgressAbsence.NOT_OBSERVED and observes:
+        raise EgressCapabilityContradiction(
+            backend=type(sandbox).__name__, declared=observes, reported=egress, completed_trials=completed)
+    if isinstance(egress, int) and not observes:
+        raise EgressCapabilityContradiction(
+            backend=type(sandbox).__name__, declared=observes, reported=egress, completed_trials=completed)
+
+
 def _judge(
     check: RuntimeAssertion, result: ExecutionResult, trust_policy: TrustPolicy | None,
 ) -> Verdict:
@@ -201,7 +259,7 @@ def run_check(
     command: Command | None = None,
     trust_policy: TrustPolicy | None = None,
     resolved_profile_digest: str | None = None,
-    backend_guard: Callable[[Sandbox], None] | None = None,
+    backend_guard: Callable[[Sandbox], None] | None,
 ) -> EngineRunResult:
     """Run ``check`` on ``artifact`` across up to ``trials`` isolated trials -> one
     Verdict. ``make_sandbox`` is a factory so each trial gets a fresh sandbox instance
@@ -213,6 +271,12 @@ def run_check(
     ``TrialReport`` DIRECTLY (the verdict is a derived property of that report — one source of truth). The
     ``report_sink`` is now a SECONDARY audit copy: it receives the SAME report AFTER it is built, and a
     sink failure is logged, never affecting the returned evidence.
+
+    ``backend_guard`` is a REQUIRED KEYWORD with an explicit ``None`` opt-out. It previously defaulted to
+    ``None``, which made THE UNGUARDED PATH THE DEFAULT — a caller got it by doing nothing, and the secure
+    composition was AVAILABLE RATHER THAN ENFORCED. Now skipping the guard is a spelled, greppable act at
+    the call site. No behaviour change: both production callers already passed it, and the sixteen sites
+    that did not were all tests, which now say so.
 
     S3-completion (measured-not-declared): ``backend_guard`` is the guard OBJECT — the runner INVOKES it on
     EVERY constructed sandbox (it raises on rejection) and derives ``guard_policy_digest`` internally by
@@ -245,6 +309,16 @@ def run_check(
         try:
             with sb.session(artifact, check.fixtures) as handle:
                 result = sb.run(handle, cmd, budget)
+        except SandboxStartError:
+            # THE REFUSAL CHANNEL. The sandbox could not start the artifact, so NO ExecutionResult was
+            # constructed and no claim was made about a measurement that was never taken. Fail-closed
+            # ERROR with no identity coordinate — the same shape as ImageResolutionError below, and for
+            # the same reason: an unattestable trial is never a silent pass.
+            verdicts.append(Verdict(VerdictType.ERROR, Reason.SANDBOX_START_FAILED))
+            raws.append(None)
+            if first_fail:
+                break
+            continue
         except ImageResolutionError:
             # 3.5-close #1.1 (finding A): the image digest could not be resolved BEFORE run -> the run
             # is UNATTESTABLE -> fail-closed ERROR, never a silent pass / "the detector did not fire".
@@ -254,6 +328,14 @@ def run_check(
             if first_fail:
                 break  # re-attempting an unresolvable image gains nothing
             continue
+        # ⚠ THE CHOKE-POINT CONSISTENCY CHECK. ``BaseSandbox.egress_when_unobserved`` guards the
+        # ACCESSOR, not the VALUE: ``EgressAbsence.NOT_OBSERVED`` is a public importable member and the
+        # field accepts it, so any backend can write the literal and never touch the property. The tree's
+        # own suite already does exactly that. This is the only site that sees BOTH the result and the
+        # backend class, so it is the only place the claim can be bracketed in both directions — and it
+        # covers backends that satisfy the Protocol without inheriting BaseSandbox, which the property
+        # cannot reach at all.
+        _require_consistent_egress_capability(sb, result, tuple(verdicts))
         verdict = _judge(check, result, trust_policy)  # trust policy applied BEFORE the detector
         verdicts.append(verdict)
         raws.append(_raw_identity(sb, result))  # image coord = the digest the sandbox actually ran

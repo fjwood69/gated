@@ -39,6 +39,8 @@ from typing import Literal
 
 from core import (
     ArtifactHashMismatchError,
+    EgressAbsence,
+    SandboxStartError,
     ImageResolutionError,
     ArtifactSpec,
     Command,
@@ -402,6 +404,10 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
     # 3.5-close #1.1: bound into the attested execution identity so observer drift (proxy source,
     # sealed-network flags, escape-probe) is visible even when the container image digest is unchanged.
     observer_config_hash: str = _OBSERVER_CONFIG_HASH
+    # THE capability declaration. It is what makes ``NOT_OBSERVED`` unobtainable here: BaseSandbox's
+    # ``egress_when_unobserved`` RAISES for a backend that declares True, so this class can only ever
+    # report an int or OBSERVER_UNREADABLE. A failed observer is never 'nothing to see here'.
+    observes_egress: bool = True
 
     def __init__(self, image: str, runtime: str | None = None) -> None:
         self.image = image
@@ -520,8 +526,15 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
                 cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, env=runtime_client_env(),
             )
-        except OSError:
-            return self._result("error", None, None, h)
+        except OSError as exc:
+            # NO RESULT IS CONSTRUCTED. The container never started, so the measurement question was
+            # never asked — and because ``egress_attempts`` is total, constructing anything here would
+            # force a claim about a reading that does not exist. Every variant is false on this path.
+            # See core.SandboxStartError: variants describe the EPISTEMIC STATUS OF A MEASUREMENT, never
+            # the CAUSE OF A FAILURE, or the enum grows one member per failure mode.
+            raise SandboxStartError(
+                f"could not start the artifact container for {h.container}: {exc!r}. No run occurred, "
+                "so no egress measurement exists to report") from exc
         try:
             proc.communicate(timeout=budget.wall_clock_seconds)
         except subprocess.TimeoutExpired:
@@ -631,10 +644,21 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         except (ValueError, AttributeError):
             return None
 
-    def _egress(self, h: ObservedHandle) -> int | None:
-        """Artifact's attempts = final proxy count minus the escape-probe baseline."""
+    def _egress(self, h: ObservedHandle) -> int | EgressAbsence:
+        """Artifact's attempts = final proxy count minus the escape-probe baseline.
+
+        An unreadable counter is OBSERVER_UNREADABLE, never a number. This backend declares
+        ``observes_egress = True``, so NOT_OBSERVED is not even obtainable here — an observer that ran
+        and could not be read is a different fact from a backend that never had one, and the count is
+        UNKNOWN rather than zero.
+
+        (The ``baseline`` term is inert — it is a literal 0 on every path — and its removal is a
+        SEPARATE diff by ruling, so the taxonomy change and the arithmetic deletion do not share one.)
+        """
         final = self._read_count(h.proxy)
-        return (final - h.baseline) if final is not None else None
+        if final is None:
+            return EgressAbsence.OBSERVER_UNREADABLE
+        return final - h.baseline
 
     def _teardown_infra(
         self, network: str, proxy: str, sandbox: str | None = None
@@ -762,7 +786,7 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
     def _network_state(self, name: str) -> ProbeReading:
         return probe_network(self._exec_runtime(), name, runtime_name=self._runtime)
 
-    def _result(self, outcome: _Outcome, exit_code: int | None, egress: int | None,
+    def _result(self, outcome: _Outcome, exit_code: int | None, egress: int | EgressAbsence,
                 handle: ObservedHandle, raw: int | None = None) -> ExecutionResult:
         return ExecutionResult(
             outcome=outcome, exit_code=exit_code, isolation_level=self.isolation_level,

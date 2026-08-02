@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 
 from core import (
+    EgressAbsence,
     ArtifactSpec,
     Command,
     ExecutionResult,
@@ -36,18 +36,37 @@ _POLICY = resolve_trust_policy("trust-policy:completed-only")
 
 class _OutcomeNoOp(NoOpSandbox):
     """A hermetic NoOp whose result carries a CHOSEN outcome / exit_code / egress — models a real run that
-    completed, timed out, errored, or produced a malformed result."""
+    completed, timed out, errored, or produced a malformed result.
+
+    ⚠ ``observes_egress = True`` IS LOAD-BEARING AND WAS MISSING. This fake emits COUNTS while inheriting
+    NoOpSandbox's ``observes_egress = False``, i.e. it declared "I have no boundary observer" and then
+    reported measurements. The runner's capability check caught it on its first full run — six tests in
+    this file — which is the check doing its job rather than being decorative: the fake models an
+    OBSERVING backend's telemetry, so it must SAY it observes.
+    """
 
     isolation_level: IsolationLevel = IsolationLevel.HERMETIC
+    observes_egress: bool = True
 
-    def __init__(self, outcome: str, exit_code: int | None, egress: int | None = 2) -> None:
+    def __init__(self, outcome: str, exit_code: int | None,
+                 egress: int | EgressAbsence = 2) -> None:
         self._outcome = outcome
         self._exit = exit_code
         self._egress = egress
 
     def run(self, handle: SandboxHandle, entrypoint: Command, budget: ResourceBudget) -> ExecutionResult:
-        base = super().run(handle, entrypoint, budget)
-        return replace(base, outcome=self._outcome, exit_code=self._exit, egress_attempts=self._egress)  # type: ignore[arg-type]
+        # CONSTRUCTS ITS OWN RESULT rather than `replace()`-ing NoOpSandbox's. The parent DERIVES its
+        # absence from ``observes_egress``, and this fake declares True — so the parent's derivation
+        # correctly REFUSES to hand back NOT_OBSERVED, and borrowing its result to overwrite the field
+        # was the fake having it both ways: a non-observer's construction wearing an observer's claim.
+        return ExecutionResult(
+            outcome=self._outcome,  # type: ignore[arg-type]
+            exit_code=self._exit,
+            isolation_level=self.isolation_level,
+            artifact_hash=handle.artifact_hash,
+            egress_attempts=self._egress,
+            raw_return_code=self._exit,
+        )
 
 
 class _AlwaysPass:
@@ -84,7 +103,7 @@ class TrustPolicyApplicationTests(unittest.TestCase):
         det = _AlwaysPass()
         cap = _Capture()
         v = run_check(lambda: _OutcomeNoOp(outcome, exit_code, egress), det, _artifact(tmp), _BUDGET,
-                      trials=1, trust_policy=_POLICY, report_sink=cap).verdict
+                      trials=1, trust_policy=_POLICY, report_sink=cap, backend_guard=None).verdict
         return v, det, cap.reports[0]
 
     def test_always_pass_not_called_on_timeout(self) -> None:
@@ -117,7 +136,7 @@ class TrustPolicyApplicationTests(unittest.TestCase):
 
     def test_egress_none_reaches_detector(self) -> None:
         # egress_attempts=None is detector-semantic telemetry, not a trust concern -> the detector still runs.
-        v, det, _ = self._run("completed", 0, egress=None)
+        v, det, _ = self._run("completed", 0, egress=EgressAbsence.OBSERVER_UNREADABLE)
         self.assertIs(v.status, VerdictType.PASS)
         self.assertEqual(det.called, 1)
 
@@ -126,7 +145,7 @@ class TrustPolicyApplicationTests(unittest.TestCase):
         # policy is threaded by the calibration/enforcement path, checkpoint 3).
         tmp = Path(tempfile.mkdtemp(prefix="mv-tp-"))
         det = _AlwaysPass()
-        run_check(lambda: _OutcomeNoOp("timeout", None), det, _artifact(tmp), _BUDGET, trials=1)
+        run_check(lambda: _OutcomeNoOp("timeout", None), det, _artifact(tmp), _BUDGET, trials=1, backend_guard=None)
         self.assertEqual(det.called, 1)  # detector consulted (no policy gating)
 
 

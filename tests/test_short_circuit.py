@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Iterator
 
 from core import (
+    EgressAbsence,
     ArtifactSpec,
     Command,
     ExecutionResult,
@@ -89,6 +90,11 @@ class _RecordingSandbox:
     path). ``session()`` mirrors BaseSandbox's contract: teardown in ``finally``."""
 
     isolation_level: IsolationLevel = IsolationLevel.HERMETIC  # required Sandbox coordinate (#3 identity)
+    # A PROTOCOL-ONLY fake: it satisfies Sandbox structurally without inheriting BaseSandbox, so it
+    # inherits none of the capability defaults. The runner's hard read caught it — which is exactly the
+    # population that read exists for, since the inheritance-based guards cannot reach it. It must ANSWER
+    # the capability question like any backend; a default would have answered "False" on its behalf.
+    observes_egress: bool = False
 
     def __init__(self, events: list[str]) -> None:
         self._events = events
@@ -96,8 +102,11 @@ class _RecordingSandbox:
     def run(self, handle: object, entrypoint: Command, budget: ResourceBudget) -> ExecutionResult:
         # the check is scripted, but the runner reads result.image_digest for the identity coordinate,
         # so return a conformant ExecutionResult (no image -> None digest).
+        # ``egress_attempts`` is now REQUIRED, and this fake has no observer — it must SAY so rather
+        # than assert it by omission, which is exactly the accident the no-default rule closes.
         return ExecutionResult(outcome="completed", exit_code=0,
-                               isolation_level=self.isolation_level, artifact_hash="scripted")
+                               isolation_level=self.isolation_level, artifact_hash="scripted",
+                               egress_attempts=EgressAbsence.NOT_OBSERVED)
 
     @contextmanager
     def session(self, artifact: ArtifactSpec, fixtures: Fixtures) -> Iterator[object]:
@@ -119,7 +128,7 @@ class ShortCircuitTests(unittest.TestCase):
     def _run(self, verdicts, calls, **kw):  # type: ignore[no-untyped-def]
         return run_check(
             _counting_factory(calls), _ScriptedCheck(verdicts), _artifact(), _BUDGET, **kw
-        ).verdict
+        , backend_guard=None).verdict
 
     def test_first_fail_short_circuits_second_sandbox_never_created(self) -> None:
         calls: list[int] = []
@@ -181,7 +190,7 @@ class TeardownOnBreakTests(unittest.TestCase):
         v = run_check(
             _recording_factory(events, made), _ScriptedCheck([_FAIL, _PASS]),
             _artifact(), _BUDGET, trials=2, first_fail=True,
-        ).verdict
+        backend_guard=None).verdict
         self.assertIs(v.status, VerdictType.FAIL)
         self.assertEqual(made, [1])  # one sandbox created (short-circuit)
         # THE proof: that one sandbox was prepared AND torn down — no orphan on break.
@@ -193,7 +202,7 @@ class TeardownOnBreakTests(unittest.TestCase):
         run_check(
             _recording_factory(events, made), _ScriptedCheck([_PASS, _PASS]),
             _artifact(), _BUDGET, trials=2, first_fail=True,
-        )
+        backend_guard=None)
         self.assertEqual(made, [1, 1])  # two sandboxes
         # perfectly paired teardowns, in order — no leaked container across the full run.
         self.assertEqual(events, ["prepare", "teardown", "prepare", "teardown"])
@@ -205,7 +214,7 @@ class TrialReportAuditTests(unittest.TestCase):
         run_check(
             _counting_factory([]), _ScriptedCheck([_FAIL, _PASS]), _artifact(), _BUDGET,
             trials=2, first_fail=True, report_sink=sink,
-        )
+        backend_guard=None)
         self.assertEqual(len(sink.reports), 1)
         r = sink.reports[0]
         self.assertEqual(r.trials_run, 1)
@@ -219,7 +228,7 @@ class TrialReportAuditTests(unittest.TestCase):
         run_check(
             _counting_factory([]), _ScriptedCheck([_PASS, _PASS]), _artifact(), _BUDGET,
             trials=2, report_sink=sink,
-        )
+        backend_guard=None)
         r = sink.reports[0]
         self.assertEqual(r.trials_run, 2)
         self.assertFalse(r.short_circuited)
@@ -230,7 +239,7 @@ class TrialReportAuditTests(unittest.TestCase):
             v = run_check(
                 _counting_factory([]), _ScriptedCheck([_FAIL]), _artifact(), _BUDGET,
                 trials=1, report_sink=_ThrowingSink(),
-            ).verdict
+            backend_guard=None).verdict
         self.assertIs(v.status, VerdictType.FAIL)  # verdict returned despite sink failure
 
 

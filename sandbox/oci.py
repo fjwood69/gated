@@ -1388,6 +1388,7 @@ class OCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
             exit_code=exit_code,
             isolation_level=self.isolation_level,
             artifact_hash=handle.artifact_hash,
+            egress_attempts=self.egress_when_unobserved,
             raw_return_code=raw,
             # single source of truth: the SAME digest that was interpolated into the run argv.
             image_digest=handle.image_id,

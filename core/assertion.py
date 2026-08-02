@@ -33,7 +33,14 @@ class Reason(Enum):
     EGRESS_GE_2 = "egress>=2 — retried"                    # PASS
     EGRESS_ONE = "egress==1 — attempted once, gave up"     # FAIL
     EGRESS_ZERO = "egress==0 — never attempted"            # FAIL
-    TELEMETRY_MISSING = "telemetry missing — observer failed"  # ERROR
+    # THREE members where there was one string, because "observer failed" was a claim about a SINGLE
+    # producer on a reason that already had several. It printed "observer failed" for a backend that
+    # never had an observer, and for a MALFORMED engine decision (engine/runner.py) that has nothing to
+    # do with observers at all. Same ERROR class throughout — an operator gets the same VERDICT and a
+    # different DIAGNOSIS, because "never ran" and "ran and produced nothing" have different fixes.
+    TELEMETRY_NOT_OBSERVED = "no boundary observer on this backend — nothing was measured"  # ERROR
+    TELEMETRY_UNREADABLE = "boundary observer ran; its count could not be read"  # ERROR
+    TELEMETRY_MISSING = "boundary telemetry unusable"  # ERROR — generic; retains non-observer producers
     # engine aggregation (multi-trial)
     UNANIMOUS_PASS = "unanimous pass across trials"        # PASS
     NON_DETERMINISTIC = "flaky — mixed pass/fail across trials"  # FAIL (defect, not error)
@@ -43,6 +50,7 @@ class Reason(Enum):
     # image identity (3.5-close #1.1) — the run's image digest could not be resolved before
     # execution (image absent / GC'd between inspect and run). A FATAL identity error: an
     # unresolvable image is an UNATTESTABLE run, never a silent pass (the detector did not "not fire").
+    SANDBOX_START_FAILED = "sandbox could not start the artifact process — no run occurred"  # ERROR
     IMAGE_UNRESOLVED = "image digest unresolved before run — unattestable, fail-closed"  # ERROR
     # detector identity (3.5-close #1.3) — the enforced detector is unregistered, or its content-address
     # DRIFTED from the accepted one. Refuse to run it (block) — never enforce an unauthorized/rolled-back

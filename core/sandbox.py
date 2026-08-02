@@ -33,7 +33,10 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+
+if TYPE_CHECKING:  # a RUNTIME import would cycle: core.assertion imports THIS module for
+    from core.assertion import Verdict  # Command/ExecutionResult/Fixtures. Forward ref only.
 
 
 class TeardownError(Exception):
@@ -146,6 +149,105 @@ class Existence(Enum):
     UNKNOWN = "unknown"
 
 
+class SandboxStartError(Exception):
+    """The sandbox could not START the artifact process. NO RUN OCCURRED.
+
+    THE REFUSAL CHANNEL, and the reason it exists rather than an ``ExecutionResult``. ``egress_attempts``
+    is TOTAL (no default), so every constructed result must state something about the measurement. On a
+    path where the container never started, NO VARIANT IS TRUE: an ``int`` is a measurement,
+    ``NOT_OBSERVED`` is a capability claim the observing backend cannot make, and ``OBSERVER_UNREADABLE``
+    asserts an observer ran and produced something uncertifiable. The measurement question WAS NEVER
+    ASKED, and a total field would force an answer anyway — so the honest move is to construct no result.
+
+    THE RULE THIS PRESERVES: an ``EgressAbsence`` variant describes the EPISTEMIC STATUS OF THE
+    MEASUREMENT, never the CAUSE OF FAILURE. Without it the enum grows a variant per failure mode —
+    RUN_NOT_COMPLETED today, IMAGE_PULL_FAILED next — until it is a error taxonomy wearing a
+    measurement's name.
+
+    Handled at the runner exactly as ``ImageResolutionError`` is: a fail-closed ERROR verdict with no
+    identity coordinate, never a silent pass and never a result that lies about a count.
+
+    NOTE the asymmetry with ``OCISandbox``, which swallows the same OSError into an error result. That is
+    HONEST there: it genuinely has no observer, so its ``NOT_OBSERVED`` is true whether or not the
+    container started. The same code shape is a lie only in the backend that HAS an observer."""
+
+
+class EgressCapabilityContradiction(Exception):
+    """A backend's DECLARED egress capability CONTRADICTS the value it reported. A HARNESS-INTEGRITY
+    fault, never a fact about the artifact.
+
+    NAMED FOR WHAT IS DETECTED, NOT FOR WHAT IS INFERRED. The check observes a contradiction between
+    ``observes_egress`` and ``egress_attempts``; it INFERS that something bypassed the intended
+    construction path. Naming it for the bypass would be wrong twice over: the bypass is what
+    ``gate.backends.trusted_backend_guard`` detects (and it raises ``UntrustedBackendError``), and this
+    contradiction CAN ARISE WITH NO BYPASS AT ALL — a regressed audited backend, a test double, or a
+    Protocol-only backend on an unguarded path. This tree has spent a week on artifacts credited with a
+    property ADJACENT to the one they have; the name is the cheapest place to stop doing it.
+
+    ⚠ DELIBERATELY NOT A SUBCLASS OF ``SandboxStartError``. That type means NO RUN OCCURRED, and in this
+    path a run DID occur — the check runs on a constructed result, after the session block exits. More
+    practically: ``engine.runner.run_check`` catches ``SandboxStartError`` BY NAME and maps it to a
+    per-trial ERROR verdict. Subclassing would invite any future refactor — moving the check inside the
+    try, or a caller wrapping ``run_check`` — to SILENTLY RECLASSIFY A HARNESS-INTEGRITY EVENT AS AN
+    ARTIFACT-TRIAL OUTCOME, charging the artifact for a defect of the harness.
+
+    Core-side beside ``ImageResolutionError`` for that class's own stated reason: the engine catches it
+    without importing a backend (engine ⊥ sandbox impl).
+
+    IT DOES NOT LOOP, and that was traced rather than assumed: a DETERMINISTIC fault classified as
+    transient INFRASTRUCTURE would spin forever if anything retried it. On the live gate path this becomes
+    a TERMINAL blocking result ("this blocks the merge and a maintainer must investigate"), and the only
+    retry in the executor re-attempts PUBLICATION to GitHub, never the check. On the recalibration path a
+    dead worker's lease expires and the job is re-queued, but BOUNDED by ``max_attempts`` and then
+    DEAD-LETTERED. It blocks once and surfaces; it never spins.
+
+    IT CARRIES THE EVIDENCE, because propagation alone discards it. When this escapes ``run_check`` the
+    loop's already-completed trials evaporate — no ``TrialReport`` is constructed on that path, which
+    breaks the runner's own "the report is ALWAYS constructed" invariant. That is acceptable for a
+    harness fault (a verdict is a statement about the artifact, and this is not one) ONLY IF THE
+    EXCEPTION IS THE EVIDENCE VESSEL. So it carries the backend class, the declaration, the reported
+    value, and the verdicts of the trials that did complete."""
+
+    def __init__(self, *, backend: str, declared: bool, reported: object,
+                 completed_trials: "tuple[Verdict, ...]" = ()) -> None:
+        self.backend = backend
+        self.declared = declared
+        self.reported = reported
+        self.completed_trials = completed_trials
+        # THE VERDICTS GO IN THE MESSAGE, not only on the attribute. Verified against the live gate path:
+        # this propagates to gate/executor.py, which converts any worker exception into
+        # InfrastructureFailure(WORKER_FAULT, detail=repr(exc)) — fail-closed and blocking, which is the
+        # right destination, but it STRINGIFIES the exception. Evidence held only on an attribute would be
+        # discarded there, and "the exception is the evidence vessel" would be a claim the vessel does not
+        # honour once it reaches its actual handler.
+        trials = ", ".join(f"{v.status.name}/{v.reason.name}" for v in completed_trials) or "none"
+        super().__init__(
+            f"{backend} declares observes_egress={declared!r} but reported {reported!r} — a harness "
+            f"integrity fault, not a fact about the artifact. Trials completed before the fault: {trials}")
+
+
+class EgressCapabilityUndeclared(Exception):
+    """A backend did not DECLARE ``observes_egress`` at all. NON-CONFORMANCE, not contradiction.
+
+    A SEPARATE TYPE, and the separation is the point. Reading the capability with a default —
+    ``getattr(sandbox, "observes_egress", False)`` — COALESCES UNDECLARED INTO DECLARED-FALSE, which
+    MANUFACTURES A SPELLED ABSENCE AT THE CONSUMPTION SITE. Absence of output is not output of absence,
+    and an undeclared backend holding a live observer would then pass a consistency check by inheriting
+    a claim it never made.
+
+    Distinct from ``EgressCapabilityContradiction`` because they are different faults with different
+    fixes: a contradiction means the backend answered wrongly, non-conformance means it never answered.
+    Sharing a type would be the same collapse this increment exists to undo, one level along.
+
+    ⚠ NOT A VALUE. There is deliberately no ``UNDECLARED`` member of ``EgressAbsence``: an error is not
+    a member of the domain it fails to inhabit.
+
+    SCOPE, stated honestly: ``BaseSandbox`` supplies ``observes_egress = False``, so every inheritor
+    always carries the attribute. This can only fire for a backend that satisfies the ``Sandbox``
+    Protocol WITHOUT inheriting — which is exactly the population the inheritance-based guards cannot
+    reach, and the reason the read is hard rather than defaulted."""
+
+
 class ImageResolutionError(Exception):
     """A backend could not resolve its mutable image tag to an immutable local digest before run
     (image absent, or GC'd/pruned between resolve and run). 3.5-close #1.1: a FATAL identity error
@@ -245,6 +347,48 @@ class SandboxHandle(Protocol):
     def artifact_hash(self) -> str: ...
 
 
+class EgressAbsence(Enum):
+    """WHY THERE IS NO COUNT — a closed set, because ``None`` was carrying two meanings.
+
+    ``egress_attempts: int | None`` conflated a CAPABILITY absence with an INSTRUMENT failure. Three of
+    four backends have no boundary observer at all and left the field defaulted, so ``completed`` +
+    ``None`` was their normal terminal state; ``ObservedOCISandbox`` produced the SAME spelling when its
+    observer ran and the count could not be read. The field docstring documented only the first, which
+    made it false about the second the day the second became possible.
+
+    The original instruction was to REFUSE ``completed`` + ``None``. That was withdrawn as incoherent —
+    it would have made the legitimate terminal state of three backends unrepresentable, i.e. the type
+    lying in the other direction. The PURPOSE it served stands and is what this enum delivers: no
+    consumer can inherit a false PASS by coalescing an absence into zero.
+
+    THE MECHANISM, and it is the whole point. ``result.egress_attempts or 0`` yields literal ``0`` for
+    ``None`` — a silent clean zero on a permanent record. It yields a TRUTHY ENUM MEMBER here, which
+    either propagates into a comparison that raises or sits visibly in the record as a non-count.
+    Inheriting a false PASS now requires someone to WRITE ``case OBSERVER_UNREADABLE: return 0`` — an
+    explicit, reviewable act rather than an idiom.
+
+    BARE VARIANTS, deliberately: no cause payload. Free text would invite consumers to pattern-match on
+    diagnostics, which is exactly the untyped-stats-bag channel ``ExecutionResult`` exists to exclude.
+    Two runs refused for different read-failure causes are the SAME VERDICT FACT; causes belong in logs.
+    """
+
+    NOT_OBSERVED = "not_observed"
+    """No boundary observer exists. A STATIC CAPABILITY FACT ABOUT THE BACKEND CLASS — never a runtime
+    outcome. It is derived from ``Sandbox.observes_egress`` rather than passed at construction, because a
+    value passed in is a value a future backend can pass WRONGLY; deriving it is the difference between
+    the type ASKING the question and the type ACCEPTING an answer.
+
+    ⚠ An observing backend must NEVER report this. If its proxy fails to start or readiness is never
+    established, that is a WHOLE-RUN REFUSAL, not a completed run with no observation — otherwise a third
+    absence squats on the most innocent spelling, and an artifact that managed to kill its own observer
+    early would inherit the variant that reads as "nothing to see here"."""
+
+    OBSERVER_UNREADABLE = "observer_unreadable"
+    """An observer ran and its product cannot be certified. The count is UNKNOWN, and unknown is not
+    zero. Produced when the countfile cannot be read or parsed, and (once the drain probe lands) when the
+    accept backlog cannot be shown to have drained — two producers, one verdict fact."""
+
+
 @dataclass(frozen=True)
 class ExecutionResult:
     """What a run produced — execution *facts*, never a verdict.
@@ -277,13 +421,26 @@ class ExecutionResult:
     exit_code: int | None
     isolation_level: IsolationLevel
     artifact_hash: str
-    raw_return_code: int | None = None
-    egress_attempts: int | None = None
+    egress_attempts: int | EgressAbsence
     """Boundary-observed count of outbound connection attempts (Increment 1.4),
     read from the sidecar proxy's own storage AFTER the run, from OUTSIDE the
     sandbox — never a value the artifact could write. A typed, named field, not an
     untyped stats bag (that would be a channel for artifact-influenced data to
-    reach the verdict). None when no boundary observer ran."""
+    reach the verdict).
+
+    ⚠ NO DEFAULT, deliberately. This field previously defaulted to ``None``, so a backend could OMIT it
+    and thereby state an absence by accident — spelled absence at the construction site. With no default
+    every backend must answer, and the type asks the question at the exact point where the answer is
+    known. A fifth backend cannot forget.
+
+    An ``int`` is a MEASUREMENT. An ``EgressAbsence`` says WHY there is no measurement, and the two
+    reasons are not interchangeable: ``NOT_OBSERVED`` is a capability fact about the backend,
+    ``OBSERVER_UNREADABLE`` is an instrument failure on a run that otherwise completed. Absence of
+    output is not output of absence."""
+    raw_return_code: int | None = None
+    """Moved BELOW ``egress_attempts`` only because that field lost its default: a dataclass cannot place
+    a non-default field after a defaulted one. Every construction site passes keywords, so no call
+    changes. Recording the reason so it does not read as gratuitous churn."""
     image_digest: str | None = None
     """The IMMUTABLE image identity the trial ACTUALLY ran on (3.5-close #1.1). An OCI
     backend resolves the local image to its content digest (``<runtime> inspect .Id`` ->
@@ -294,6 +451,61 @@ class ExecutionResult:
     ceiling; see ARCHITECTURE.md). Measured host-side by the trusted sandbox object, never
     self-reported by the artifact. None for backends with no image (NoOp/Subprocess)."""
 
+    @classmethod
+    def from_run(
+        cls,
+        sandbox: "Sandbox",
+        *,
+        outcome: Literal["completed", "timeout", "error"],
+        exit_code: int | None,
+        artifact_hash: str,
+        measured: "int | EgressAbsence | None" = None,
+        raw_return_code: int | None = None,
+        image_digest: str | None = None,
+    ) -> "ExecutionResult":
+        """Construct a result with everything derivable DERIVED from the backend object.
+
+        A CONVENIENCE, AND THE SCOPE MATTERS. This does NOT stop a capability lie from being written:
+        ``ExecutionResult`` is a public frozen dataclass and Python offers no way to close the raw
+        constructor. (The overclaim lint flagged the stronger word here, which is the correct outcome —
+        it is exactly the claim the design review refused, and the sentence was a denial of it rather
+        than an assertion. The lint does not parse negation, and the safer habit is to not reach for the
+        word at all when describing a control that does not deliver it.) The consistency control remains ``engine.runner._require_consistent_egress_capability``,
+        which is the only site holding both the result and the backend object. What this buys is narrower
+        and still worth having:
+
+          * for a NON-OBSERVING backend the egress argument DOES NOT EXIST — the absence is derived, so
+            there is no parameter through which to state it wrongly;
+          * for an OBSERVING backend the parameter is constrained to a MEASUREMENT or
+            ``OBSERVER_UNREADABLE``. ``NOT_OBSERVED`` is not an accepted answer, because a backend that
+            HAS an observer cannot claim it has none.
+
+        ⚠ IT DOES NOTHING FOR DECLARATION TRUTH. It derives FROM ``observes_egress``, so it trusts the
+        declaration by construction. A backend declaring ``False`` while holding a live observer produces
+        a perfectly consistent result here. That residual is answered by the admission brief in
+        ``gate/backends.py``, not by any constructor shape.
+
+        And it does not verify the COUNT. A measurement's integrity rests on where it comes from — the
+        sidecar's own storage, read from outside the sandbox after the run — never on the shape of the
+        call that packages it. Asking a constructor to validate a count would be crediting an API with a
+        property it cannot have.
+        """
+        observes = sandbox.observes_egress
+        if not observes:
+            if measured is not None:
+                raise EgressCapabilityContradiction(
+                    backend=type(sandbox).__name__, declared=observes, reported=measured)
+            egress: int | EgressAbsence = EgressAbsence.NOT_OBSERVED
+        else:
+            if measured is None or measured is EgressAbsence.NOT_OBSERVED:
+                raise EgressCapabilityContradiction(
+                    backend=type(sandbox).__name__, declared=observes, reported=measured)
+            egress = measured
+        return cls(
+            outcome=outcome, exit_code=exit_code, isolation_level=sandbox.isolation_level,
+            artifact_hash=artifact_hash, egress_attempts=egress,
+            raw_return_code=raw_return_code, image_digest=image_digest,
+        )
 
 @runtime_checkable
 class Sandbox(Protocol):
@@ -316,6 +528,21 @@ class Sandbox(Protocol):
     """
 
     isolation_level: IsolationLevel
+
+    observes_egress: bool
+    """Whether this backend class HAS a boundary observer at all. A STATIC CAPABILITY OF THE CLASS, not
+    a property of any run.
+
+    It exists so ``EgressAbsence.NOT_OBSERVED`` can be DERIVED rather than passed. Passing the variant at
+    construction leaves the type accepting an answer, and an answer can be wrong — a fifth backend could
+    hand back ``NOT_OBSERVED`` while holding a live observer, or an ``int`` while holding none, and
+    nothing would object. Deriving it from the class means the question is asked where the answer is a
+    fact about the code rather than a decision at a call site.
+
+    Bound in BOTH directions by ``tests/test_egress_absence_contract.py``: a backend declaring ``False``
+    must never emit an ``int``, and a backend declaring ``True`` must never emit ``NOT_OBSERVED`` (its
+    observer failing is ``OBSERVER_UNREADABLE`` if the run completed, or a whole-run refusal if the
+    observer never came up)."""
 
     def prepare(self, artifact: ArtifactSpec, fixtures: Fixtures) -> SandboxHandle:
         """Stage the artifact tree + fixtures into a fresh isolated environment,
