@@ -111,7 +111,7 @@ class FrozenTests(unittest.TestCase):
 class AuthoritativeReturnTests(unittest.TestCase):
     def test_report_always_constructed_without_a_sink(self) -> None:
         # the report is the AUTHORITATIVE return — present even when NO audit sink is wired.
-        res = run_check(lambda: _HermeticNoOp(), _Scripted([_PASS] * 3), _artifact(), _BUDGET, trials=3)
+        res = run_check(lambda: _HermeticNoOp(), _Scripted([_PASS] * 3), _artifact(), _BUDGET, trials=3, backend_guard=None)
         self.assertIsInstance(res, EngineRunResult)
         self.assertIsInstance(res.trial_report, TrialReport)
         self.assertIs(res.verdict.status, VerdictType.PASS)
@@ -121,7 +121,7 @@ class AuthoritativeReturnTests(unittest.TestCase):
         # a throwing AUDIT sink is logged, never swallows: the authoritative return + full report survive.
         with self.assertLogs("gated.engine", level="WARNING"):
             res = run_check(lambda: _HermeticNoOp(), _Scripted([_PASS]), _artifact(), _BUDGET,
-                            trials=1, report_sink=_ThrowingSink())
+                            trials=1, report_sink=_ThrowingSink(), backend_guard=None)
         self.assertIs(res.verdict.status, VerdictType.PASS)
         self.assertEqual(res.trial_report.trials_run, 1)  # full evidence returned despite sink failure
 
@@ -161,7 +161,7 @@ class AuthoritativeReturnTests(unittest.TestCase):
 
         cap = _Cap()
         res = run_check(lambda: _HermeticNoOp(), _Scripted([_PASS]), _artifact(), _BUDGET, trials=1,
-                        report_sink=cap)
+                        report_sink=cap, backend_guard=None)
         self.assertIs(res.trial_report, cap.last)  # identical instance -> byte-identical report content
 
 

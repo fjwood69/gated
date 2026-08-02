@@ -88,6 +88,40 @@ _TICKET_ATTR = "_gated_trusted_backend_ticket"
 # runtime (sealed net + external proxy + escape probe, fail-closed); OCISandbox APPLIES --network=none by
 # argv construction, with no runtime check and no attestation of that posture. Adding a backend here is a
 # reviewed, security-relevant change — and reviewing it means asking which of those two bars it clears.
+#
+# ── ADMISSION BRIEF: ``observes_egress``, BOTH DIRECTIONS ────────────────────────────────────────────
+#
+# WHY THIS LIVES HERE AND NOT IN A NEW MECHANISM. ``Sandbox.observes_egress`` has exactly the declare-vs-
+# prove gap this module's header already describes for ``IsolationLevel.HERMETIC``: the generic API lets a
+# backend DECLARE a capability it may not have. That problem class is already answered here — closed set,
+# minted ticket, identity check on the returned object — so answering it a second time elsewhere would be
+# a parallel mechanism for a solved problem. A registration-TIME check could only ever verify that a
+# declaration is PRESENT and well-formed; it cannot verify that it is TRUE. Truth is what admission review
+# is for, and that is what this brief specifies.
+#
+# ADMITTING A BACKEND REQUIRES A FINDING ON BOTH DIRECTIONS OF ITS DECLARATION:
+#
+#   observes_egress = True   → VERIFIED grade. The positive control must PASS AT ADMISSION: run a fixture
+#                              whose egress is KNOWN and confirm the backend reports exactly that count.
+#                              This mirrors the escape probe's standard — a claim of PRESENCE is provable
+#                              by exhibiting the thing present, so exhibit it.
+#   observes_egress = False  → AUDIT grade, and that is the CORRECT ceiling rather than a shortfall. The
+#                              claim is that the class has NO observer, and a runtime probe cannot prove
+#                              a class LACKS a channel — "absence of output is not output of absence"
+#                              applied to capability itself. Code audit is the right instrument for an
+#                              absence claim; record the finding, do not pretend a probe delivered it.
+#
+# WHAT THIS DOES NOT ESTABLISH, STATED SO IT IS NOT INFERRED: guard-passing proves the object was built by
+# the approved constructor and bears the stamp — i.e. its class is one of the audited classes. It no more
+# verifies ``observes_egress`` than it verifies that ``--network=none`` took effect. The declaration's
+# truth rests on THIS BRIEF being applied at review, at the grades above.
+#
+# AND IT IS NOT THE ONLY CONTROL, NOR THE SENIOR ONE. ``engine.runner._require_consistent_egress_capability``
+# brackets RESULT-vs-DECLARATION consistency on EVERY run of ANY backend, including Protocol-only ones that
+# never reach this registry. These are DIFFERENT CONTROL TYPES, not a primary and its backup: this brief
+# establishes declaration-truth for a closed set; that check establishes consistency for every run.
+# Describing either as the other's defence-in-depth would credit a control with a property adjacent to the
+# one it has — the defect this codebase has spent a week cataloguing.
 _APPROVED: dict[str, Callable[[str, str | None], Sandbox]] = {
     "oci": lambda image, runtime: OCISandbox(image=image, runtime=runtime),
     "observed": lambda image, runtime: ObservedOCISandbox(image=image, runtime=runtime),

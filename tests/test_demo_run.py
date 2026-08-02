@@ -263,10 +263,20 @@ class NothingIsSealedThatWasNotMeasured(unittest.TestCase):
                                for v in n.values)]
         self.assertEqual(or_defaults, [],
                          "`egress_attempts or 0` seals an outage as a measurement of zero")
-        guards = [n for n in ast.walk(fn) if isinstance(n, ast.Compare)
-                  and isinstance(n.left, ast.Attribute) and n.left.attr == "egress_attempts"
-                  and any(isinstance(o, ast.Is) for o in n.ops)]
-        self.assertTrue(guards, "an unreadable counter must raise before anything is sealed")
+        # ⚠ RE-POINTED when egress_attempts became ``int | EgressAbsence``. This previously required a
+        # ``Compare``/``Is`` node — i.e. it pinned ``is None``. Once the type moved, that guard could
+        # never fire, and a test asserting the presence of a DEAD check is worse than no test: it reports
+        # a control that cannot engage. The live shape is an isinstance against the absence type.
+        guards = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                  and isinstance(n.func, ast.Name) and n.func.id == "isinstance"
+                  and len(n.args) == 2
+                  and isinstance(n.args[0], ast.Attribute) and n.args[0].attr == "egress_attempts"
+                  and isinstance(n.args[1], ast.Name) and n.args[1].id == "EgressAbsence"]
+        self.assertTrue(
+            guards,
+            "measure_row must refuse an EgressAbsence before anything is sealed — an absence is not a "
+            "measurement of zero, and BOTH variants must land here: a backend with no observer is as "
+            "unusable for this table as an observer whose count could not be read")
 
     def test_events_are_NEVER_synthesised_from_the_count(self) -> None:
         src = open(run.__file__).read()

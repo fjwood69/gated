@@ -170,6 +170,7 @@ class SubprocessSandbox(BaseSandbox):
             exit_code=exit_code,
             isolation_level=self.isolation_level,
             artifact_hash=handle.artifact_hash,
+            egress_attempts=self.egress_when_unobserved,
             raw_return_code=raw,
         )
 

@@ -47,6 +47,7 @@ class NoOpSandbox(BaseSandbox):
             exit_code=0,
             isolation_level=self.isolation_level,
             artifact_hash=handle.artifact_hash,
+            egress_attempts=self.egress_when_unobserved,
             raw_return_code=0,
         )
 

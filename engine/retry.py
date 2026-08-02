@@ -10,6 +10,7 @@ a later increment). Here the entrypoint exercises one designated call.
 from __future__ import annotations
 
 from core import (
+    EgressAbsence,
     BoundaryFault,
     BoundaryFaultMode,
     Command,
@@ -19,6 +20,14 @@ from core import (
     Verdict,
     VerdictType,
 )
+
+
+# The absence -> diagnosis map. Exhaustive over EgressAbsence by construction: the contract test
+# asserts every member has an entry, so a future variant cannot silently fall back to a generic reason.
+_ABSENCE_REASON = {
+    EgressAbsence.NOT_OBSERVED: Reason.TELEMETRY_NOT_OBSERVED,
+    EgressAbsence.OBSERVER_UNREADABLE: Reason.TELEMETRY_UNREADABLE,
+}
 
 
 class RetryCheck:
@@ -34,8 +43,17 @@ class RetryCheck:
     def assert_invariant(self, result: ExecutionResult) -> Verdict:
         # Out-of-band boundary telemetry ONLY — never in-process state.
         n = result.egress_attempts
-        if n is None:
-            return Verdict(VerdictType.ERROR, Reason.TELEMETRY_MISSING)  # observer failed
+        if isinstance(n, EgressAbsence):
+            # ONE VERDICT CLASS, TWO DIAGNOSES. Both absences are ERROR — there is no measurement, and no
+            # measurement is not a measurement of zero. But the VARIANT SURVIVES TO THE REASON rather than
+            # being collapsed here: an operator refused with this verdict needs to know whether the
+            # observer never existed or ran and produced nothing, because those have different fixes.
+            # Collapsing them would have replaced one spelling of absence with two that print identically.
+            #
+            # The previous branch tested ``n is None`` and commented "observer failed" — true only because
+            # this detector happens to run on the observing backend. Safe by THIS detector's
+            # implementation, never by construction, which is exactly what a second detector inherits.
+            return Verdict(VerdictType.ERROR, _ABSENCE_REASON[n])
         if n >= 2:
             return Verdict(VerdictType.PASS, Reason.EGRESS_GE_2)          # retried
         if n == 1:
