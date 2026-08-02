@@ -57,6 +57,7 @@ import shutil
 
 from sandbox.base import BaseSandbox
 from sandbox.oci import (
+    NO_HEALTHCHECK_FLAGS,
     RESOURCE_PREFIX,
     artifact_run_argv,
     OCIRuntimeUnavailable,
@@ -219,7 +220,8 @@ def proxy_run_argv(runtime: str, *, network: str, name: str, image_id: str, mode
     """The counting fail-responder sidecar. It sits ON the sealed network but needs no ``--add-host``:
     it is the thing being resolved, not a resolver."""
     return [
-        runtime, "run", "-d", *attached_network_segment(network), "--name", name,
+        runtime, "run", "-d", *NO_HEALTHCHECK_FLAGS,
+        *attached_network_segment(network), "--name", name,
         "--mount", proxy_mount_spec(),
         image_id, "python3", "/proxy.py", str(PROXY_PORT), _COUNTFILE, mode,
     ]
@@ -231,15 +233,28 @@ def escape_probe_argv(runtime: str, *, network: str, proxy_ip: str, image_id: st
     Uses ``sealed_network_segment`` so the posture it certifies is the posture the artifact receives.
     """
     return [
-        runtime, "run", "-i", "--rm", *sealed_network_segment(network, proxy_ip),
+        runtime, "run", "-i", "--rm", *NO_HEALTHCHECK_FLAGS,
+        *sealed_network_segment(network, proxy_ip),
         image_id, "python3", "-",
     ]
 
 
+# ``no_healthcheck_flags`` IS A VALUE MEMBER, and it lands in the SAME COMMIT as the flag reaching the
+# three builders. The ordering is deliberate: a Clause-M control that is live for even one commit while
+# unattested is a fossil in the making, and this tree already carries the archaeology — the vestigial
+# ``baseline`` field records a behaviour change that moved no identity because the local half is
+# unattested and nobody was structurally obliged to notice.
+#
+# WHY A VALUE AND NOT BUILDER SOURCE. Builder-source hashing would cover these three CONSTRUCT sites, and
+# it is the mechanism the NARROW ruling kept — but the ruling kept its DESIGN, not a live implementation.
+# Nothing in this module hashes any builder's source today, and ``sandbox/oci.py`` says so itself. Adding
+# the flag on the strength of a mechanism that is not built would be exactly the overclaim this
+# increment's own brief had to strike.
 _OBSERVER_CONFIG_HASH = content_digest({
     "proxy_src_sha256": hashlib.sha256(_PROXY_SRC.read_bytes()).hexdigest(),
     "escape_probe_sha256": hashlib.sha256(_ESCAPE_SCRIPT.encode("utf-8")).hexdigest(),
     "sealed_network_flags": list(_SEALED_NETWORK_FLAGS),
+    "no_healthcheck_flags": list(NO_HEALTHCHECK_FLAGS),
     "proxy_port": PROXY_PORT,
     "proxy_host": PROXY_HOST,
 })

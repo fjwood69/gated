@@ -50,7 +50,7 @@ _PROD_PKGS = ("core", "sandbox", "engine", "observe", "gate", "cli")
 #
 # RE-PINNED — P3 step 0, 2026-08-02: write_count publishes by atomic rename; see the execution-identity
 # golden for the measurement.
-_GOLDEN_OBSERVER_CONFIG_HASH = "6605652a4c75592c1678aca75e547a6276e4c8cce10c57ff6651cca58ad7e8b0"
+_GOLDEN_OBSERVER_CONFIG_HASH = "c9d22c3fa5389986d941333d1b717f4a0a5b45271c3e801f1dfc8113159cf4eb"
 
 
 def _iter_prod_py() -> "list[Path]":

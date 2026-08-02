@@ -37,11 +37,11 @@ _GOLDEN_BACKEND_NAMES = {
 # value landed, so the executor's out-of-process ``cat`` could read it EMPTY and parse it to None —
 # measured at 2687 of 4000 reads under a hammering writer, 0 of 4000 after. This is a deliberate,
 # behaviour-changing proxy edit, so the re-pin is the identity working as designed rather than noise.
-_GOLDEN_OBSERVER_CONFIG_HASH = "6605652a4c75592c1678aca75e547a6276e4c8cce10c57ff6651cca58ad7e8b0"
+_GOLDEN_OBSERVER_CONFIG_HASH = "c9d22c3fa5389986d941333d1b717f4a0a5b45271c3e801f1dfc8113159cf4eb"
 # A representative FULL Observed identity (image_ref a fixed sentinel) and its digest — the tuple AND the
 # digest are pinned so neither a coordinate change nor a digest-formula change slips through.
 _GOLDEN_OBSERVED_IMAGE_REF = "sha256:GOLDEN"
-_GOLDEN_OBSERVED_DIGEST = "91b9f6fbb788e7bd4ce4224997fcd235ecf8847eb41ffb1ee3113b0e7d9503ed"
+_GOLDEN_OBSERVED_DIGEST = "c973452ce14831305dcf64842462392c71e1614580685a5089e2161ef40cfe74"
 
 
 class ExecutionIdentityGoldenTests(unittest.TestCase):
