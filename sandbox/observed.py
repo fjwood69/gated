@@ -102,7 +102,34 @@ _PROXY_SRC = Path(__file__).resolve().parent.parent / "observe" / "proxy.py"
 # ``NO_HEALTHCHECK_FLAGS``): the budget and the sentence describing it are ONE value here, so they cannot
 # drift apart. The refusal additionally reports MEASURED elapsed, because a message that states what it
 # observed cannot misdescribe its own budget the way a hardcoded figure can.
-_READINESS_DEADLINE_SECONDS = 5.0
+#
+# ⚠⚠ READ THIS BEFORE CHANGING THE NUMBER. THREE FACTS ABOUT ITS PROVENANCE, HERE RATHER THAN IN A REVIEW,
+# BECAUSE A NUMBER WHOSE PROVENANCE IS NOT VISIBLE AT THE POINT OF EDIT IS HOW THE LAST TWO DEFECTS HAPPENED.
+#
+#   1. THIS BUDGET USED TO ADAPT TO THE HOST AND NO LONGER DOES. As an iteration count, a slow host made
+#      each poll slower AND still granted all fifty of them, so the effective budget grew with host
+#      slowness — nobody designed that, but it was real and it was protective. A wall clock removes it.
+#      MEASURED on the reference host (podman 4.9.3, 20 samples): exec round-trip median 89ms, so the old
+#      shape afforded ~9.4s. On a 2s-per-exec loaded runner the old shape still gave 50 polls (~105s);
+#      30s gives about 14. THE MARGIN IS NOW FIXED AND MUST COVER THE SLOWEST HOST GATED IS REQUIRED TO
+#      RUN ON. Cutting it after measuring RTT on a fast machine would be cutting into a budget that no
+#      longer stretches — which is exactly the mistake this comment exists to prevent.
+#
+#   2. 30s IS A DEFENSIBLE MARGIN, NOT A CALIBRATION. It is ~3x the old effective budget on the reference
+#      host, and it bounds the wedged-runtime case at roughly one subprocess timeout past the deadline
+#      (~60s) instead of the ~1500s an iteration count allowed. Chosen for headroom, not derived.
+#
+#   3. READINESS LATENCY ITSELF HAS NEVER BEEN MEASURED. Only the exec round-trip has. Nobody has timed how
+#      long the proxy actually takes to bind, listen and publish the countfile, on any host. THAT
+#      MEASUREMENT IS AVAILABLE TO BE TAKEN and would replace this margin with a real calibration; until
+#      someone takes it, no one should read 30.0 as though it encodes one.
+#
+# NAMED FOR WHAT IT BOUNDS. It bounds ATTEMPT SCHEDULING — the deadline is consulted only BETWEEN polls, so
+# a single wedged ``exec`` can overrun it by its own subprocess timeout. The composite bound is
+# ``deadline + one subprocess timeout``, never the deadline alone. The earlier name said DEADLINE and read
+# as "readiness waits at most this long", which is the adjacent-property defect in miniature: the value was
+# credited with bounding the WAIT when it bounds the ATTEMPTS.
+_READINESS_POLL_DEADLINE_SECONDS = 30.0
 _READINESS_POLL_INTERVAL_SECONDS = 0.1
 
 # Escape probe: each residual channel MUST fail; the proxy MUST be reachable.
@@ -648,13 +675,13 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         while True:
             if self._read_count(name) is not None:
                 return ip
-            if time.monotonic() - started >= _READINESS_DEADLINE_SECONDS:
+            if time.monotonic() - started >= _READINESS_POLL_DEADLINE_SECONDS:
                 break
             time.sleep(_READINESS_POLL_INTERVAL_SECONDS)
         raise NetworkIsolationError(
             f"proxy {name} never published its readiness countfile — refusing to run an artifact "
             f"against a proxy that is not proven to be serving. Waited "
-            f"{time.monotonic() - started:.1f}s against a {_READINESS_DEADLINE_SECONDS:g}s deadline "
+            f"{time.monotonic() - started:.1f}s against a {_READINESS_POLL_DEADLINE_SECONDS:g}s deadline "
             f"(elapsed is MEASURED, not the budget restated: a single wedged runtime call can overrun "
             f"the deadline by its own subprocess timeout)")
 

@@ -185,6 +185,49 @@ class TheReadinessBudgetIsWallClockNotAnIterationCount(unittest.TestCase):
 
     These tests run on a FAKE CLOCK, so they assert the budget rather than the wall time of the suite."""
 
+    def _ready_at(self, clock: _FakeClock, calls: list[int], ready_after: float,
+                  step: float = 1.0) -> Callable[..., subprocess.CompletedProcess[str]]:
+        """A HEALTHY proxy that becomes ready ``ready_after`` seconds in, polled at ``step`` per read.
+        Used for the deadline's EDGE — the one arithmetic this fix introduces."""
+        t0 = clock.t
+
+        def run(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+            if "exec" in argv:
+                calls.append(1)
+                clock.t += step
+                if clock.t - t0 >= ready_after:
+                    return _completed(0, "0")        # countfile published
+                return _completed(1, "")             # not yet: cat finds no file
+            if "inspect" in argv:
+                return _completed(0, "10.0.0.2\n")
+            return _completed(0, "")
+        return run
+
+    def test_a_proxy_ready_JUST_INSIDE_the_deadline_is_accepted(self) -> None:
+        """EDGE, lower side. Ready at 29s against a 30s deadline must SUCCEED. Without this, an
+        off-by-one that refused at the boundary would pass every other assertion in this class."""
+        clock = _FakeClock()
+        calls: list[int] = []
+        with mock.patch("sandbox.observed.subprocess.run",
+                        side_effect=self._ready_at(clock, calls, ready_after=29.0)), \
+             mock.patch("sandbox.observed.time.monotonic", clock), \
+             mock.patch("sandbox.observed.time.sleep"):
+            self.assertEqual(
+                _sandbox()._start_proxy("net", "proxy", "fail_always", "sha256:x"), "10.0.0.2")
+
+    def test_a_proxy_ready_JUST_OUTSIDE_the_deadline_is_refused(self) -> None:
+        """EDGE, upper side. Ready at 31s against a 30s deadline must REFUSE — and refusing here is
+        correct, not harsh: proceeding would release the artifact against a proxy with no readiness
+        evidence, whose first egress attempts are refused and therefore never counted."""
+        clock = _FakeClock()
+        calls: list[int] = []
+        with mock.patch("sandbox.observed.subprocess.run",
+                        side_effect=self._ready_at(clock, calls, ready_after=31.0)), \
+             mock.patch("sandbox.observed.time.monotonic", clock), \
+             mock.patch("sandbox.observed.time.sleep"):
+            with self.assertRaises(NetworkIsolationError):
+                _sandbox()._start_proxy("net", "proxy", "fail_always", "sha256:x")
+
     def _wedged(self, clock: _FakeClock, calls: list[int], exec_cost: float = 30.0
                 ) -> Callable[..., subprocess.CompletedProcess[str]]:
         def run(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
@@ -219,14 +262,17 @@ class TheReadinessBudgetIsWallClockNotAnIterationCount(unittest.TestCase):
         the way a hardcoded figure can."""
         clock = _FakeClock()
         calls: list[int] = []
-        with mock.patch("sandbox.observed.subprocess.run", side_effect=self._wedged(clock, calls)), \
+        # exec_cost deliberately DIFFERENT from the deadline, so "what was waited" and "what was
+        # budgeted" are two distinguishable numbers in the message rather than one repeated.
+        with mock.patch("sandbox.observed.subprocess.run",
+                        side_effect=self._wedged(clock, calls, exec_cost=31.0)), \
              mock.patch("sandbox.observed.time.monotonic", clock), \
              mock.patch("sandbox.observed.time.sleep"):
             with self.assertRaises(NetworkIsolationError) as ctx:
                 _sandbox()._start_proxy("net", "proxy", "fail_always", "sha256:x")
         msg = str(ctx.exception)
-        self.assertIn("30.0s", msg, f"the refusal does not report the MEASURED 30s wait: {msg}")
-        self.assertIn("5s deadline", msg, f"the refusal does not name its deadline: {msg}")
+        self.assertIn("31.0s", msg, f"the refusal does not report the MEASURED wait: {msg}")
+        self.assertIn("30s deadline", msg, f"the refusal does not name its deadline: {msg}")
 
     def test_a_SLOW_BUT_HEALTHY_proxy_still_gets_its_full_deadline(self) -> None:
         """POSITIVE CONTROL, and the one that stops the fix over-correcting. A deadline that refused on
