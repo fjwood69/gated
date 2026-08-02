@@ -6,8 +6,25 @@ the detector. TWO SEPARATE responsibilities (board 2026-07-13):
      one of the three known values. A malformed result is UNTRUSTED regardless of any policy.
   2. The observation TRUST POLICY — the CONFIGURABLE decision over a schema-valid result: which outcomes are
      trusted. The reference policy trusts only ``completed``. A NON-ZERO ``completed`` exit code is a TRUSTED
-     observation (the detector decides what it means); ``egress_attempts=None`` stays detector-semantic
-     telemetry (``RetryCheck`` still receives it and may return ``TELEMETRY_MISSING``).
+     observation (the detector decides what it means); an ABSENT ``egress_attempts`` stays detector-semantic
+     telemetry — a ``completed`` run carrying an ``EgressAbsence`` is passed THROUGH to the detector as
+     trusted, and ``RetryCheck`` is what refuses it.
+
+⚠ THE EXPOSURE THAT LINE DESCRIBES, STATED AS SCOPE RATHER THAN AS SAFETY. This layer does NOT refuse an
+absence; it forwards one. The reason nothing is currently laundered is that the ONLY detector that exists
+maps both ``EgressAbsence`` members to ``Verdict(ERROR)`` (``engine/retry.py``'s ``_ABSENCE_REASON``). So the
+verified claim is "no coercion BY THE ONLY DETECTOR THAT EXISTS" — not "no coercion anywhere". A SECOND
+detector inherits the exposure: a low-egress predicate written as ``case NOT_OBSERVED: pass`` would turn a
+refusal into a clean result, and this layer would not stop it, because forwarding is what this layer does.
+
+Written at this length deliberately. "No coercion anywhere" is the shorter sentence and it is FALSE — and
+the substitution of the strong claim for the scoped one is the same move as dropping an ``[ASSUMED]`` label
+when retelling a finding. The scope is the claim.
+
+*(This paragraph was corrected 2026-08-02: it previously said ``egress_attempts=None`` and named a
+``TELEMETRY_MISSING`` reason. Both predate the typed-absence work — absence is now an ``EgressAbsence``
+member and the reasons are ``TELEMETRY_NOT_OBSERVED`` / ``TELEMETRY_UNREADABLE``. A doc sentence naming a
+spelling that no longer exists is the same staleness class as a comment citing a deleted field.)*
 
 An untrusted observation is mapped by ``run_check`` to ``Verdict(ERROR)`` MECHANICALLY — the detector's
 ``assert_invariant`` is NEVER consulted for an untrusted result, so an always-PASS detector cannot launder a

@@ -635,13 +635,49 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
             raise NetworkIsolationError(f"escape probe found a leak: {detail}")
 
     def _read_count(self, proxy: str) -> int | None:
-        r = subprocess.run(
-            [self._exec_runtime(), "exec", proxy, "cat", _COUNTFILE],
-            capture_output=True, text=True, timeout=30, env=runtime_client_env(),
-        )
+        """The count, or ``None`` for "no reading" — and the exit status is consulted BEFORE the bytes.
+
+        ⚠ THE ORDER IS THE WHOLE FIX. This previously parsed ``r.stdout`` and never looked at
+        ``r.returncode``, which made a load-bearing property EMERGENT rather than CONSTRUCTED.
+
+        WHY IT MATTERED. This call is also the system's liveness witness for the proxy: ``exec`` requires a
+        RUNNING container, and the proxy IS the container's PID 1 (``proxy_run_argv`` runs
+        ``python3 /proxy.py``; every handler thread is ``daemon=True`` and so does not hold the interpreter
+        open). If ``serve()`` ever unwinds, the container stops and this read must yield "no reading" — which
+        is what stops a FROZEN countfile being reported as a small, clean-looking integer.
+
+        MEASURED 2026-08-02 on podman 4.9.3: exec against a stopped container exits 255 and writes its error
+        to STDERR, leaving stdout EMPTY, so ``int("")`` raised and the old code happened to return ``None``.
+        THAT IS A PROPERTY OF ONE RUNTIME'S STREAM BEHAVIOUR, NOT OF THIS FUNCTION. ``_RUNTIMES`` admits
+        ``nerdctl`` and ``docker``; a runtime that put anything numeric on stdout on an error path would have
+        been PARSED INTO A COUNT. Same class as reading ``git rev-parse HEAD``'s stdout without its exit
+        status — which echoes the literal ``HEAD`` at rc 128 and has already bitten this tree once.
+
+        ``TimeoutExpired`` is mapped here rather than left to propagate: a wedged runtime is exactly "the
+        observer could not be read", and letting it escape ``_egress`` would reintroduce the raw-exception
+        shape that the typed-absence taxonomy exists to replace.
+
+        ``OSError`` is DELIBERATELY NOT caught, and the exclusion is stated rather than left to inference.
+        A vanished runtime binary is not "the observer could not be read" — it is the executor losing its own
+        tooling, and the readiness poll would silently absorb it into 50 retries and then report that the
+        PROXY never published its countfile. That message would name the wrong subject. It stays loud.
+
+        ``AttributeError`` was removed from the except set: ``text=True`` with ``capture_output=True``
+        guarantees ``r.stdout`` is a ``str``, so that arm was dead. A guessed except-set is a small thing
+        that reads as coverage.
+        """
+        try:
+            r = subprocess.run(
+                [self._exec_runtime(), "exec", proxy, "cat", _COUNTFILE],
+                capture_output=True, text=True, timeout=30, env=runtime_client_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        if r.returncode != 0:
+            return None
         try:
             return int(r.stdout.strip())
-        except (ValueError, AttributeError):
+        except ValueError:
             return None
 
     def _egress(self, h: ObservedHandle) -> int | EgressAbsence:
