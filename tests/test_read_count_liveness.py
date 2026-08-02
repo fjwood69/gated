@@ -284,7 +284,7 @@ class TheReadinessBudgetIsWallClockNotAnIterationCount(unittest.TestCase):
         cheap = self._wedged(clock, calls, exec_cost=0.1)   # healthy-but-not-yet-ready reads
 
         def run(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
-            if "exec" in argv and len(calls) >= 3:          # ready on the 4th poll, well inside 5s
+            if "exec" in argv and len(calls) >= 3:          # ready on the 4th poll, well inside the deadline
                 calls.append(1)
                 return _completed(0, "0")
             return cheap(argv, **kw)

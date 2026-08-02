@@ -669,8 +669,11 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         #
         # WHAT THE DEADLINE BOUNDS, STATED PRECISELY: the number of ATTEMPTS, not the duration of one. A
         # single wedged ``exec`` can still consume its own 30s subprocess timeout, so the worst case is
-        # roughly one exec timeout past the deadline — bounded and ~35s, not unbounded and ~1500s. Saying
-        # "the deadline bounds the wait" without that sentence would be the adjacent-property defect again.
+        # roughly one exec timeout past the deadline — bounded and ~60s (30s deadline + 30s timeout), not
+        # unbounded and ~1500s. Saying "the deadline bounds the wait" without that sentence would be the
+        # adjacent-property defect again. The composite figure is stated at the constant too; if the
+        # deadline moves, BOTH sentences move, and this one already lagged once — it read ~35s from the
+        # 5s era while the constant block read ~60s, which is the exact drift class this diff is about.
         started = time.monotonic()
         while True:
             if self._read_count(name) is not None:
