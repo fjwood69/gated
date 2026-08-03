@@ -584,9 +584,16 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
                 proc.communicate(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
+            # THE WORSE OF THE TWO READS. ``_egress`` is a FLOOR on the normal path (see its
+            # docstring); HERE it is a floor with ORIGINATION-CLOSURE ITSELF unestablished — ``_force_remove``
+            # is best-effort with its result never checked, and the inner ``communicate`` above can
+            # expire with the exception passed, so this line can be reached with the container possibly
+            # still running and still counting.
             return self._result("timeout", None, self._egress(h), h)
         rc = proc.returncode
-        egress = self._egress(h)  # sandbox has exited -> count is stable
+        # The sandbox has exited, so no NEW connection can originate. That is ORIGINATION-closure, and it
+        # is NOT count-stability — this read is a FLOOR. See ``_egress`` for the mechanism and bounds.
+        egress = self._egress(h)
         if rc is None or rc in (125, 126, 127) or rc >= 128:
             return self._result("error", None, egress, h, raw=rc)
         return self._result("completed", rc, egress, h, raw=rc)
@@ -768,26 +775,83 @@ class ObservedOCISandbox(_ResolvedRuntimeMixin, BaseSandbox):
         and could not be read is a different fact from a backend that never had one, and the count is
         UNKNOWN rather than zero.
 
-        ⚠ THE SUBTRACTION IS GONE, AND IT WAS ALREADY INERT. ``ObservedHandle`` carried a ``baseline``
-        field whose comment read "proxy count after the escape probe (subtracted from the final)" — but
-        it was assigned the literal ``0`` on every path, so ``final - baseline`` was identically
-        ``final``. The comment described the PRE-RESTART design: the escape probe's reachability hit used
-        to bump the counter, and the baseline subtracted it. That was superseded when ``prepare()`` began
-        RESTARTING the proxy after the probe, so the artifact faces a fresh observer at zero — and the
-        field survived the design that justified it.
+        ⚠⚠ WHAT THIS NUMBER IS: A FLOOR, NOT THE VALUE. Both call sites read through here, which is why
+        the statement lives on the function rather than beside one of them — an earlier version put it
+        at the normal-path read only, so the timeout path (the WORSE one) carried no warning at all.
 
-        SUBTRACTION WOULD BE WRONG EVEN IF THE FIELD WERE LIVE, which is why this is a deletion rather
-        than a repair. A one-shot contamination is contamination, and subtracting it LAUNDERS it into a
-        clean number; an ONGOING source contributes at T1..Tn, so a baseline measured at T0
-        UNDER-corrects by exactly the post-start events. Contamination is eliminated or discriminated AT
-        THE OBSERVER — never corrected arithmetically after the fact.
+        The read was once commented "sandbox has exited -> count is stable". THE FIRST CLAUSE IS TRUE
+        AND DOES NOT IMPLY THE SECOND. Exit establishes ORIGINATION-CLOSURE — no new connection can
+        ORIGINATE. COUNT-STABILITY — no further increment can OCCUR — is a different fact, and it does
+        not hold, because a connection may have originated before exit and not yet been counted.
 
-        NOT IN THIS DIFF: the witness chain that would give the count a two-sided floor on the live
-        engine (start -> 0, post-probe -> exactly the pinned probe cardinality, restart -> 0, post-run ->
-        final). That is a DESIGN with its own pins — chiefly that the probe's connection count must be
-        ONE CONSTANT expanded at both the escape script and the check, or it is two literals agreeing by
-        convention. Deleting an inert term is mechanical; adding a floor is not, and bundling them would
-        smuggle an unbuilt design into a subtraction removal.
+        THREE POPULATIONS ARE MISSING FROM THIS NUMBER AT READ TIME. Named here because a caller cannot
+        interpret the value without them; DERIVED in the design doc (see the pointer at the end).
+
+          1. THE KERNEL ACCEPT BACKLOG — connections whose handshake completed but which no
+             ``accept()`` has returned. The proxy counts AT accept and accept is gated behind
+             ``sem.acquire()``, so silent clients occupying every handler leave real, pre-exit
+             arrivals uncounted. Depth measured 17 in isolation, but 18-19 under load: NOT A CEILING.
+          2. ONE ACCEPTED-BUT-UNCOUNTED CONNECTION, between ``accept()`` returning and ``write_count``
+             completing. Exactly one, because the accept loop is single-threaded. THE ONLY BOUNDED
+             TERM, and bounded by the source rather than by a measurement.
+          3. DEFERRED COMPLETIONS IN SYN-RECV. At the Linux default ``tcp_abort_on_overflow`` is
+             DISABLED (``tcp(7)``): a full accept queue DROPS the completing ACK rather than refusing
+             it, so the handshake can complete LATER on the SYN-ACK retransmit schedule — seconds, not
+             one RTT. NO CEILING IS DERIVABLE: the population is bounded by what the artifact offered,
+             not by any queue depth.
+
+        ⚠ THERE IS THEREFORE NO NUMERIC BOUND, AND ONE MUST NOT BE REINTRODUCED. A previous version of
+        this docstring asserted "THE COUNT BOUND IS Q + 1" in one paragraph and conceded it might not
+        hold in another — a reader could not tell which to trust. Term 1 is unresolved and term 3 is
+        unbounded by construction, so any single figure quoted here is false precision. A gate sizing
+        patience must size it against TIME (a host-dependent ``tcp_synack_retries`` window) or REFUSE;
+        neither is a bound on this number.
+
+        POLARITY, because it decides who is hurt: this UNDER-reports. A consumer asking "is the count
+        ZERO?" can FALSE-PASS an artifact that did attempt egress. A consumer wanting an exact retry
+        count can false-FAIL.
+
+        ⚠⚠ THE DANGEROUS DIRECTION NEEDS ONE ATTEMPT, NOT A FLOOD. This paragraph once ended "once the
+        backlog is full the kernel refuses outright ... so it is never counted at all", which made the
+        false-PASS sound like it required saturation. That is FALSE at the Linux default (term 3): the
+        ACK is DROPPED, not refused, and a dropped ACK can be retransmitted into a completed handshake.
+        A truly REFUSED connection could never be counted; a deferred one is counted the moment the
+        queue drains. So the reachable failure is: ONE attempt lands in SYN-RECV, THIS FUNCTION READS
+        ZERO, and the connection is counted afterwards or not at all. No saturation, no concurrency.
+
+        SCOPE, so this is not read as wider than it is — AND IT IS A PROPERTY OF THE PREDICATE, NOT OF
+        ANY PARTICULAR DETECTOR. A consumer treating ``n == 0`` as FAIL is fail-closed; a consumer
+        treating it as "no egress" is EXPOSED. ``RetryCheck`` is the current instance of the first kind
+        (``n == 0`` -> FAIL / ``EGRESS_ZERO``), so nothing shipped today is at risk — but that sentence
+        is about the predicate and survives the detector being renamed or replaced.
+
+        The false-PASS therefore belongs to the FIRST LOW-EGRESS DETECTOR, which is not built. There it
+        is ONE blocking prerequisite together with NOT_OBSERVED truthfulness and the
+        accepted-vs-attempted contract, not three separate residuals.
+
+        NOT FIXED HERE, DELIBERATELY. The repair is the closure increment plus a drain witness, and
+        neither is built. What is fixed here is the SENTENCE: it asserted a property the code does not
+        have, at the one place a reader goes to learn what this number means.
+
+
+        ─────────────────────────────────────────────────────────────────────────────────────────────
+        DERIVATION OF THE THREE DEFICIT TERMS, the drain measurements, the refuted explanations of the
+        backlog overshoot, and what a detector battery needs instead of a bound:
+        ``docs/gated-planning/state/DESIGN-arrival-closure-v2.md`` (dotfiles), section
+        **THE THREE DEFICIT TERMS**.
+
+        THE ANCHOR IS THE SECTION'S PHRASE, NEVER ITS NUMBER. A "§8" rots silently the moment anything
+        is inserted above it, and a pointer that has quietly stopped resolving is the same failure as a
+        claim that has quietly stopped being true. The phrase is grep-able and travels with the content.
+        For the same reason the pointer names WHAT lives there rather than merely where: a supersession
+        sweep grepping ``deficit terms`` must hit BOTH surfaces. THE TERMS THEMSELVES STAY HERE — if they
+        migrate out, the read site stops carrying the floor.
+
+        ⚠ THE TARGET IS A PRIVATE REPO AND THIS FILE IS PUBLIC. A stranger following this pointer cannot
+        read it. That is an ACCESS limit, not a truthfulness one — everything needed to interpret the
+        return value is above, and only the derivation is behind the wall — but it is the first pointer
+        in this tree that leads somewhere the reader of the demo cannot go, and whether the derivation
+        should be publishable is an open question rather than a settled one.
         """
         final = self._read_count(h.proxy)
         if final is None:
