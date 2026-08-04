@@ -70,8 +70,19 @@ def normalise(text: str) -> str:
     NFKC->NFC left the test GREEN, which is how the false reason was found at all.
 
     THE REAL REASON: COMPATIBILITY CHARACTERS INSIDE WORDS, which no whitespace rule can reach — the
-    fi-ligature, fullwidth letter forms, and the non-breaking hyphen. Each defeats literal matching
-    outright, and each is realistic in typography-rich prose.
+    fi-ligature and fullwidth letter forms. Both defeat literal matching outright, both are realistic
+    in typography-rich prose, and NFKC folds both to ASCII.
+
+    ⚠ AND THE THIRD EXAMPLE THIS DOCSTRING USED TO GIVE — THE NON-BREAKING HYPHEN — IS DEAD. It read
+    "the fi-ligature, fullwidth letter forms, and the non-breaking hyphen". MEASURED: NFKC maps
+    U+2011 NON-BREAKING HYPHEN to U+2010 HYPHEN, **not** to U+002D HYPHEN-MINUS, so an ASCII-hyphen
+    pattern STILL MISSES after normalisation. NFKC does not rescue that case and never did.
+
+    ⚠ THE POINT IS NOT THE CHARACTER. This docstring exists to record that a ruling survived its
+    red-proof while its stated justification did not — and the CORRECTED justification then shipped
+    with a fresh false example of its own, undetected until an outside reviewer read it. A correction
+    is not self-certifying. The hyphen axis is crossed by ``expand``, deliberately and by
+    enumeration, precisely because normalisation does not cross it.
 
     Widening equivalence in a tool that never removes hits can only ADD them, so this stays fail-safe.
     """
@@ -882,9 +893,14 @@ def harvest(args) -> int:
 
     # ── THE FIXPOINT LOOP (R3). Add-only over a fixed snapshot ⇒ the reached set is monotone and
     # bounded by the corpus, so it terminates in at most |units| rounds and CANNOT oscillate.
+    # ⚠ THERE IS NO --anchor FLAG, AND ITS ABSENCE IS THE RULING. The design states that ANCHORS ARE
+    # AN OUTPUT OF HARVEST, NEVER AN INPUT, and the CLI used to invite them in anyway — laundering a
+    # remembered guess into the registry wearing an output's clothing. MEASURED on the 2026-08-04
+    # incident: hand-chosen subject anchors reached 1 of 5 carriers, STRICTLY WORSE than the literal
+    # seed's 3 of 5, and recovered NOTHING the seed had missed. The bias is systematic — whoever
+    # picks anchors has just finished writing the correction, so they reach for the MECHANISM's
+    # vocabulary while the carriers are still speaking the CLAIM's.
     held: dict[str, str] = {canonical(args.seed): args.seed}
-    for a in (args.anchor or []):               # legacy input anchors, if any were passed
-        held.setdefault(canonical(a), a)
     reached: dict[str, str] = {}
     occurrences: dict[str, int] = {}
     rounds: list[dict] = []
@@ -964,9 +980,8 @@ def harvest(args) -> int:
     rec = Record(
         id=args.id, seed=args.seed,
         variants=sorted({v for v in held.values()}) or [args.seed],
-        anchors=args.anchor or [],
-        nets_run=["literal-seed", "carrier-extraction", "orthographic-expansion"]
-                 + (["subject-anchors"] if args.anchor else []),
+        anchors=[],   # OUTPUT-only; see the fixpoint loop above
+        nets_run=["literal-seed", "carrier-extraction", "orthographic-expansion"],
         tombstones=[],                      # OPEN by construction — see R4
         surfaces_at_withdrawal=sorted(where),
         expected_counts={s.name: s.item_count for s in surfaces},
@@ -977,6 +992,22 @@ def harvest(args) -> int:
     rd = NAMESPACE / "records"
     rd.mkdir(parents=True, exist_ok=True)
     rel = f"records/{rec.id}.json"
+    # ⚠ NEVER OVERWRITE AN EXISTING RECORD. `harvest` wrote unconditionally, and a re-harvest under
+    # an id already in use RESET `tombstones` TO [] — silently destroying the hash-pinned exclusions
+    # a CLOSED record licenses. The loss is INVISIBLE by construction: the tombstones that would
+    # raise `tomb_lost` on the next sweep are the very thing deleted, so the run afterwards is clean
+    # and the formerly-excluded blocks simply return as live hits with no explanation.
+    # ⚠ THIS WAS A LIVE NEAR-MISS, NOT A HYPOTHETICAL: on 2026-08-04 I re-harvested an existing id
+    # to register an experiment's anchors. That record happened to be OPEN, so nothing was lost.
+    # Inside the tool built to stop claims disappearing without record.
+    if (NAMESPACE / rel).exists():
+        print(f"⚠ INSTRUMENT FAILURE — record {rec.id!r} ALREADY EXISTS. NOTHING WAS WRITTEN.")
+        print(f"    {NAMESPACE / rel}")
+        print("  Overwriting would reset its tombstones to [], destroying every hash-pinned")
+        print("  exclusion it licenses — and the next sweep could not report the loss, because the")
+        print("  tombstones that would flag it are what the overwrite deletes.")
+        print("  Choose a new id, or delete the record deliberately if that is what you mean.")
+        return EXIT_INSTRUMENT
     (NAMESPACE / rel).write_text(json.dumps(rec.__dict__, indent=2), encoding="utf-8")
     manifest_add(NAMESPACE, rel)
 
@@ -1035,7 +1066,6 @@ def main(argv: list[str] | None = None) -> int:
     hv = sub.add_parser("harvest", help="harvest actual variants and register a record (R3/R4)")
     hv.add_argument("id")
     hv.add_argument("seed")
-    hv.add_argument("--anchor", action="append", help="subject anchor: identifier, config key, sysctl…")
     hv.add_argument("--parent", default=None, help="supersession parent record id (R1)")
     hv.set_defaults(fn=harvest)
     a = ap.parse_args(argv)
