@@ -461,6 +461,112 @@ class OrthographicExpansion(unittest.TestCase):
         self.assertNotIn("zero-gates", got, "no pluralisation")
 
 
+class RecordOverwrite(unittest.TestCase):
+    """⚠ `harvest` OVERWROTE AN EXISTING RECORD ID, RESETTING ITS TOMBSTONES TO [].
+
+    The loss is INVISIBLE BY CONSTRUCTION: the tombstones that would raise `tomb_lost` on the next
+    sweep are exactly what the overwrite deletes, so the following run is CLEAN and the
+    formerly-excluded blocks simply return as live hits with no explanation. A live near-miss on
+    2026-08-04 — an existing id was re-harvested to register an experiment's anchors; it happened to
+    be OPEN, so nothing was lost. Inside the tool built to stop claims disappearing without record.
+    """
+
+    def _run(self, ns, rid):
+        from types import SimpleNamespace
+        from unittest import mock
+        cfg = {"control_token": "ZZ-SWEEP-CONTROL-TOKEN", "surfaces": [], "expected_counts": {}}
+        surf = [S.SurfaceResult("docs", "filesystem", "3 files", 3,
+                                [(f"docs/f{i}.md", "body ZZ-SWEEP-CONTROL-TOKEN") for i in range(3)])]
+        args = SimpleNamespace(id=rid, seed="a claim", parent=None)
+        with mock.patch.object(S, "load_config", return_value=cfg), \
+             mock.patch.object(S, "gather_surfaces", return_value=surf), \
+             mock.patch.object(S, "NAMESPACE", ns):
+            return S.harvest(args)
+
+    def test_existing_record_is_NOT_overwritten(self):
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        (ns / "records").mkdir()
+        closed = {"id": "R", "seed": "a claim", "variants": ["a claim"], "anchors": [],
+                  "nets_run": [], "tombstones": [{"location": "docs/f0.md", "block_sha256": "abc"}],
+                  "surfaces_at_withdrawal": [], "expected_counts": {}, "parent": None, "created": ""}
+        (ns / "records" / "R.json").write_text(json.dumps(closed), encoding="utf-8")
+        # ⚠ THE NAMESPACE MUST BE MANIFEST-CLEAN OR THIS TEST PASSES FOR THE WRONG REASON. Without a
+        # manifest listing records/R.json, instrument_gate fails on an UNMANIFESTED STRAY and returns
+        # EXIT_INSTRUMENT before the overwrite guard is ever reached — the assertion then holds while
+        # the guard could be deleted entirely. Caught by a mutant that SURVIVED.
+        (ns / "manifest.json").write_text(json.dumps(["records/R.json"]), encoding="utf-8")
+        self.assertEqual(S.manifest_check(ns), [], "the gate must not short-circuit this test")
+        rc = self._run(ns, "R")
+        self.assertEqual(rc, S.EXIT_INSTRUMENT, "re-harvesting an existing id must REFUSE")
+        after = json.loads((ns / "records" / "R.json").read_text(encoding="utf-8"))
+        self.assertEqual(after["tombstones"], closed["tombstones"],
+                         "⚠ THE TOMBSTONES MUST SURVIVE — they are the exclusions the record licenses")
+
+    def test_a_fresh_id_still_writes(self):
+        """Correlated positive control: prove the refusal above is the guard, not harvest broken."""
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        rc = self._run(ns, "FRESH")
+        self.assertEqual(rc, S.EXIT_DEBT)
+        self.assertTrue((ns / "records" / "FRESH.json").exists())
+
+
+class NfkcHyphenIsNotFolded(unittest.TestCase):
+    """⚠ THE DOCSTRING'S THIRD NFKC EXAMPLE WAS DEAD, AND IT WAS THE CORRECTED VERSION.
+
+    `normalise` exists to record that a ruling survived its red-proof while its stated reason did
+    not. The rewritten reason then shipped with a FRESH false example — the non-breaking hyphen —
+    undetected until an outside reviewer read it. This test pins the measurement so the claim cannot
+    quietly return.
+    """
+
+    def test_U2011_does_NOT_fold_to_ascii_hyphen(self):
+        folded = S.normalise("\u2011")
+        self.assertEqual(folded, "\u2010", "NFKC maps NON-BREAKING HYPHEN to HYPHEN, not to ASCII")
+        self.assertNotEqual(folded, "-", "so NFKC does NOT rescue an ASCII-hyphen pattern")
+        self.assertIsNone(S.compile_pattern("co-operate").search(S.normalise("co\u2011operate")),
+                          "an ASCII-hyphen pattern still MISSES a typographic hyphen after NFKC")
+
+    def test_the_two_surviving_examples_are_real(self):
+        """The correlated control: ligature and fullwidth DO fold, so the ruling still stands."""
+        self.assertIsNotNone(S.compile_pattern("final").search(S.normalise("\ufb01nal")))
+        self.assertEqual(S.normalise("\uff21"), "A")
+
+    def test_expand_is_what_crosses_the_hyphen_axis(self):
+        """Since normalisation does not cross it, expansion must — by enumeration."""
+        self.assertIn("co\u2011operate", S.expand("co-operate"))
+
+
+class AnchorsAreAnOutputNotAnInput(unittest.TestCase):
+    """⚠ THE CLI USED TO INVITE ANCHORS IN while the design ruled them an OUTPUT of harvest.
+
+    That laundered a remembered guess into the registry wearing an output's clothing. MEASURED:
+    hand-chosen anchors reached 1 of 5 carriers — STRICTLY WORSE than the literal seed's 3 of 5 —
+    and recovered nothing the seed had missed.
+    """
+
+    def test_harvest_has_no_anchor_flag(self):
+        """⚠ ASSERT WHICH SystemExit. Bare `assertRaises(SystemExit)` passes whether or not the flag
+        exists — with it, argparse accepts and `load_config` exits on a missing config instead. That
+        mutant SURVIVED. The parser's own error message is the only thing that distinguishes them."""
+        import contextlib, io
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            S.main(["harvest", "ID", "seed", "--anchor", "SomeIdentifier"])
+        self.assertIn("unrecognized arguments: --anchor", err.getvalue(),
+                      "the flag must be REJECTED BY THE PARSER, not merely absent from the outcome")
+
+    def test_the_parser_still_accepts_a_real_harvest_invocation(self):
+        """Correlated control: prove the rejection above is the flag and not a broken parser."""
+        import contextlib, io
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            S.main(["harvest", "ID", "seed", "--parent", "P"])
+        self.assertNotIn("unrecognized arguments", err.getvalue(),
+                         "--parent is a real flag and must parse")
+
+
 # ⚠ THIS ENTRY POINT MUST STAY AT THE END OF THE FILE, AND IT USED TO SIT IN THE MIDDLE.
 # ``unittest.main()`` runs at the point it is reached during module execution, so every class defined
 # BELOW it was never registered when the file was run as a script: `python3 test_sweep.py` reported
