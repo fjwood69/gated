@@ -18,3 +18,7 @@ dist/
 
 # Local agent tooling (gitnexus skill files, agent config) — never part of the published tree.
 .claude/
+
+# sweep: the artefact store and the real config never enter a PUBLIC repo (see scripts/sweep.py)
+scripts/sweep-registry/
+scripts/sweep.config.json

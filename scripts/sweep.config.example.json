@@ -1,0 +1,21 @@
+{
+  "control_token": "ZZ-SWEEP-CONTROL-TOKEN",
+  "surfaces": [
+    {
+      "name": "planning-docs",
+      "mechanism": "filesystem",
+      "root": "/path/to/your/planning-docs",
+      "globs": [
+        "**/*.md"
+      ],
+      "git": false
+    },
+    {
+      "name": "board",
+      "mechanism": "http-board",
+      "url": "https://your-board-endpoint.example/<secret-path>/state"
+    }
+  ],
+  "expected_counts": {},
+  "_note": "Copy to sweep.config.json and fill in. The real config is gitignored: this repo is PUBLIC."
+}
