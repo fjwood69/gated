@@ -550,7 +550,8 @@ class AnchorsAreAnOutputNotAnInput(unittest.TestCase):
         """⚠ ASSERT WHICH SystemExit. Bare `assertRaises(SystemExit)` passes whether or not the flag
         exists — with it, argparse accepts and `load_config` exits on a missing config instead. That
         mutant SURVIVED. The parser's own error message is the only thing that distinguishes them."""
-        import contextlib, io
+        import contextlib
+        import io
         err = io.StringIO()
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
             S.main(["harvest", "ID", "seed", "--anchor", "SomeIdentifier"])
@@ -559,7 +560,8 @@ class AnchorsAreAnOutputNotAnInput(unittest.TestCase):
 
     def test_the_parser_still_accepts_a_real_harvest_invocation(self):
         """Correlated control: prove the rejection above is the flag and not a broken parser."""
-        import contextlib, io
+        import contextlib
+        import io
         err = io.StringIO()
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
             S.main(["harvest", "ID", "seed", "--parent", "P"])
