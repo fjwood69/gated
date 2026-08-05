@@ -344,6 +344,38 @@ def enumerate_board(name: str, base_url: str, timeout: int = 30) -> SurfaceResul
 # not tolerate `>` would treat a 400-line design as ONE unit and harvest its entire vocabulary.
 _HEADING = re.compile(r"^[ \t]*(?:>[ \t]*)*#{1,6}[ \t]+\S", re.MULTILINE)
 
+# ⚠ AND A HEADING MARK INSIDE A FENCED BLOCK IS NOT A HEADING. `_HEADING` matches any line whose
+# first non-whitespace (modulo `>` prefixes) is 1-6 `#` plus a space — WHICH INCLUDES A SHELL OR
+# PYTHON COMMENT INSIDE A FENCE, markdown-in-markdown samples, and quoted code via the blockquote
+# tolerance. MEASURED on the 2026-08-05 corpus: 245 such marks across 33 of 492 locations (6.7%).
+#
+# ⚠ WHY IT BECAME LOAD-BEARING ONLY NOW. Under the deleted fixpoint loop a mis-split barely
+# mattered — the flood crossed every boundary anyway. Under claim-span seeding THE UNIT *IS* THE
+# CANDIDATE SET, so a `# comment` inside a fence ABOVE the claim CUTS THE UNIT SHORT, extraction
+# loses the claim's trailing vocabulary, and `variants` SILENTLY NARROWS. Worse: EDITING A CODE
+# SAMPLE would then change harvest output — and the founding failure was a design document UNDER
+# ACTIVE EDIT, so that instability class is the live one.
+#
+# ⚠ THE ABLATION CANNOT BE CITED AGAINST THIS. Both of its arms shared `_HEADING`, so it measured
+# GRANULARITY (block vs unit), never PARSE CORRECTNESS.
+_FENCE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})", re.MULTILINE)
+
+
+def _fenced_spans(text: str) -> list[tuple[int, int]]:
+    """Fence-delimited regions, as (start, end) offsets.
+
+    ⚠ AN UNCLOSED FENCE EXTENDS TO END OF TEXT, AND THE DIRECTION IS DELIBERATE. Suppressing splits
+    after an unterminated fence yields FEWER, LARGER units — more vocabulary harvested, which is
+    noise the tool already tolerates and prints. Ignoring it instead would let splits happen INSIDE
+    what is probably a fence, which TRUNCATES a unit silently. Truncation is the dangerous direction
+    under claim-span seeding, so the fail-safe is to over-include.
+    """
+    marks = [m.start() for m in _FENCE.finditer(text)]
+    spans = [(marks[i], marks[i + 1]) for i in range(0, len(marks) - 1, 2)]
+    if len(marks) % 2:                      # unterminated fence
+        spans.append((marks[-1], len(text)))
+    return spans
+
 # Extraction classes. ⚠ ALL CASE-INSENSITIVE BY CONSTRUCTION, BECAUSE THE MATCHER IS. A
 # lowercase-only compound class was MEASURED to see nothing at all in a carrier that spells its terms
 # in capitals — and that was one of only three carriers the seed reached.
@@ -404,7 +436,9 @@ def carrier_units(location: str, text: str) -> list[tuple[str, str]]:
 
     A board value has no headings and is returned whole, which is its structure.
     """
-    marks = [m.start() for m in _HEADING.finditer(text)]
+    fenced = _fenced_spans(text)
+    marks = [m.start() for m in _HEADING.finditer(text)
+             if not any(a <= m.start() < b for a, b in fenced)]
     if not marks:
         return [(location, text)]
     bounds = ([0] if marks[0] > 0 else []) + marks + [len(text)]

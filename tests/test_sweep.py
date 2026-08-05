@@ -569,6 +569,66 @@ class AnchorsAreAnOutputNotAnInput(unittest.TestCase):
                          "--parent is a real flag and must parse")
 
 
+class FenceAwareCarrierUnits(unittest.TestCase):
+    """⚠ A HEADING MARK INSIDE A FENCED BLOCK IS NOT A HEADING.
+
+    `_HEADING` matches any line starting (modulo `>` prefixes) with 1-6 `#` and a space, so a SHELL
+    OR PYTHON COMMENT INSIDE A FENCE was a split mark. MEASURED on the 2026-08-05 corpus: 245 such
+    marks across 33 of 492 locations (6.7%).
+
+    ⚠ IT BECAME LOAD-BEARING ONLY WITH CLAIM-SPAN SEEDING. Under the fixpoint loop a mis-split barely
+    mattered — the flood crossed every boundary. When THE UNIT IS THE CANDIDATE SET, a mis-split
+    above the claim CUTS THE UNIT SHORT and `variants` SILENTLY NARROWS. And the ablation cannot be
+    cited against it: both arms shared `_HEADING`, so it measured granularity, never parse
+    correctness.
+    """
+
+    F = "```"
+
+    def _doc(self):
+        return ("intro paragraph\n\n" + self.F + "bash\n"
+                "# this is a shell comment, NOT a heading\n"
+                "echo hi\n" + self.F + "\n\n"
+                "the claim lives here\n\n"
+                "## A REAL HEADING\n"
+                "tail\n")
+
+    def test_a_hash_comment_inside_a_fence_does_NOT_split(self):
+        """⚠ THE TARGET ASSERTION. Fence-blind, this yields THREE units and the claim's unit begins
+        at the shell comment — losing everything above it."""
+        units = S.carrier_units("f.md", S.normalise(self._doc()))
+        self.assertEqual(len(units), 2, f"the fence must not split; got {[u for u,_ in units]}")
+        claim = [t for _, t in units if "the claim lives here" in t][0]
+        self.assertIn("intro paragraph", claim,
+                      "⚠ the claim's unit must still reach back past the fence")
+
+    def test_a_real_heading_outside_a_fence_STILL_splits(self):
+        """The correlated positive control: without it the test above passes on a function that
+        never splits at all."""
+        units = S.carrier_units("f.md", S.normalise(self._doc()))
+        self.assertEqual(len(units), 2)
+        self.assertTrue(any("A REAL HEADING" in t for _, t in units))
+        self.assertFalse(any("A REAL HEADING" in t and "the claim lives here" in t
+                             for _, t in units), "the real heading must separate them")
+
+    def test_an_unterminated_fence_extends_to_end_of_text(self):
+        """⚠ THE FAIL-SAFE DIRECTION, STATED. Suppressing splits after an unclosed fence yields
+        FEWER, LARGER units — more vocabulary, which the tool already prints. Ignoring it would let
+        splits happen INSIDE a probable fence, TRUNCATING silently. Truncation is the dangerous
+        direction under claim-span seeding."""
+        doc = "intro\n\n" + self.F + "\n# not a heading\n## also not\n"
+        self.assertEqual(len(S.carrier_units("f.md", S.normalise(doc))), 1)
+
+    def test_tilde_fences_count_too(self):
+        doc = "intro\n\n~~~\n# not a heading\n~~~\n\nbody\n"
+        self.assertEqual(len(S.carrier_units("f.md", S.normalise(doc))), 1)
+
+    def test_headings_still_split_a_document_with_no_fences_at_all(self):
+        """Second correlated control: fence logic must not perturb the ordinary path."""
+        doc = "preamble\n\n# One\na\n\n## Two\nb\n"
+        self.assertEqual(len(S.carrier_units("f.md", S.normalise(doc))), 3)
+
+
 # ⚠ THIS ENTRY POINT MUST STAY AT THE END OF THE FILE, AND IT USED TO SIT IN THE MIDDLE.
 # ``unittest.main()`` runs at the point it is reached during module execution, so every class defined
 # BELOW it was never registered when the file was run as a script: `python3 test_sweep.py` reported
