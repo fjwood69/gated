@@ -653,6 +653,160 @@ class FenceAwareCarrierUnits(unittest.TestCase):
         self.assertEqual(len(S.carrier_units("f.md", S.normalise(doc))), 3)
 
 
+class SeedCensus(unittest.TestCase):
+    """P1-1 — ⚠ THE DESIGN DELETES THE INSTRUMENT FOR CARRIER *ENUMERATION* AND REPLACES IT WITH AN
+    UNRECORDED *ADJUDICATION*.
+
+    Claim-span seeding asks which carrier holds the claim. The design stores the ANSWER (``--carrier``)
+    and never the QUESTION — what there was to choose from. That is this tool's founding failure, one
+    level down: a sweep that searches what its author remembers, reappearing inside the command whose
+    docstring claims to make the registry honest.
+
+    MEASURED on the founding incident: ``no egress`` is ordinary vocabulary in a project about network
+    isolation, and 7 of the 8 locations using the phrase were HOMONYMS. So the population and the
+    choice are genuinely different objects, and only one of them was being written down.
+    """
+
+    def _units(self, *triples):
+        return list(triples)
+
+    # ── the census counts, and never chooses (R5) ─────────────────────────────────────────────────
+    def test_lists_every_unit_holding_the_seed(self):
+        c = S.seed_census("no egress", self._units(
+            ("a.md#0", "docs", "the count is zero so no egress"),
+            ("a.md#1", "docs", "unrelated prose"),
+            ("board/k", "board", "no egress here too")))
+        self.assertEqual({h["unit"] for h in c["units_holding"]}, {"a.md#0", "board/k"})
+        self.assertEqual(c["unit_total"], 3, "the denominator is the whole unit index, not the hits")
+
+    def test_a_single_occurrence_is_listed_exactly_like_a_frequent_one(self):
+        """⚠ THE NO-THRESHOLD PROPERTY, AS A TEST RATHER THAN A COMMENT. A census that quietly
+        dropped the long tail would reproduce the silent cutoff it exists to expose — and the tail is
+        where a forgotten carrier lives, by definition."""
+        c = S.seed_census("seed", self._units(
+            ("rare#0", "docs", "seed"),
+            ("common#0", "docs", "seed seed seed seed seed")))
+        self.assertEqual(len(c["units_holding"]), 2)
+        self.assertEqual({h["unit"]: h["occurrences"] for h in c["units_holding"]},
+                         {"rare#0": 1, "common#0": 5},
+                         "occurrences are REPORTED, never used to filter")
+
+    def test_occurrences_and_units_are_distinct_numbers(self):
+        c = S.seed_census("seed", self._units(("u#0", "docs", "seed seed seed")))
+        self.assertEqual(len(c["units_holding"]), 1)
+        self.assertEqual(c["occurrences_total"], 3,
+                         "3 occurrences in 1 unit must never be reported as 3 carriers")
+
+    def test_surfaces_are_deduplicated_and_sorted(self):
+        c = S.seed_census("seed", self._units(
+            ("b#0", "board", "seed"), ("a#0", "docs", "seed"), ("a#1", "docs", "seed")))
+        self.assertEqual(c["surfaces"], ["board", "docs"])
+
+    def test_matching_is_the_matcher_not_a_substring(self):
+        """The census must agree with what a sweep would find, so it goes through ``compile_pattern``
+        — hard-wrap tolerant and NFKC-folded. A bare ``in`` test would under-count exactly the
+        re-flowed occurrence R2 exists for."""
+        c = S.seed_census("no egress", self._units(("w#0", "docs", "the claim says no\negress here")))
+        self.assertEqual(len(c["units_holding"]), 1,
+                         "a hard-wrapped occurrence is an occurrence (R2)")
+
+    def test_an_uncompilable_seed_is_REPORTED_not_raised(self):
+        """⚠ THE COUNTER DOES NOT DECIDE WHAT AN INSTRUMENT CONDITION COSTS. It reports; the caller
+        rules. Raising here would make the census's failure indistinguishable from harvest crashing."""
+        c = S.seed_census("   ", self._units(("u#0", "docs", "anything")))
+        self.assertIsNotNone(c["error"])
+        self.assertEqual(c["units_holding"], [],
+                         "an empty population, never a population that was not measured")
+
+    def test_zero_occurrences_is_a_measured_zero_not_an_error(self):
+        """The correlated negative control for the test above: absence of the seed and inability to
+        look for it must not produce the same record."""
+        c = S.seed_census("absent", self._units(("u#0", "docs", "nothing here")))
+        self.assertIsNone(c["error"])
+        self.assertEqual(c["units_holding"], [])
+
+    # ── the adjudication over it, which is a DIFFERENT object ─────────────────────────────────────
+    def test_adjudication_records_what_was_LEFT_OUT_and_can_disagree(self):
+        """⚠ THE PROPERTY THE WHOLE ITEM EXISTS FOR. Naming one carrier out of three must leave the
+        other two NAMED in the record, not merely absent from it. This is exercised on inputs that
+        DISAGREE, which no end-to-end run in this build can produce."""
+        c = S.seed_census("seed", self._units(
+            ("a#0", "docs", "seed"), ("b#0", "docs", "seed"), ("c#0", "docs", "seed")))
+        adj = S.census_adjudication(c, ["a#0"], carriers_named=["a#0"], basis="operator named a#0")
+        self.assertEqual(adj["seeded"], ["a#0"])
+        self.assertEqual(adj["adjudicated_out"], ["b#0", "c#0"],
+                         "the units NOT chosen are the record's whole point")
+        self.assertEqual(adj["carriers_named"], ["a#0"])
+
+    def test_adjudication_is_empty_when_everything_was_seeded(self):
+        """The correlated positive control: prove the test above is the difference firing and not
+        ``adjudicated_out`` being non-empty unconditionally."""
+        c = S.seed_census("seed", self._units(("a#0", "docs", "seed"), ("b#0", "docs", "seed")))
+        adj = S.census_adjudication(c, ["a#0", "b#0"], basis="all")
+        self.assertEqual(adj["adjudicated_out"], [])
+
+    def test_seeding_a_unit_the_census_never_found_does_not_go_negative(self):
+        """A set difference in the other direction. It must not silently vanish: the two instruments
+        disagreeing the OTHER way is still a disagreement, and ``adjudicated_out`` is not the place
+        it would show — so this pins that the reconciliation does not crash or invent an entry."""
+        c = S.seed_census("seed", self._units(("a#0", "docs", "seed")))
+        adj = S.census_adjudication(c, ["a#0", "ghost#9"], basis="x")
+        self.assertEqual(adj["adjudicated_out"], [])
+        self.assertIn("ghost#9", adj["seeded"])
+
+    # ── the WIRING. Behaviour and wiring are two claims (the SharedInstrumentGate lesson). ────────
+    def _run_harvest(self, seed, items):
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+        token = "ZZ-SWEEP-CONTROL-TOKEN"
+        cfg = {"control_token": token, "surfaces": [], "expected_counts": {}}
+        surf = S.SurfaceResult("docs", "filesystem", f"{len(items)} files", len(items),
+                               [(loc, f"{body}\n{token}\n") for loc, body in items])
+        ns = Path(tempfile.mkdtemp())
+        args = SimpleNamespace(id="NEW", seed=seed, anchor=None, parent=None)
+        with mock.patch.object(S, "load_config", return_value=cfg), \
+             mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
+             mock.patch.object(S, "NAMESPACE", ns):
+            rc = S.harvest(args)
+        return rc, ns
+
+    def test_harvest_PERSISTS_the_census_onto_the_record(self):
+        rc, ns = self._run_harvest("no egress", [("docs/a.md", "the claim: no egress"),
+                                                 ("docs/b.md", "nothing to see")])
+        self.assertEqual(rc, S.EXIT_DEBT)
+        rec = json.loads((ns / "records" / "NEW.json").read_text(encoding="utf-8"))
+        self.assertIn("seed_census", rec, "a census computed and not written down is not a record")
+        self.assertEqual([h["unit"] for h in rec["seed_census"]["units_holding"]], ["docs/a.md"])
+        self.assertEqual(rec["seed_census"]["adjudication"]["adjudicated_out"], [],
+                         "this build adjudicates nothing, so the two instruments must agree")
+
+    def test_harvest_SPILLS_the_census_to_a_MANIFESTED_file(self):
+        """R6/R13 — spilled in full, and manifested, or the next run reports it as a stray and the
+        tool fails its own instrument gate on a file it wrote itself."""
+        rc, ns = self._run_harvest("no egress", [("docs/a.md", "no egress")])
+        self.assertEqual(rc, S.EXIT_DEBT)
+        self.assertTrue((ns / "census" / "NEW.tsv").exists(), "the full census must be persisted")
+        self.assertIn("census/NEW.tsv",
+                      json.loads((ns / "manifest.json").read_text(encoding="utf-8")))
+        self.assertEqual(S.manifest_check(ns), [],
+                         "harvest must not leave a file its own gate would call a stray")
+
+    def test_a_record_written_before_the_census_existed_STILL_LOADS(self):
+        """The added field carries a default for the same reason every other R3 field does: a tool
+        that cannot read its own history has no history."""
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        (ns / "records").mkdir()
+        (ns / "records" / "OLD.json").write_text(json.dumps({
+            "id": "OLD", "seed": "s", "variants": [], "anchors": [], "nets_run": [],
+            "tombstones": [], "surfaces_at_withdrawal": [], "expected_counts": {},
+            "parent": None, "created": ""}), encoding="utf-8")
+        recs = S.load_records(ns)
+        self.assertEqual(recs["OLD"].seed_census, {},
+                         "an absent census must read as absent, never as a measured zero")
+
+
 # ⚠ THIS ENTRY POINT MUST STAY AT THE END OF THE FILE, AND IT USED TO SIT IN THE MIDDLE.
 # ``unittest.main()`` runs at the point it is reached during module execution, so every class defined
 # BELOW it was never registered when the file was run as a script: `python3 test_sweep.py` reported

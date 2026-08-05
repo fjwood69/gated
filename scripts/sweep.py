@@ -512,6 +512,72 @@ def expand(term: str) -> set[str]:
     return ({" ".join(parts), "".join(parts)} | {h.join(parts) for h in _HYPHENS}) - {term}
 
 
+def seed_census(seed: str, units: list[tuple[str, str, str]]) -> dict:
+    """EVERY UNIT THE SEED OCCURS IN — the ADJUDICATION'S INPUT, recorded BEFORE anything narrows it.
+
+    ⚠ THIS EXISTS BECAUSE THE DESIGN RECORDS THE OUTCOME OF AN ADJUDICATION AND NEVER THE
+    ADJUDICATION. Claim-span seeding asks which carrier holds the claim, and that answer is a
+    JUDGEMENT. MEASURED on the 2026-08-04 incident: ``no egress`` is ordinary vocabulary in a project
+    about network isolation, and SEVEN OF THE EIGHT locations using the phrase were HOMONYMS — they
+    meant ``--network=none``, not the withdrawn compound ``count == 0 ⇒ no egress``. A record that
+    stores the chosen carrier and nothing else has replaced an ENUMERATION with an UNRECORDED
+    JUDGEMENT — which is this tool's founding failure (a sweep that searches what its author
+    remembers) one level down, inside the command whose docstring claims to make the registry honest.
+
+    ⚠ IT COUNTS, IT NEVER CHOOSES (R5). No threshold, no ranking, no filter: every unit holding the
+    seed is listed. WHICH of them were actually used is recorded SEPARATELY, by the caller, from the
+    loop's own behaviour — so the census and the run can DISAGREE VISIBLY. Fusing the two would be the
+    adjudication wearing the instrument's clothes, and a census that also decided could never
+    contradict the decision.
+
+    ⚠ AND IT IS COMPUTED ON THE SAME UNIT INDEX THE RUN USES, from the same snapshot. A census built
+    by a second enumeration would be measuring a different population from the one seeded, and any
+    disagreement would then be attributable to the instrument rather than to the judgement — which is
+    exactly the confound that made the first ARM-1 grid unreadable.
+
+    An uncompilable seed yields ``error`` set and an empty population. It is reported rather than
+    raised, because the caller decides what an instrument condition costs; this function only counts.
+    """
+    out: dict = {"seed": seed, "unit_total": len(units), "units_holding": [],
+                 "surfaces": [], "occurrences_total": 0, "error": None}
+    try:
+        pat = compile_pattern(seed)
+    except ValueError as exc:
+        out["error"] = f"seed does not compile to a pattern: {exc}"
+        return out
+    for uid, sname, utext in units:
+        n = len(pat.findall(normalise(utext)))
+        if n:
+            out["units_holding"].append({"unit": uid, "surface": sname, "occurrences": n})
+    out["surfaces"] = sorted({h["surface"] for h in out["units_holding"]})
+    out["occurrences_total"] = sum(h["occurrences"] for h in out["units_holding"])
+    return out
+
+
+def census_adjudication(census: dict, seeded: Iterable[str], *,
+                        carriers_named: Iterable[str] = (), basis: str) -> dict:
+    """What was DONE with the census — kept separate from the census itself, and PURE so it can be
+    tested on inputs that DISAGREE.
+
+    ⚠ THE SEPARATION IS THE POINT. ``seeded`` is measured by the caller from the run's own behaviour,
+    never copied from the census, so the two can contradict each other and the record will say so.
+    Inlining this as a set difference over a variable derived from the census would make the
+    contradiction UNREPRESENTABLE — the record would agree with itself by construction, which is the
+    property a self-check must not have.
+
+    ⚠ AND IT IS A FUNCTION SO THE DISAGREEMENT PATH CAN BE EXERCISED AT ALL. In the current build the
+    census and round 1 search the same seed over the same units, so they agree BY CONSTRUCTION and no
+    end-to-end test can distinguish a measurement from a copy. Extracting the reconciliation is what
+    makes the difference testable today rather than a claim waiting for ``--carrier`` to arrive.
+    """
+    held_units = {h["unit"] for h in census["units_holding"]}
+    seeded = list(seeded)
+    return {"carriers_named": list(carriers_named),
+            "seeded": sorted(seeded),
+            "adjudicated_out": sorted(held_units - set(seeded)),
+            "basis": basis}
+
+
 # ── registry (R3, R4, R13) ────────────────────────────────────────────────────────────────────────
 @dataclass
 class Record:
@@ -531,6 +597,11 @@ class Record:
     rounds: list[dict] = field(default_factory=list)      # [{round, carriers, promoted, unpromoted}]
     candidates: dict = field(default_factory=dict)        # canonical -> provenance + both DF legs
     at_fixpoint: bool = False
+    # ⚠ THE SEED CENSUS AND THE ADJUDICATION OVER IT — the population the seeding decision was made
+    # FROM, not merely the decision's outcome. Defaulted like every other added field so an older
+    # record still loads; a record written before this field existed carries {} and says so, which is
+    # honest, rather than an empty census implying a measured zero.
+    seed_census: dict = field(default_factory=dict)
 
     @property
     def is_open(self) -> bool:
@@ -945,6 +1016,11 @@ def harvest(args) -> int:
             for uid, utext in carrier_units(loc, normalise(body)):
                 units.append((uid, surf.name, utext))
 
+    # ── THE SEED CENSUS (P1-1). Computed on the unit index above, BEFORE the loop reaches anything,
+    # so it records the population the seeding decision was made FROM rather than the decision's
+    # outcome. See ``seed_census`` for why the design's ``--carrier`` needs this to exist.
+    census = seed_census(args.seed, units)
+
     # ── THE FIXPOINT LOOP (R3). Add-only over a fixed snapshot ⇒ the reached set is monotone and
     # bounded by the corpus, so it terminates in at most |units| rounds and CANNOT oscillate.
     # ⚠ THERE IS NO --anchor FLAG, AND ITS ABSENCE IS THE RULING. The design states that ANCHORS ARE
@@ -960,6 +1036,11 @@ def harvest(args) -> int:
     rounds: list[dict] = []
     candidates: dict[str, dict] = {}
     rnd = 0
+    # ⚠ MEASURED FROM THE LOOP, NEVER ASSERTED FROM THE CENSUS. Round 1 searches the seed and nothing
+    # else, so the units it reaches ARE the seeded population — and taking that value from the loop
+    # rather than copying the census lets the two DISAGREE. If they ever do, the record says so
+    # instead of quietly agreeing with itself, which is the only way a self-check earns its keep.
+    seeded_units: list[str] = []
     while True:
         rnd += 1
         compiled = []
@@ -982,6 +1063,8 @@ def harvest(args) -> int:
         if not new_units:
             rounds.append({"round": rnd, "new_carriers": 0, "promoted": 0, "held": len(held)})
             break
+        if rnd == 1:
+            seeded_units = sorted(new_units)
         reached.update(new_units)
 
         # EXTRACT from every reached carrier, then EXPAND every candidate and every held term.
@@ -1030,6 +1113,19 @@ def harvest(args) -> int:
             continue
         d["corpus_df"] = sum(1 for _, _, u in units if cpat.search(u))
 
+    # ── THE ADJUDICATION OVER THE CENSUS, RECORDED SEPARATELY FROM IT (R5).
+    # ⚠ THIS BUILD NAMES NO CARRIER AND THEREFORE ADJUDICATES NOTHING — every unit holding the seed
+    # is seeded. That is not a placeholder: it is the honest state of a tool whose ``--carrier`` does
+    # not exist yet, and writing it down now is what makes the flag's arrival a RECORDED narrowing
+    # rather than a silent one. When ``--carrier`` lands it fills ``carriers_named`` and moves the
+    # difference into ``adjudicated_out`` WITH A REASON PER UNIT.
+    # ⚠ ``seeded_units`` COMES FROM THE LOOP. In this build a non-empty ``adjudicated_out`` therefore
+    # means the census and round 1 DISAGREE about where the seed occurs — an INSTRUMENT finding, and
+    # printed as one below, never quietly reported as a narrowing.
+    census["adjudication"] = census_adjudication(
+        census, seeded_units,
+        basis="no carrier adjudication in this build — every unit holding the seed was seeded")
+
     where = {sname for uid, sname, _ in units if uid in reached}
     rec = Record(
         id=args.id, seed=args.seed,
@@ -1040,7 +1136,7 @@ def harvest(args) -> int:
         surfaces_at_withdrawal=sorted(where),
         expected_counts={s.name: s.item_count for s in surfaces},
         parent=args.parent, created=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        rounds=rounds, candidates=candidates, at_fixpoint=True)
+        rounds=rounds, candidates=candidates, at_fixpoint=True, seed_census=census)
     variants = {v: occurrences.get(canonical(v), 0) for v in rec.variants}
 
     rd = NAMESPACE / "records"
@@ -1077,8 +1173,52 @@ def harvest(args) -> int:
                   for d in ranked) + "\n", encoding="utf-8")
     manifest_add(NAMESPACE, crel)
 
+    # R6/R12/R13 — the census SPILLS IN FULL to a manifested file. The printed view is bounded; what
+    # is recorded is not. A census that printed a top-N and kept nothing else would reproduce the
+    # silent cutoff it exists to expose.
+    seeded_set = set(census["adjudication"]["seeded"])
+    out_set = set(census["adjudication"]["adjudicated_out"])
+    srel = f"census/{rec.id}.tsv"
+    (NAMESPACE / "census").mkdir(parents=True, exist_ok=True)
+    (NAMESPACE / srel).write_text(
+        "occurrences\tseeded\tadjudicated_out\tsurface\tunit\n" +
+        "\n".join(f"{h['occurrences']}\t{h['unit'] in seeded_set}\t{h['unit'] in out_set}\t"
+                  f"{h['surface']}\t{h['unit']}"
+                  for h in sorted(census["units_holding"],
+                                  key=lambda h: (-h["occurrences"], h["surface"], h["unit"]))) + "\n",
+        encoding="utf-8")
+    manifest_add(NAMESPACE, srel)
+
     print(f"HARVESTED {rec.id}")
     print(f"  seed            : {rec.seed!r}")
+    # ── THE SEED CENSUS, PRINTED. The design records which carrier was chosen; this records what
+    # there was to choose FROM, which is the half a later reader cannot reconstruct.
+    if census["error"]:
+        print(f"  ⚠ SEED CENSUS   : NOT COMPUTED — {census['error']}")
+        print( "    The record below was built without one. Nothing downstream should be read as")
+        print( "    evidence about where the seed occurs.")
+    else:
+        print(f"  seed census     : {census['occurrences_total']} occurrences in "
+              f"{len(census['units_holding'])} of {census['unit_total']} carrier units, "
+              f"on {len(census['surfaces'])} surface(s): {', '.join(census['surfaces']) or 'NONE'}")
+        print(f"    seeded {len(seeded_set)}  ·  adjudicated out {len(out_set)}  ·  "
+              f"carriers named: {', '.join(census['adjudication']['carriers_named']) or 'NONE'}")
+        print(f"    {census['adjudication']['basis']}")
+        if out_set:
+            # See the ``adjudicated_out`` comment: in this build a non-empty set is the census and
+            # the loop disagreeing, which is an instrument finding, not a narrowing.
+            print( "    ⚠ INSTRUMENT DISAGREEMENT — the census found the seed in units round 1 did")
+            print( "      not reach. This build adjudicates nothing, so the two must agree:")
+            for uid in sorted(out_set)[:8]:
+                print(f"        {uid}")
+        for h in sorted(census["units_holding"],
+                        key=lambda h: (-h["occurrences"], h["surface"], h["unit"]))[:8]:
+            print(f"      x{h['occurrences']:<3} {h['surface'][:10]:<10} {h['unit'][:78]}")
+        if len(census["units_holding"]) > 8:
+            print(f"      … {len(census['units_holding']) - 8} more in {srel} — NOT truncated, SPILLED")
+        print( "    ⚠ THESE ARE OCCURRENCES, NOT CARRIERS OF THE CLAIM. Whether a unit ASSERTS the")
+        print( "      withdrawn claim or merely uses the same words is a JUDGEMENT this tool does not")
+        print( "      make (R5). MEASURED on the founding incident: 7 of 8 were homonyms.")
     print(f"  carrier units   : {len(reached)} reached, of {len(units)} in the corpus")
     print(f"  rounds          : {len(rounds)}  "
           + " · ".join(f"r{r['round']}:+{r['new_carriers']}c/+{r['promoted']}p" for r in rounds))
