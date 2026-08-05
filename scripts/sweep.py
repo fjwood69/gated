@@ -344,6 +344,38 @@ def enumerate_board(name: str, base_url: str, timeout: int = 30) -> SurfaceResul
 # not tolerate `>` would treat a 400-line design as ONE unit and harvest its entire vocabulary.
 _HEADING = re.compile(r"^[ \t]*(?:>[ \t]*)*#{1,6}[ \t]+\S", re.MULTILINE)
 
+# ⚠ AND A HEADING MARK INSIDE A FENCED BLOCK IS NOT A HEADING. `_HEADING` matches any line whose
+# first non-whitespace (modulo `>` prefixes) is 1-6 `#` plus a space — WHICH INCLUDES A SHELL OR
+# PYTHON COMMENT INSIDE A FENCE, markdown-in-markdown samples, and quoted code via the blockquote
+# tolerance. MEASURED on the 2026-08-05 corpus: 245 such marks across 33 of 492 locations (6.7%).
+#
+# ⚠ WHY IT BECAME LOAD-BEARING ONLY NOW. Under the deleted fixpoint loop a mis-split barely
+# mattered — the flood crossed every boundary anyway. Under claim-span seeding THE UNIT *IS* THE
+# CANDIDATE SET, so a `# comment` inside a fence ABOVE the claim CUTS THE UNIT SHORT, extraction
+# loses the claim's trailing vocabulary, and `variants` SILENTLY NARROWS. Worse: EDITING A CODE
+# SAMPLE would then change harvest output — and the founding failure was a design document UNDER
+# ACTIVE EDIT, so that instability class is the live one.
+#
+# ⚠ THE ABLATION CANNOT BE CITED AGAINST THIS. Both of its arms shared `_HEADING`, so it measured
+# GRANULARITY (block vs unit), never PARSE CORRECTNESS.
+_FENCE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})", re.MULTILINE)
+
+
+def _fenced_spans(text: str) -> list[tuple[int, int]]:
+    """Fence-delimited regions, as (start, end) offsets.
+
+    ⚠ AN UNCLOSED FENCE EXTENDS TO END OF TEXT, AND THE DIRECTION IS DELIBERATE. Suppressing splits
+    after an unterminated fence yields FEWER, LARGER units — more vocabulary harvested, which is
+    noise the tool already tolerates and prints. Ignoring it instead would let splits happen INSIDE
+    what is probably a fence, which TRUNCATES a unit silently. Truncation is the dangerous direction
+    under claim-span seeding, so the fail-safe is to over-include.
+    """
+    marks = [m.start() for m in _FENCE.finditer(text)]
+    spans = [(marks[i], marks[i + 1]) for i in range(0, len(marks) - 1, 2)]
+    if len(marks) % 2:                      # unterminated fence
+        spans.append((marks[-1], len(text)))
+    return spans
+
 # Extraction classes. ⚠ ALL CASE-INSENSITIVE BY CONSTRUCTION, BECAUSE THE MATCHER IS. A
 # lowercase-only compound class was MEASURED to see nothing at all in a carrier that spells its terms
 # in capitals — and that was one of only three carriers the seed reached.
@@ -357,6 +389,8 @@ _C_QUOTED = re.compile(r"`([^`\n]{3,60})`")                                     
 # MEASURED reason, not a preference: expansion mints the space form without it (see EXPANSION).
 
 _HYPHENS = ("-", "‐", "‑")
+# Eligibility for orthographic expansion: word-shaped parts only (see ``expand``).
+_ORTHO_PART = re.compile(r"^\w+$", re.UNICODE)
 
 # ⚠ THE PROMOTION RULE, AND THE MEASUREMENT THAT SET IT. ITS JUSTIFICATION LIVES HERE, AT THE VALUE.
 #
@@ -404,7 +438,9 @@ def carrier_units(location: str, text: str) -> list[tuple[str, str]]:
 
     A board value has no headings and is returned whole, which is its structure.
     """
-    marks = [m.start() for m in _HEADING.finditer(text)]
+    fenced = _fenced_spans(text)
+    marks = [m.start() for m in _HEADING.finditer(text)
+             if not any(a <= m.start() < b for a, b in fenced)]
     if not marks:
         return [(location, text)]
     bounds = ([0] if marks[0] > 0 else []) + marks + [len(text)]
@@ -454,6 +490,24 @@ def expand(term: str) -> set[str]:
     """
     parts = [p for p in re.split(r"[-‐‑\s]+", normalise(term).strip()) if p]
     if len(parts) < 2:
+        return set()
+    # ⚠ ELIGIBILITY FOR THE ORTHOGRAPHIC AXIS — A DOMAIN PRECONDITION, NOT A NEW EXPANSION CLASS.
+    # This does NOT amend the scope pinned above: it adds no axis, folds no case, pluralises and
+    # stems nothing. It answers a different question — WHICH INPUTS ARE ELIGIBLE for the axis that
+    # was already ruled — so the orthographic transform only runs where the parts are orthographic
+    # parts. Widening was forbidden because it turns a fix into a redesign; THIS NARROWS
+    # APPLICATION OF THE SAME TRANSFORM, which is the opposite failure mode.
+    #
+    # ⚠ AND IT CLOSES A PATH THAT ALREADY FIRES, NOT A FUTURE ONE. ``_C_QUOTED`` extracts backticked
+    # spans, so ``count == 0 => no egress`` is a live candidate TODAY, and expansion turned it into
+    # ``count-==-0-=>-no-egress``. That string is already sitting in a persisted 2026-08-04 run
+    # transcript. Joining operators with hyphens produces a pattern that can match nothing and
+    # occupies the variant set as noise.
+    #
+    # THE CRITERION IS STRUCTURAL AND STAYS THAT WAY: every part must be word-shaped, i.e. drawn
+    # from the same alphabet the hyphen/space family joins. It is NEVER a semantic judgement about
+    # whether something "is a claim" — that would be adjudication, which R5 forbids.
+    if not all(_ORTHO_PART.match(part) for part in parts):
         return set()
     return ({" ".join(parts), "".join(parts)} | {h.join(parts) for h in _HYPHENS}) - {term}
 
