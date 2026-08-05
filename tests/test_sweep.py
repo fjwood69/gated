@@ -449,6 +449,30 @@ class OrthographicExpansion(unittest.TestCase):
         for t in ("no egress", "false-pass"):
             self.assertNotIn(t, S.expand(t))
 
+    def test_operator_compounds_are_INELIGIBLE_for_the_orthographic_axis(self):
+        """⚠ A PATH THAT ALREADY FIRED, NOT A FUTURE ONE. ``_C_QUOTED`` extracts backticked spans, so
+        ``count == 0 => no egress`` is a live candidate TODAY — and expansion turned it into
+        ``count-==-0-=>-no-egress``, a string already sitting in a persisted 2026-08-04 transcript.
+
+        This is a DOMAIN PRECONDITION, not a new expansion class: no axis added, no case folded,
+        nothing pluralised or stemmed. It NARROWS application of the same ruled transform.
+        """
+        self.assertEqual(S.expand("count == 0"), set())
+        self.assertEqual(S.expand("count == 0 => no egress"), set())
+
+    def test_the_gate_leaves_ordinary_orthographic_terms_UNCHANGED(self):
+        """⚠ THE CORRELATED NEGATIVE. Without it the test above passes on a gate that refuses
+        everything, which would silently delete the mechanism it is meant to protect."""
+        self.assertIn("no-egress", S.expand("no egress"))
+        self.assertIn("false pass", S.expand("false-pass"))
+        self.assertIn("false PASSES", S.expand("false-PASSES"),
+                      "the criterion is STRUCTURAL, so mixed case must survive it")
+
+    def test_the_criterion_is_structural_not_semantic(self):
+        """It asks 'are the parts word-shaped', never 'is this a claim'. A meaningless but
+        word-shaped term must still expand, or the gate has become adjudication (R5)."""
+        self.assertIn("a-b", S.expand("a b"))
+
     def test_scope_is_ORTHOGRAPHIC_ONLY(self):
         """⚠ THE RULED DEFECT WAS ONE-WAYNESS, NOT NARROWNESS. Case folding, pluralisation and
         stemming are DIFFERENT AXES, each needing its own justification. Widening beyond the ruling

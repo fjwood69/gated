@@ -389,6 +389,8 @@ _C_QUOTED = re.compile(r"`([^`\n]{3,60})`")                                     
 # MEASURED reason, not a preference: expansion mints the space form without it (see EXPANSION).
 
 _HYPHENS = ("-", "‐", "‑")
+# Eligibility for orthographic expansion: word-shaped parts only (see ``expand``).
+_ORTHO_PART = re.compile(r"^\w+$", re.UNICODE)
 
 # ⚠ THE PROMOTION RULE, AND THE MEASUREMENT THAT SET IT. ITS JUSTIFICATION LIVES HERE, AT THE VALUE.
 #
@@ -488,6 +490,24 @@ def expand(term: str) -> set[str]:
     """
     parts = [p for p in re.split(r"[-‐‑\s]+", normalise(term).strip()) if p]
     if len(parts) < 2:
+        return set()
+    # ⚠ ELIGIBILITY FOR THE ORTHOGRAPHIC AXIS — A DOMAIN PRECONDITION, NOT A NEW EXPANSION CLASS.
+    # This does NOT amend the scope pinned above: it adds no axis, folds no case, pluralises and
+    # stems nothing. It answers a different question — WHICH INPUTS ARE ELIGIBLE for the axis that
+    # was already ruled — so the orthographic transform only runs where the parts are orthographic
+    # parts. Widening was forbidden because it turns a fix into a redesign; THIS NARROWS
+    # APPLICATION OF THE SAME TRANSFORM, which is the opposite failure mode.
+    #
+    # ⚠ AND IT CLOSES A PATH THAT ALREADY FIRES, NOT A FUTURE ONE. ``_C_QUOTED`` extracts backticked
+    # spans, so ``count == 0 => no egress`` is a live candidate TODAY, and expansion turned it into
+    # ``count-==-0-=>-no-egress``. That string is already sitting in a persisted 2026-08-04 run
+    # transcript. Joining operators with hyphens produces a pattern that can match nothing and
+    # occupies the variant set as noise.
+    #
+    # THE CRITERION IS STRUCTURAL AND STAYS THAT WAY: every part must be word-shaped, i.e. drawn
+    # from the same alphabet the hyphen/space family joins. It is NEVER a semantic judgement about
+    # whether something "is a claim" — that would be adjudication, which R5 forbids.
+    if not all(_ORTHO_PART.match(part) for part in parts):
         return set()
     return ({" ".join(parts), "".join(parts)} | {h.join(parts) for h in _HYPHENS}) - {term}
 
