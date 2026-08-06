@@ -22,3 +22,16 @@ dist/
 # sweep: the artefact store and the real config never enter a PUBLIC repo (see scripts/sweep.py)
 scripts/sweep-registry/
 scripts/sweep.config.json
+
+# ── REPO HYGIENE. Enforced by the `hygiene` job in .github/workflows/ci.yml.
+# ⚠ THESE RULES USED TO LIVE ONLY IN .git/info/exclude, WHICH IS LOCAL AND NEVER COMMITTED — so a
+# fresh clone, a second machine and CI itself were all unprotected, and the protection existed only
+# on the one workstation that happened to have run the indexer. Measured 2026-08-06 across gated,
+# gated-uat and mori: all three, same gap.
+# ⚠ AND THIS FILE IS THE GUARD, NOT THE ENFORCEMENT. .gitignore stops an ACCIDENT; it does not
+# detect an artefact that is ALREADY tracked, and `git add -f` walks straight past it. The CI job
+# therefore asserts on `git ls-files` — on what IS tracked — and checks this file separately.
+.gitnexus/
+node_modules/
+.env
+.secrets
