@@ -37,6 +37,15 @@ EXIT_INSTRUMENT = 1   # control failed · surface missing · count dropped · un
 EXIT_TOMBSTONE = 2    # a correction was re-worded — STILL PRINTS EVERY HIT (R8)
 EXIT_HITS = 3         # live hits, read them
 EXIT_DEBT = 4         # a record is open (zero tombstones)
+EXIT_SEED = 5         # the SEED the caller supplied cannot be searched with (R16)
+# ⚠ R16 — WHY THE BROKEN SEED GETS ITS OWN STRATUM RATHER THAN REUSING EXIT_INSTRUMENT.
+# Every other code above names a failure of the CORPUS or the CHANNEL: a surface vanished, a fetch
+# truncated, a control did not travel, a file appeared unmanifested. A seed that will not compile is
+# none of those — it is a CALLER-INPUT failure, and the whole point of stratifying exits is that
+# DIFFERENT CAUSES GET DIFFERENT REMEDIATIONS. An operator who sees "instrument failure" goes and
+# checks the corpus, the board endpoint and the glob roots; the thing actually wrong is the string
+# they typed. Folding this into code 1 would send every future reader to the wrong place, which is
+# the same defect R4a exists to prevent one level in.
 
 CONFIG_PATH = Path(__file__).resolve().parent / "sweep.config.json"
 # ⚠ NOT COMMITTED. gated is PUBLIC and the real config names a private board endpoint and
@@ -513,7 +522,13 @@ def expand(term: str) -> set[str]:
 
 
 def seed_census(seed: str, units: list[tuple[str, str, str]]) -> dict:
-    """EVERY UNIT THE SEED OCCURS IN — the ADJUDICATION'S INPUT, recorded BEFORE anything narrows it.
+    """EVERY SEARCHED UNIT THE SEED OCCURS IN — the ADJUDICATION'S INPUT, recorded BEFORE anything
+    narrows it.
+
+    ⚠ "SEARCHED" IS NOT A HEDGE, IT IS THE SCOPE. The unit index this is handed EXCLUDES the tool's
+    own namespace (see ``harvest``), and until this line was written that exclusion was documented
+    only against EXTRACTION — so a docstring saying "every unit" described a population the caller
+    does not supply. Doc-vs-code drift inside the tool whose entire subject is doc-vs-code drift.
 
     ⚠ THIS EXISTS BECAUSE THE DESIGN RECORDS THE OUTCOME OF AN ADJUDICATION AND NEVER THE
     ADJUDICATION. Claim-span seeding asks which carrier holds the claim, and that answer is a
@@ -897,6 +912,25 @@ def sweep(args) -> int:
             L.append(f"⚠ SURFACE DRIFT {rid}: recorded but not swept now: {sorted(drift)}")
     if open_records:
         L.append(f"OPEN RECORDS  {', '.join(open_records)}   <-- process debt (exit {EXIT_DEBT})")
+    # ── ZERO-SEED — RULED 2026-08-06. A STANDING OBSERVABLE, AND NEVER AN EXIT CODE (R5).
+    # ⚠ SHIPPING PERMISSIVE BEHAVIOUR *IS* A RULING. This was previously left unstated on the
+    # grounds that it belonged to a separate item, which is false comfort: THE BUILD RULES EVERY
+    # TIME IT RUNS. The ruling is PERMIT — a seed matching nothing today is the tripwire case, and
+    # ``expand`` already keeps zero-hit forms for exactly that reason, so refusing here would
+    # contradict this file's own position.
+    # ⚠ BUT PERMITTING LEAVES A TYPO AND A DELIBERATE TRIPWIRE INDISTINGUISHABLE AFTER HARVEST, and
+    # the difference is invisible precisely because both produce silence. So the tool prints the
+    # question it cannot answer, which is R5's whole posture: the observable is reported, the
+    # judgement is the reader's. NOT to be confused with R15d, which REFUSES a zero inside a named
+    # ``--carrier`` — there the caller asserted a location, so the zero refutes an assertion instead
+    # of guarding a future one.
+    # ⚠ ``is None``, NEVER a falsy test: a record written before the census existed carries {}, and
+    # an ABSENT census must not be reported as a MEASURED zero.
+    for rid in selected:
+        sc = records[rid].seed_census
+        if sc.get("error") is None and sc.get("occurrences_total") == 0:
+            L.append(f"ZERO-SEED {rid}: seed {records[rid].seed!r} matched nothing at harvest "
+                     f"— tripwire, or typo? (observable only; this does not affect the exit code)")
     L.append("")
 
     if instrument_errors:
@@ -1019,7 +1053,44 @@ def harvest(args) -> int:
     # ── THE SEED CENSUS (P1-1). Computed on the unit index above, BEFORE the loop reaches anything,
     # so it records the population the seeding decision was made FROM rather than the decision's
     # outcome. See ``seed_census`` for why the design's ``--carrier`` needs this to exist.
+    #
+    # ⚠ DEFERRED TEST GAP, RECORDED RATHER THAN CLAIMED CLOSED. Moving this call BELOW the fixpoint
+    # loop SURVIVES THE WHOLE SUITE — ``units`` is not mutated by the loop, so every output is
+    # byte-identical. The ordering is therefore load-bearing in INTENT and inert in BEHAVIOUR today.
+    # It stops being inert the day ``--carrier`` narrows the seeded population, because then the
+    # census must describe what existed BEFORE the narrowing. NO TEST PINS THIS YET; the test that
+    # can arrives with the flag. Found by dissent, not by the red-proof, and written here rather
+    # than left to memory — a surviving mutant is a test gap or a bad mutant, and this one is a gap
+    # whose CONSEQUENCE IS DEFERRED, NOT ABSENT.
     census = seed_census(args.seed, units)
+
+    # ── R16 — AN UNSEARCHABLE SEED IS A REFUSAL. RULED 2026-08-06.
+    # ⚠ THE RECORD IT WOULD HAVE WRITTEN IS A FALSE INSTRUMENT, WHICH IS WORSE THAN AN EMPTY ONE.
+    # `variants` falls back to ``[args.seed]``, and every later sweep compiles the variants inside a
+    # ``try/except ValueError: continue`` — so the pattern NEVER RUNS, no observable says so, and the
+    # record SWEEPS CLEAN FOR EVER. A dead tripwire registered as a live one, in the tool whose whole
+    # subject is claims that stop being checked without anyone noticing.
+    #
+    # ⚠ THREE ZERO-SHAPED CASES, THREE DIFFERENT ACTS. Collapsing them is the error this ruling was
+    # split to avoid:
+    #   (1) UNSEARCHABLE SEED          → REFUSE (here). The pattern CAN NEVER FIRE.
+    #   (2) CORPUS-WIDE ZERO, bare harvest → PERMIT, with the ZERO-SEED observable on every later
+    #       sweep. The pattern DOES NOT FIRE YET, which is the tripwire case ``expand`` already
+    #       rules for: "a form matching nothing today is a TRIPWIRE for the carrier written
+    #       tomorrow". Refusing it would contradict a ruling this same file carries.
+    #   (3) ZERO INSIDE A NAMED ``--carrier`` (R15d) → REFUSE. The caller ASSERTED A LOCATION and it
+    #       is empty, so the zero refutes an assertion rather than guarding a future one.
+    # (2) and (3) look identical in the number and are opposite in the ACT. (3) is not built here;
+    # it arrives with ``--carrier``.
+    if census["error"]:
+        print("⚠ SEED FAILURE — the seed cannot be compiled into a pattern. NOTHING WAS WRITTEN.")
+        print(f"    {census['error']}")
+        print("  A record written now would carry this seed as its only variant, and every sweep")
+        print("  compiles variants inside `except ValueError: continue` — so the pattern would")
+        print("  NEVER RUN and the record would report CLEAN for ever, with no observable saying")
+        print("  the search did not happen. A dead tripwire registered as a live one.")
+        print(f"  This is exit {EXIT_SEED}, NOT the instrument code: the corpus is fine, the seed is not.")
+        return EXIT_SEED
 
     # ── THE FIXPOINT LOOP (R3). Add-only over a fixed snapshot ⇒ the reached set is monotone and
     # bounded by the corpus, so it terminates in at most |units| rounds and CANNOT oscillate.
@@ -1178,14 +1249,22 @@ def harvest(args) -> int:
     # silent cutoff it exists to expose.
     seeded_set = set(census["adjudication"]["seeded"])
     out_set = set(census["adjudication"]["adjudicated_out"])
+    named = census["adjudication"]["carriers_named"]
+    # ⚠ ORDERED BY LOCATION, NOT BY FREQUENCY, AND THE FILE ALREADY RULED THIS ABOUT ITSELF. ``sweep``
+    # sorts unknown-disposition FIRST because "leading with a suspected-live class primes confirmation
+    # over reading" — and an occurrence-ranked census primes by FREQUENCY, which on the founding
+    # incident points the wrong way: `no egress` was ordinary project vocabulary and 7 of its 8
+    # locations were HOMONYMS, so frequency plausibly ANTI-correlates with carrier-hood. The
+    # SINGLE-OCCURRENCE unit is where a forgotten carrier lives BY DEFINITION, and ranking sank it
+    # into the unprinted tail. Occurrence-ascending would be the opposite unjustified ranking; the
+    # answer is to present the POPULATION and let the occurrence column speak.
+    census_rows = sorted(census["units_holding"], key=lambda h: (h["surface"], h["unit"]))
     srel = f"census/{rec.id}.tsv"
     (NAMESPACE / "census").mkdir(parents=True, exist_ok=True)
     (NAMESPACE / srel).write_text(
         "occurrences\tseeded\tadjudicated_out\tsurface\tunit\n" +
         "\n".join(f"{h['occurrences']}\t{h['unit'] in seeded_set}\t{h['unit'] in out_set}\t"
-                  f"{h['surface']}\t{h['unit']}"
-                  for h in sorted(census["units_holding"],
-                                  key=lambda h: (-h["occurrences"], h["surface"], h["unit"]))) + "\n",
+                  f"{h['surface']}\t{h['unit']}" for h in census_rows) + "\n",
         encoding="utf-8")
     manifest_add(NAMESPACE, srel)
 
@@ -1202,20 +1281,31 @@ def harvest(args) -> int:
               f"{len(census['units_holding'])} of {census['unit_total']} carrier units, "
               f"on {len(census['surfaces'])} surface(s): {', '.join(census['surfaces']) or 'NONE'}")
         print(f"    seeded {len(seeded_set)}  ·  adjudicated out {len(out_set)}  ·  "
-              f"carriers named: {', '.join(census['adjudication']['carriers_named']) or 'NONE'}")
+              f"carriers named: {', '.join(named) or 'NONE'}")
         print(f"    {census['adjudication']['basis']}")
-        if out_set:
-            # See the ``adjudicated_out`` comment: in this build a non-empty set is the census and
-            # the loop disagreeing, which is an instrument finding, not a narrowing.
+        # ⚠ WHICH OF THE TWO THIS IS, IS DECIDED BY THE CODE AND NOT BY WHOEVER EDITS IT NEXT.
+        # A non-empty ``adjudicated_out`` means one of two OPPOSITE things, and the earlier version
+        # of this block asserted in PROSE that it could only ever mean the first: "this build
+        # adjudicates nothing, so the two must agree". That sentence goes FALSE the day ``--carrier``
+        # lands, and nothing would have failed to say so. Keying on ``carriers_named`` makes the
+        # distinction structural, which is this project's standing preference — mechanism over
+        # intent, because prose describing a behaviour the code has outgrown is the dangerous
+        # direction and this tool exists to find exactly that.
+        if out_set and not named:
             print( "    ⚠ INSTRUMENT DISAGREEMENT — the census found the seed in units round 1 did")
-            print( "      not reach. This build adjudicates nothing, so the two must agree:")
+            print( "      not reach, and NO CARRIER WAS NAMED, so nothing narrowed the population.")
+            print( "      The two instruments disagree; this is NOT a recorded adjudication:")
             for uid in sorted(out_set)[:8]:
                 print(f"        {uid}")
-        for h in sorted(census["units_holding"],
-                        key=lambda h: (-h["occurrences"], h["surface"], h["unit"]))[:8]:
+        elif out_set:
+            print(f"    {len(out_set)} unit(s) held the seed and were ADJUDICATED OUT by the named")
+            print( "      carrier(s) above. This is the narrowing, RECORDED rather than silent:")
+            for uid in sorted(out_set)[:8]:
+                print(f"        {uid}")
+        for h in census_rows[:8]:
             print(f"      x{h['occurrences']:<3} {h['surface'][:10]:<10} {h['unit'][:78]}")
-        if len(census["units_holding"]) > 8:
-            print(f"      … {len(census['units_holding']) - 8} more in {srel} — NOT truncated, SPILLED")
+        if len(census_rows) > 8:
+            print(f"      … {len(census_rows) - 8} more in {srel} — NOT truncated, SPILLED")
         print( "    ⚠ THESE ARE OCCURRENCES, NOT CARRIERS OF THE CLAIM. Whether a unit ASSERTS the")
         print( "      withdrawn claim or merely uses the same words is a JUDGEMENT this tool does not")
         print( "      make (R5). MEASURED on the founding incident: 7 of 8 were homonyms.")

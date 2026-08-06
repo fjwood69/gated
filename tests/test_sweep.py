@@ -756,6 +756,8 @@ class SeedCensus(unittest.TestCase):
 
     # ── the WIRING. Behaviour and wiring are two claims (the SharedInstrumentGate lesson). ────────
     def _run_harvest(self, seed, items):
+        import contextlib
+        import io
         import tempfile
         from types import SimpleNamespace
         from unittest import mock
@@ -765,32 +767,157 @@ class SeedCensus(unittest.TestCase):
                                [(loc, f"{body}\n{token}\n") for loc, body in items])
         ns = Path(tempfile.mkdtemp())
         args = SimpleNamespace(id="NEW", seed=seed, anchor=None, parent=None)
+        out = io.StringIO()
         with mock.patch.object(S, "load_config", return_value=cfg), \
              mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
-             mock.patch.object(S, "NAMESPACE", ns):
+             mock.patch.object(S, "NAMESPACE", ns), contextlib.redirect_stdout(out):
             rc = S.harvest(args)
-        return rc, ns
+        return rc, ns, out.getvalue()
 
     def test_harvest_PERSISTS_the_census_onto_the_record(self):
-        rc, ns = self._run_harvest("no egress", [("docs/a.md", "the claim: no egress"),
-                                                 ("docs/b.md", "nothing to see")])
+        """⚠ THE CORPUS HERE CARRIES A HARD-WRAPPED OCCURRENCE ON PURPOSE. The census and round 1
+        agree BY CONSTRUCTION in this build, so this assertion can only ever fail if they diverge —
+        and the likeliest divergence is a PARSE one. A corpus of unwrapped one-liners would never
+        exercise it, which would make the agreement claim rest on the easiest possible input."""
+        rc, ns, _ = self._run_harvest("no egress", [("docs/a.md", "the claim: no egress"),
+                                                    ("docs/w.md", "and again no\negress here"),
+                                                    ("docs/b.md", "nothing to see")])
         self.assertEqual(rc, S.EXIT_DEBT)
         rec = json.loads((ns / "records" / "NEW.json").read_text(encoding="utf-8"))
         self.assertIn("seed_census", rec, "a census computed and not written down is not a record")
-        self.assertEqual([h["unit"] for h in rec["seed_census"]["units_holding"]], ["docs/a.md"])
+        self.assertEqual(sorted(h["unit"] for h in rec["seed_census"]["units_holding"]),
+                         ["docs/a.md", "docs/w.md"],
+                         "the hard-wrapped occurrence is an occurrence (R2)")
         self.assertEqual(rec["seed_census"]["adjudication"]["adjudicated_out"], [],
                          "this build adjudicates nothing, so the two instruments must agree")
 
     def test_harvest_SPILLS_the_census_to_a_MANIFESTED_file(self):
         """R6/R13 — spilled in full, and manifested, or the next run reports it as a stray and the
         tool fails its own instrument gate on a file it wrote itself."""
-        rc, ns = self._run_harvest("no egress", [("docs/a.md", "no egress")])
+        rc, ns, _ = self._run_harvest("no egress", [("docs/a.md", "no egress")])
         self.assertEqual(rc, S.EXIT_DEBT)
         self.assertTrue((ns / "census" / "NEW.tsv").exists(), "the full census must be persisted")
         self.assertIn("census/NEW.tsv",
                       json.loads((ns / "manifest.json").read_text(encoding="utf-8")))
         self.assertEqual(S.manifest_check(ns), [],
                          "harvest must not leave a file its own gate would call a stray")
+
+    # ── the PRINTED view. ⚠ ONE STDOUT ASSERTION, ON THE ONE PRINT THAT CARRIES A RULING. ────────
+    def test_the_OCCURRENCES_ARE_NOT_CARRIERS_warning_is_PRINTED(self):
+        """⚠ FOUND BY DISSENT AS A SURVIVING MUTANT CLASS: every display-only change passed a green
+        suite, including DELETING THIS WARNING — the one line doing R5's work at the census.
+
+        ⚠ AND IT IS DELIBERATELY THE *ONLY* STDOUT TEST. A general assertion over harvest's output
+        would pin formatting, which is not a ruling and would break on every cosmetic edit until
+        someone loosened it into uselessness. This line is different in kind: it is the only print
+        that carries a RULING — occurrences are not carriers, and whether a unit ASSERTS the claim
+        is a judgement R5 forbids the tool from making. The ordering ruling is pinned on the
+        PERSISTED TSV below, where it is an artefact rather than a layout.
+        """
+        _, _, out = self._run_harvest("no egress", [("docs/a.md", "no egress")])
+        self.assertIn("OCCURRENCES, NOT CARRIERS OF THE CLAIM", out)
+        self.assertIn("7 of 8 were homonyms", out,
+                      "the measurement is what makes the warning more than a disclaimer")
+
+    def test_the_spilled_census_is_ordered_by_LOCATION_not_by_frequency(self):
+        """⚠ THE FILE ALREADY RULED THIS ABOUT ITSELF. ``sweep`` sorts unknown-disposition FIRST
+        because "leading with a suspected-live class primes confirmation over reading" — and an
+        occurrence-ranked census primes by FREQUENCY, which on the founding incident points the
+        WRONG WAY: `no egress` was ordinary project vocabulary and 7 of its 8 locations were
+        HOMONYMS, so frequency plausibly ANTI-correlates with carrier-hood. The single-occurrence
+        unit is where a forgotten carrier lives by definition, and ranking sank it into the tail.
+
+        Asserted on the SPILLED FILE, which is the durable artefact; the printed view reads from the
+        same ordered list.
+        """
+        _, ns, _ = self._run_harvest("no egress", [
+            ("docs/zzz.md", "no egress no egress no egress"),   # most frequent, LAST by location
+            ("docs/aaa.md", "no egress")])                      # rarest, FIRST by location
+        rows = (ns / "census" / "NEW.tsv").read_text(encoding="utf-8").splitlines()[1:]
+        self.assertEqual([r.split("\t")[-1] for r in rows], ["docs/aaa.md", "docs/zzz.md"],
+                         "the RAREST unit must not be ranked below the most frequent one")
+        self.assertEqual(rows[0].split("\t")[0], "1",
+                         "the occurrence count is still REPORTED — the ruling is about order only")
+
+    # ── R16, RULED 2026-08-06. THREE ZERO-SHAPED CASES, TWO DIFFERENT ACTS. ──────────────────────
+    def test_an_UNSEARCHABLE_seed_REFUSES_and_WRITES_NOTHING(self):
+        """⚠ THE RECORD IT WOULD HAVE WRITTEN IS A FALSE INSTRUMENT, WORSE THAN AN EMPTY ONE.
+        `variants` falls back to [seed], and `sweep` compiles variants inside
+        `except ValueError: continue` — so the pattern NEVER RUNS, nothing says so, and the record
+        reports CLEAN for ever. A dead tripwire registered as a live one."""
+        rc, ns, out = self._run_harvest("   ", [("docs/a.md", "anything at all")])
+        self.assertEqual(rc, S.EXIT_SEED)
+        self.assertFalse((ns / "records" / "NEW.json").exists(),
+                         "a seed that can never fire must not be registered as a live pattern")
+        self.assertIn("SEED FAILURE", out)
+
+    def test_the_seed_refusal_has_its_OWN_stratum_not_the_instrument_code(self):
+        """⚠ DIFFERENT CAUSE, DIFFERENT REMEDIATION. Every other exit names a failure of the CORPUS
+        or the CHANNEL; this one names the caller's own input. An operator shown "instrument
+        failure" goes and checks surfaces, globs and the board endpoint — while the thing actually
+        wrong is the string they typed."""
+        codes = [S.EXIT_CLEAN, S.EXIT_INSTRUMENT, S.EXIT_TOMBSTONE, S.EXIT_HITS, S.EXIT_DEBT,
+                 S.EXIT_SEED]
+        self.assertEqual(len(set(codes)), 6, "a shared code sends the reader to the wrong place")
+        self.assertNotEqual(S.EXIT_SEED, S.EXIT_INSTRUMENT)
+
+    def test_a_CORPUS_WIDE_ZERO_seed_is_PERMITTED_and_still_registers(self):
+        """⚠ THE OPPOSITE ACT, AND THE CORRELATED CONTROL FOR THE REFUSAL ABOVE. A seed matching
+        nothing TODAY is the tripwire case — ``expand`` already keeps zero-hit forms for exactly
+        that reason, so refusing here would contradict a ruling this same file carries. Without
+        this test the refusal above passes on a harvest that rejects every empty result."""
+        rc, ns, _ = self._run_harvest("nowhere at all", [("docs/a.md", "unrelated prose")])
+        self.assertEqual(rc, S.EXIT_DEBT, "a searchable seed with zero hits still registers")
+        rec = json.loads((ns / "records" / "NEW.json").read_text(encoding="utf-8"))
+        self.assertIsNone(rec["seed_census"]["error"], "this is a MEASURED zero, not a failure")
+        self.assertEqual(rec["seed_census"]["occurrences_total"], 0)
+
+    def test_sweep_prints_ZERO_SEED_for_a_measured_zero(self):
+        """The typo-vs-tripwire gap: permitting leaves them indistinguishable after harvest, and
+        both produce silence. So the tool prints the question it cannot answer (R5)."""
+        L = self._sweep_lines(occurrences_total=0, error=None)
+        self.assertTrue(any("ZERO-SEED" in ln for ln in L), f"expected a ZERO-SEED line, got {L}")
+
+    def test_sweep_does_NOT_print_ZERO_SEED_for_a_seed_that_hit(self):
+        """Correlated negative control: without it the test above passes on code that flags every
+        record, which would be a standing warning nobody reads."""
+        L = self._sweep_lines(occurrences_total=7, error=None)
+        self.assertFalse(any("ZERO-SEED" in ln for ln in L))
+
+    def test_an_ABSENT_census_is_never_reported_as_a_measured_zero(self):
+        """⚠ A record written before the census existed carries {}. Reading that as zero would
+        invent a measurement nobody made — the exact confusion the whole item exists to prevent."""
+        L = self._sweep_lines(census={})
+        self.assertFalse(any("ZERO-SEED" in ln for ln in L),
+                         "absence of a census must not masquerade as a census reporting zero")
+
+    def _sweep_lines(self, census=None, **census_kw):
+        """Drive the real ``sweep`` and return its printed lines."""
+        import contextlib
+        import io
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+        token = "ZZ-SWEEP-CONTROL-TOKEN"
+        cfg = {"control_token": token, "surfaces": [], "expected_counts": {}}
+        surf = S.SurfaceResult("docs", "filesystem", "1 files", 1,
+                               [("docs/a.md", f"body {token}")])
+        ns = Path(tempfile.mkdtemp())
+        sc = census if census is not None else {"seed": "s", "unit_total": 1, "units_holding": [],
+                                                "surfaces": [], **census_kw}
+        (ns / "records").mkdir()
+        (ns / "records" / "R.json").write_text(json.dumps({
+            "id": "R", "seed": "a seed", "variants": ["a seed"], "anchors": [], "nets_run": [],
+            "tombstones": [{"location": "docs/a.md", "block_sha256": "x"}],
+            "surfaces_at_withdrawal": [], "expected_counts": {}, "parent": None, "created": "",
+            "seed_census": sc}), encoding="utf-8")
+        (ns / "manifest.json").write_text(json.dumps(["records/R.json"]), encoding="utf-8")
+        out = io.StringIO()
+        with mock.patch.object(S, "load_config", return_value=cfg), \
+             mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
+             mock.patch.object(S, "NAMESPACE", ns), contextlib.redirect_stdout(out):
+            S.sweep(SimpleNamespace(records=[], show=40))
+        return out.getvalue().splitlines()
 
     def test_a_record_written_before_the_census_existed_STILL_LOADS(self):
         """The added field carries a default for the same reason every other R3 field does: a tool
