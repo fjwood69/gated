@@ -342,7 +342,8 @@ class SharedInstrumentGate(unittest.TestCase):
         return c
 
     def _surface(self, name="docs", count=5, with_token=True):
-        items = [(f"{name}/f{i}.md", f"body {self.TOKEN}" if with_token else "body")
+        items = [(f"{name}/f{i}.md",
+                  f"some claim body {self.TOKEN}" if with_token else "some claim body")
                  for i in range(count)]
         return S.SurfaceResult(name, "filesystem", f"{count} files", count, items)
 
@@ -391,7 +392,11 @@ class SharedInstrumentGate(unittest.TestCase):
             (ns / "records").mkdir()
             for rid, r in records.items():
                 (ns / "records" / f"{rid}.json").write_text(json.dumps(r.__dict__), encoding="utf-8")
-        args = SimpleNamespace(id="NEW", seed="some claim", anchor=None, parent=None)
+        # ⚠ --carrier IS REQUIRED (ruled 2026-08-06). These fixtures exist to exercise the
+        # INSTRUMENT GATE, which runs BEFORE the carrier checks, so a healthy run must still name a
+        # carrier that genuinely holds the seed or it refuses for the wrong reason.
+        args = SimpleNamespace(id="NEW", seed="some claim", anchor=None, parent=None,
+                               carrier=[surfaces[0].items[0][0]] if surfaces[0].items else ["x"])
         with mock.patch.object(S, "load_config", return_value=self._cfg()), \
              mock.patch.object(S, "gather_surfaces", return_value=surfaces), \
              mock.patch.object(S, "NAMESPACE", ns):
@@ -500,8 +505,9 @@ class RecordOverwrite(unittest.TestCase):
         from unittest import mock
         cfg = {"control_token": "ZZ-SWEEP-CONTROL-TOKEN", "surfaces": [], "expected_counts": {}}
         surf = [S.SurfaceResult("docs", "filesystem", "3 files", 3,
-                                [(f"docs/f{i}.md", "body ZZ-SWEEP-CONTROL-TOKEN") for i in range(3)])]
-        args = SimpleNamespace(id=rid, seed="a claim", parent=None)
+                                [(f"docs/f{i}.md", "a claim body ZZ-SWEEP-CONTROL-TOKEN")
+                                 for i in range(3)])]
+        args = SimpleNamespace(id=rid, seed="a claim", parent=None, carrier=["docs/f0.md"])
         with mock.patch.object(S, "load_config", return_value=cfg), \
              mock.patch.object(S, "gather_surfaces", return_value=surf), \
              mock.patch.object(S, "NAMESPACE", ns):
@@ -582,15 +588,49 @@ class AnchorsAreAnOutputNotAnInput(unittest.TestCase):
         self.assertIn("unrecognized arguments: --anchor", err.getvalue(),
                       "the flag must be REJECTED BY THE PARSER, not merely absent from the outcome")
 
-    def test_the_parser_still_accepts_a_real_harvest_invocation(self):
-        """Correlated control: prove the rejection above is the flag and not a broken parser."""
+    def _parse(self, argv):
+        """Drive ``main`` with the COMMAND STUBBED OUT, and return (rc, stderr, args).
+
+        ⚠ THIS USED TO RELY ON ``load_config`` EXITING BECAUSE NO CONFIG FILE EXISTED, AND THAT IS
+        A TEST THAT PASSES FOR A REASON ABOUT THE DEVELOPER'S MACHINE. On CI there is no config, so
+        it went green. The moment a real config was present — as it is on any workstation that has
+        actually RUN the tool — the parse fell through and **executed a live harvest against the
+        private corpus**, 331 board keys over HTTP included. It did not fail; it did the thing.
+        MEASURED 2026-08-06: the suite hung, CPU-bound, and had to be killed.
+
+        A control that depends on a file being ABSENT is not a control. Stubbing the command makes
+        the assertion about the PARSER, which is what it always claimed to be about.
+        """
         import contextlib
         import io
+        from unittest import mock
+        seen = {}
+
+        def _stub(a):
+            seen.update(vars(a))
+            return 0
+
         err = io.StringIO()
-        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
-            S.main(["harvest", "ID", "seed", "--parent", "P"])
-        self.assertNotIn("unrecognized arguments", err.getvalue(),
-                         "--parent is a real flag and must parse")
+        with mock.patch.object(S, "harvest", _stub), contextlib.redirect_stderr(err):
+            rc = S.main(argv)
+        return rc, err.getvalue(), seen
+
+    def test_the_parser_still_accepts_a_real_harvest_invocation(self):
+        """Correlated control: prove the rejection above is the flag and not a broken parser."""
+        rc, err, args = self._parse(["harvest", "ID", "seed", "--parent", "P"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("unrecognized arguments", err, "--parent is a real flag and must parse")
+        self.assertEqual(args["parent"], "P",
+                         "⚠ --parent must REACH the command: it is the only input to "
+                         "ancestor_closure, and R1's nested-withdrawal case goes dark without it")
+
+    def test_carrier_is_REPEATABLE(self):
+        """⚠ A RULING, NOT A CONVENIENCE. A claim can be made in more than one place before anyone
+        notices it is wrong — the founding incident had FIVE carriers — so a single-valued flag
+        would force the operator to pick one and silently discard the rest of a span already
+        found."""
+        _, _, args = self._parse(["harvest", "ID", "seed", "--carrier", "a.md", "--carrier", "b.md"])
+        self.assertEqual(args["carrier"], ["a.md", "b.md"])
 
 
 class FenceAwareCarrierUnits(unittest.TestCase):
@@ -755,7 +795,7 @@ class SeedCensus(unittest.TestCase):
         self.assertIn("ghost#9", adj["seeded"])
 
     # ── the WIRING. Behaviour and wiring are two claims (the SharedInstrumentGate lesson). ────────
-    def _run_harvest(self, seed, items):
+    def _run_harvest(self, seed, items, carrier=None):
         import contextlib
         import io
         import tempfile
@@ -766,7 +806,12 @@ class SeedCensus(unittest.TestCase):
         surf = S.SurfaceResult("docs", "filesystem", f"{len(items)} files", len(items),
                                [(loc, f"{body}\n{token}\n") for loc, body in items])
         ns = Path(tempfile.mkdtemp())
-        args = SimpleNamespace(id="NEW", seed=seed, anchor=None, parent=None)
+        # ⚠ DEFAULT: name EVERY fixture location. --carrier is required, and these tests are about
+        # the CENSUS (which counts corpus-wide) rather than about narrowing, so naming everything
+        # keeps `adjudicated_out` empty and leaves the census assertions measuring what they claim.
+        args = SimpleNamespace(id="NEW", seed=seed, anchor=None, parent=None,
+                               carrier=list(carrier) if carrier is not None
+                               else [loc for loc, _ in items])
         out = io.StringIO()
         with mock.patch.object(S, "load_config", return_value=cfg), \
              mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
@@ -861,35 +906,9 @@ class SeedCensus(unittest.TestCase):
         self.assertEqual(len(set(codes)), 6, "a shared code sends the reader to the wrong place")
         self.assertNotEqual(S.EXIT_SEED, S.EXIT_INSTRUMENT)
 
-    def test_a_CORPUS_WIDE_ZERO_seed_is_PERMITTED_and_still_registers(self):
-        """⚠ THE OPPOSITE ACT, AND THE CORRELATED CONTROL FOR THE REFUSAL ABOVE. A seed matching
-        nothing TODAY is the tripwire case — ``expand`` already keeps zero-hit forms for exactly
-        that reason, so refusing here would contradict a ruling this same file carries. Without
-        this test the refusal above passes on a harvest that rejects every empty result."""
-        rc, ns, _ = self._run_harvest("nowhere at all", [("docs/a.md", "unrelated prose")])
-        self.assertEqual(rc, S.EXIT_DEBT, "a searchable seed with zero hits still registers")
-        rec = json.loads((ns / "records" / "NEW.json").read_text(encoding="utf-8"))
-        self.assertIsNone(rec["seed_census"]["error"], "this is a MEASURED zero, not a failure")
-        self.assertEqual(rec["seed_census"]["occurrences_total"], 0)
 
-    def test_sweep_prints_ZERO_SEED_for_a_measured_zero(self):
-        """The typo-vs-tripwire gap: permitting leaves them indistinguishable after harvest, and
-        both produce silence. So the tool prints the question it cannot answer (R5)."""
-        L = self._sweep_lines(occurrences_total=0, error=None)
-        self.assertTrue(any("ZERO-SEED" in ln for ln in L), f"expected a ZERO-SEED line, got {L}")
 
-    def test_sweep_does_NOT_print_ZERO_SEED_for_a_seed_that_hit(self):
-        """Correlated negative control: without it the test above passes on code that flags every
-        record, which would be a standing warning nobody reads."""
-        L = self._sweep_lines(occurrences_total=7, error=None)
-        self.assertFalse(any("ZERO-SEED" in ln for ln in L))
 
-    def test_an_ABSENT_census_is_never_reported_as_a_measured_zero(self):
-        """⚠ A record written before the census existed carries {}. Reading that as zero would
-        invent a measurement nobody made — the exact confusion the whole item exists to prevent."""
-        L = self._sweep_lines(census={})
-        self.assertFalse(any("ZERO-SEED" in ln for ln in L),
-                         "absence of a census must not masquerade as a census reporting zero")
 
     def _sweep_lines(self, census=None, **census_kw):
         """Drive the real ``sweep`` and return its printed lines."""
@@ -932,6 +951,251 @@ class SeedCensus(unittest.TestCase):
         recs = S.load_records(ns)
         self.assertEqual(recs["OLD"].seed_census, {},
                          "an absent census must read as absent, never as a measured zero")
+
+
+class ClaimSpanSeeding(unittest.TestCase):
+    """R15 — THE CORPUS FIXPOINT LOOP IS DELETED. The candidate set comes from the CLAIM.
+
+    MEASURED, and this is the deletion's whole case: the loop reached 98% of one corpus and — on
+    2026-08-06, on a corpus not chosen for the test and a carrier nobody planted — **2,727 of 2,752
+    units (99.1%), 8,848 terms, ~32 minutes, from a seed occurring FIVE times.** A sweep that flags
+    99.1% of the corpus has not found the carrier; it has stopped discriminating.
+
+    ⚠ AND THE REPLACEMENT IS NOT A FILTER. The claim-span set never contained `and` BECAUSE `and` IS
+    NOT IN THE CLAIM'S BLOCK — no rule rejected it. The population is different, and describing it
+    as filtering would invite the reparametrisation that has already failed four times.
+    """
+
+    TOKEN = "ZZ-SWEEP-CONTROL-TOKEN"
+
+    def _run(self, seed, items, carrier=None, ns=None):
+        import contextlib
+        import io
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+        cfg = {"control_token": self.TOKEN, "surfaces": [], "expected_counts": {}}
+        surf = S.SurfaceResult("docs", "filesystem", f"{len(items)} files", len(items),
+                               [(loc, f"{body}\n{self.TOKEN}\n") for loc, body in items])
+        ns = ns or Path(tempfile.mkdtemp())
+        args = SimpleNamespace(id="NEW", seed=seed, parent=None, carrier=list(carrier or []))
+        out = io.StringIO()
+        with mock.patch.object(S, "load_config", return_value=cfg), \
+             mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
+             mock.patch.object(S, "NAMESPACE", ns), contextlib.redirect_stdout(out):
+            rc = S.harvest(args)
+        rec = None
+        if (ns / "records" / "NEW.json").exists():
+            rec = json.loads((ns / "records" / "NEW.json").read_text(encoding="utf-8"))
+        return rc, ns, out.getvalue(), rec
+
+    # ── R15a — the seed is in variants BY CONSTRUCTION ────────────────────────────────────────────
+    def test_the_PROSE_seed_is_in_variants(self):
+        """⚠ CONFIRMED BY EXECUTION, NOT BY REVIEW. `extract_candidates` excludes free prose BY
+        DESIGN and `expand` excludes its own input BY CONSTRUCTION, so for a prose seed NEITHER
+        produces it. MEASURED on the real claim block: 15 terms extracted and the seed was not among
+        them — a record whose sweep never matches the exact withdrawn sentence. The old code
+        guaranteed it twice and BOTH guarantees lived inside the loop this change deletes."""
+        _, _, _, rec = self._run("no egress", [("docs/a.md", "the claim: no egress here")],
+                                 carrier=["docs/a.md"])
+        self.assertIn("no egress", rec["variants"],
+                      "the seed must survive the deletion of the loop that used to carry it")
+
+    def test_variants_are_SORTED(self):
+        """R15g — the union is set-derived; unsorted output makes record files nondeterministic
+        across runs of identical input, so a diff would report changes nobody made."""
+        _, _, _, rec = self._run("no egress", [("docs/a.md", "no egress `zero-gate` `false-pass`")],
+                                 carrier=["docs/a.md"])
+        self.assertEqual(rec["variants"], sorted(rec["variants"]))
+
+    # ── R15b — the tool's own namespace is not a carrier ──────────────────────────────────────────
+    def test_a_carrier_inside_the_TOOL_NAMESPACE_is_refused(self):
+        """⚠ A stored run report carries the claim's FULL MATCHED SPAN, so seeding from one derives
+        the vocabulary from the tool's own output — and under claim-span seeding it does so CLEANLY,
+        producing a plausible result. Silent and self-certifying, which is why it is a refusal."""
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        rc, _, out, rec = self._run("no egress", [("docs/a.md", "no egress")],
+                                    carrier=[str(ns / "reports" / "x.txt")], ns=ns)
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIsNone(rec, "nothing may be written from a tautological seeding")
+        self.assertIn("OWN namespace", out)
+
+    def test_an_ABSENT_carrier_is_an_instrument_failure_not_an_empty_result(self):
+        rc, _, out, rec = self._run("no egress", [("docs/a.md", "no egress")],
+                                    carrier=["docs/does-not-exist.md"])
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIsNone(rec)
+        self.assertIn("not found on any enumerated surface", out)
+
+    # ── R15d — zero inside a NAMED carrier refutes an assertion ───────────────────────────────────
+    def test_zero_occurrences_in_a_NAMED_carrier_is_a_REFUSAL(self):
+        """⚠ NOT THE SAME ACT AS A CORPUS-WIDE ZERO. Here the caller ASSERTED a location and the
+        assertion is refuted; a bare harvest that finds nothing is a TRIPWIRE and is permitted.
+        Identical in the number, opposite in meaning."""
+        rc, _, out, rec = self._run("no egress", [("docs/a.md", "unrelated prose entirely")],
+                                    carrier=["docs/a.md"])
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIsNone(rec, "a carrier that does not hold the claim must not be pinned as state")
+        self.assertIn("ZERO occurrences", out)
+
+
+    # ── the narrowing is RECORDED, which is what the census was built for ────────────────────────
+    def test_naming_a_carrier_RECORDS_what_it_left_out(self):
+        """⚠ THE BRANCH THAT WAS UNREACHABLE THIS MORNING. Until --carrier existed, the census and
+        the seeding population agreed by construction and `adjudicated_out` could never be non-empty.
+        Now naming one carrier out of two must leave the other NAMED in the record — not merely
+        absent from it. That is the difference between recording an adjudication and recording only
+        its outcome, which is the P1 this whole line of work exists for."""
+        _, _, _, rec = self._run("no egress",
+                                 [("docs/a.md", "the claim: no egress"),
+                                  ("docs/b.md", "also no egress over here")],
+                                 carrier=["docs/a.md"])
+        adj = rec["seed_census"]["adjudication"]
+        self.assertEqual(adj["carriers_named"], ["docs/a.md"])
+        self.assertEqual(adj["seeded"], ["docs/a.md"])
+        self.assertEqual(adj["adjudicated_out"], ["docs/b.md"],
+                         "the unit NOT chosen is the record's whole point")
+
+
+    # ── R15c — one corpus pass, and reach at BOTH granularities ──────────────────────────────────
+    def test_surfaces_at_withdrawal_is_MEASURED_not_memory_authored(self):
+        """⚠ Today it is COMPUTED from the reached set, and the deletion removes the only thing
+        computing it. Without step 4½ the field becomes memory-authored again — the original disease
+        persisting inside the registry, wearing a tool's clothing."""
+        _, _, _, rec = self._run("no egress", [("docs/a.md", "no egress")], carrier=["docs/a.md"])
+        self.assertEqual(rec["surfaces_at_withdrawal"], ["docs"])
+
+    def test_reach_is_reported_at_BOTH_granularities_and_the_SET_is_persisted(self):
+        """⚠ EVERY REACH FIGURE THIS PROJECT PRODUCED WAS UNIT-ONLY, because nothing recorded WHICH
+        units were reached, so the location figure could not be computed after the fact at all —
+        while every pre-registration asked for both, because A HUMAN OPENS LOCATIONS."""
+        _, ns, out, rec = self._run("no egress", [("docs/a.md", "no egress")], carrier=["docs/a.md"])
+        for k in ("units_reached", "units_total", "locations_reached", "locations_total"):
+            self.assertIn(k, rec["reach"])
+        self.assertTrue(rec["reach"]["reached_units"], "the SET must be persisted, not just its size")
+        self.assertIn("LOCATIONS", out, "the printed report must state the location figure")
+        self.assertTrue((ns / "reach" / "NEW.tsv").exists())
+        self.assertIn("reach/NEW.tsv",
+                      json.loads((ns / "manifest.json").read_text(encoding="utf-8")))
+
+    # ── R15f — the migrated audit target ─────────────────────────────────────────────────────────
+    def test_the_seeding_units_are_recorded_and_SPILLED(self):
+        """The candidates TSV recorded a FILTERING decision and the filtering is gone, so that audit
+        target ceases to exist. WHICH TEXT SEEDED THE VOCABULARY is still a decision, and a span
+        sha256 is a commitment rather than something a reviewer can read."""
+        _, ns, _, rec = self._run("no egress", [("docs/a.md", "no egress `zero-gate`")],
+                                  carrier=["docs/a.md"])
+        self.assertIn("docs/a.md", rec["seeding_units"])
+        self.assertIn("zero-gate", rec["seeding_units"]["docs/a.md"]["extracted"])
+        self.assertTrue((ns / "seeding" / "NEW.tsv").exists())
+        self.assertEqual(S.manifest_check(ns), [], "harvest must not leave its own files as strays")
+        self.assertEqual(rec["boundary_rule"], S.BOUNDARY_RULE,
+                         "a later disagreement must be diagnosable as CORPUS vs RULE changed")
+
+    # ── the loop's state is gone from new records, and old records still load ────────────────────
+    def test_new_records_carry_NO_fixpoint_state(self):
+        _, _, _, rec = self._run("no egress", [("docs/a.md", "no egress")], carrier=["docs/a.md"])
+        self.assertEqual(rec["rounds"], [])
+        self.assertEqual(rec["candidates"], {})
+        self.assertFalse(rec["at_fixpoint"], "there is no fixpoint any more; claiming one is a lie")
+
+    def test_a_record_written_by_the_LOOP_still_loads(self):
+        """⚠ THE FIELDS STAY EVEN THOUGH THE LOOP IS GONE. Removing them would make every record
+        written before today fail to load, and a tool that cannot read its own history has none."""
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        (ns / "records").mkdir()
+        (ns / "records" / "OLD.json").write_text(json.dumps({
+            "id": "OLD", "seed": "s", "variants": ["s"], "anchors": [], "nets_run": [],
+            "tombstones": [], "surfaces_at_withdrawal": [], "expected_counts": {},
+            "parent": None, "created": "", "rounds": [{"round": 1}],
+            "candidates": {"x": {}}, "at_fixpoint": True}), encoding="utf-8")
+        recs = S.load_records(ns)
+        self.assertEqual(recs["OLD"].rounds, [{"round": 1}])
+        self.assertEqual(recs["OLD"].carriers, [], "a new field must default, not explode")
+
+    # ── Ruling 1 — --carrier is REQUIRED ─────────────────────────────────────────────────────────
+    def test_a_BARE_harvest_is_REFUSED(self):
+        """⚠ RULED 2026-08-06, AND THE FALLBACK IT REPLACES WAS MY OWN INVENTION — inferred from a
+        ruling about a different question and never designed, consulted or boarded. It RESTORED THE
+        FLOOD IN ONE PASS: every seed-holding unit contributes its backticked spans, so `variants`
+        explodes exactly as under the deleted loop. Cost sealed it — ~1,000 seed-holding units at
+        ~50 terms and ~5 expansions each is ~250,000 variants over the whole corpus."""
+        rc, _, out, rec = self._run("no egress", [("docs/a.md", "no egress")])
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIsNone(rec, "a harvest with no claim span must write nothing")
+        self.assertIn("--carrier is REQUIRED", out)
+
+    def test_the_refusal_is_NOT_argparse_exit_2(self):
+        """⚠ WHY THE REFUSAL IS IN-CODE AND NOT `required=True`. argparse exits **2** on a missing
+        required flag, and 2 is EXIT_TOMBSTONE — a forgotten flag would be indistinguishable from
+        "a correction was re-worded", the exact collision R4a's stratification exists to prevent."""
+        rc, _, _, _ = self._run("no egress", [("docs/a.md", "no egress")])
+        self.assertNotEqual(rc, S.EXIT_TOMBSTONE)
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+
+    # ── the surviving mutant the consult found ───────────────────────────────────────────────────
+    def test_a_carrier_does_NOT_match_a_prefix_EXTENSION(self):
+        """⚠ A MUTATION THAT SURVIVED THE WHOLE SUITE. Changing the scope filter from `in named` to
+        `startswith(named[0])` makes carrier `docs/a.md` also seed from `docs/a.md.bak`, and every
+        existing assertion still held because no fixture had a prefix collision. Found by the
+        consult reading the source, not by the red-proof."""
+        _, _, _, rec = self._run("no egress",
+                                 [("docs/a.md", "no egress"), ("docs/a.md.bak", "no egress")],
+                                 carrier=["docs/a.md"])
+        adj = rec["seed_census"]["adjudication"]
+        self.assertEqual(adj["seeded"], ["docs/a.md"], "a carrier is a location, not a prefix")
+        self.assertIn("docs/a.md.bak", adj["adjudicated_out"])
+
+    def test_parent_reaches_the_WRITTEN_RECORD_not_merely_the_parser(self):
+        """⚠ THE PARSER TEST WAS NOT ENOUGH. `--parent` is the only input to `ancestor_closure`, and
+        a value that parses but never lands on the record takes R1's nested-withdrawal case dark
+        with nothing failing."""
+        import contextlib
+        import io
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+        cfg = {"control_token": self.TOKEN, "surfaces": [], "expected_counts": {}}
+        surf = S.SurfaceResult("docs", "filesystem", "1 files", 1,
+                               [("docs/a.md", f"no egress\n{self.TOKEN}\n")])
+        ns = Path(tempfile.mkdtemp())
+        args = SimpleNamespace(id="NEW", seed="no egress", parent="ANCESTOR",
+                               carrier=["docs/a.md"])
+        with mock.patch.object(S, "load_config", return_value=cfg), \
+             mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
+             mock.patch.object(S, "NAMESPACE", ns), contextlib.redirect_stdout(io.StringIO()):
+            S.harvest(args)
+        rec = json.loads((ns / "records" / "NEW.json").read_text(encoding="utf-8"))
+        self.assertEqual(rec["parent"], "ANCESTOR")
+
+    def test_span_sha256_is_STRUCK(self):
+        """⚠ CEREMONY, BY THE STANDARD THAT KILLED R15e. Nothing ever recomputed or compared it.
+        What it claimed to protect is carried by `seeding_units` and the spill — WHICH units seeded
+        and WHAT each contributed, auditable by opening the unit, which a hash never was."""
+        _, _, _, rec = self._run("no egress", [("docs/a.md", "no egress")], carrier=["docs/a.md"])
+        self.assertNotIn("span_sha256", rec, "an unverified hash must not ship as a commitment")
+
+    # ── the location helper, which the whole dual-granularity claim rests on ─────────────────────
+    def test_unit_location_strips_only_a_carrier_units_suffix(self):
+        """⚠ THE FIRST VERSION OF THIS RULE WAS WRONG, AND THE CONSULT FOUND IT. It stripped any
+        trailing `#<digits>` — but a board key may legitimately END in `#<digits>`, and a location
+        with no headings is returned UNSUFFIXED. So `board/incident#42` was reduced to
+        `board/incident` and MERGED WITH A DISTINCT LOCATION, understating the location count: the
+        exact figure this helper exists to make reportable."""
+        self.assertEqual(S._unit_location("docs/a.md#unit-3"), "docs/a.md")
+        self.assertEqual(S._unit_location("docs/a.md"), "docs/a.md")
+        self.assertEqual(S._unit_location("board/some#key"), "board/some#key")
+        self.assertEqual(S._unit_location("board/incident#42"), "board/incident#42",
+                         "⚠ a board key ending in #<digits> is a LOCATION, not a unit suffix")
+        self.assertEqual(S._unit_location("board/incident#42#unit-1"), "board/incident#42")
+
+    def test_carrier_units_emits_the_unambiguous_separator(self):
+        """The correlated half: the helper's rule is only safe if the producer uses that separator."""
+        units = S.carrier_units("board/incident#42", S.normalise("intro\n\n# One\na\n"))
+        self.assertTrue(all("#unit-" in uid for uid, _ in units), f"got {[u for u, _ in units]}")
+        self.assertTrue(all(S._unit_location(uid) == "board/incident#42" for uid, _ in units))
 
 
 # ⚠ THIS ENTRY POINT MUST STAY AT THE END OF THE FILE, AND IT USED TO SIT IN THE MIDDLE.
