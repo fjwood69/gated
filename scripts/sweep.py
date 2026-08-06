@@ -1401,7 +1401,7 @@ def harvest(args) -> int:
               f"{len(census['units_holding'])} of {census['unit_total']} carrier units, "
               f"on {len(census['surfaces'])} surface(s): {', '.join(census['surfaces']) or 'NONE'}")
         print(f"    seeded {len(seeded_set)}  ·  adjudicated out {len(out_set)}  ·  "
-              f"carriers named: {', '.join(named) or 'NONE'}")
+              f"carriers named: {', '.join(named)}")
         print(f"    {census['adjudication']['basis']}")
         # ⚠ WHICH OF THE TWO THIS IS, IS DECIDED BY THE CODE AND NOT BY WHOEVER EDITS IT NEXT.
         # A non-empty ``adjudicated_out`` means one of two OPPOSITE things, and the earlier version
@@ -1430,7 +1430,7 @@ def harvest(args) -> int:
         print( "      withdrawn claim or merely uses the same words is a JUDGEMENT this tool does not")
         print( "      make (R5). MEASURED on the founding incident: 7 of 8 were homonyms.")
     # ── R15 — WHAT SEEDED, AND WHAT IT REACHED. Both, because they are different questions.
-    print(f"  carriers named  : {', '.join(named) or 'NONE — bare harvest, every unit holding the seed'}")
+    print(f"  carriers named  : {', '.join(named)}")
     print(f"  seeding units   : {len(seeding_units)}")
     print(f"  boundary rule   : {BOUNDARY_RULE}")
     for uid, d in sorted(seeding_units.items())[:8]:
@@ -1451,7 +1451,7 @@ def harvest(args) -> int:
     print( "    scoreable in locations later. A human opens locations.")
     print( "    ⚠ ONE CORPUS PASS (R15c), no iteration and no promotion. This pins")
     print( "      surfaces_at_withdrawal by MEASUREMENT; without it the record is memory-authored.")
-    print(f"  surfaces        : {', '.join(rec.surfaces_at_withdrawal) or 'NONE — seed matched nothing'}")
+    print(f"  surfaces        : {', '.join(rec.surfaces_at_withdrawal)}")
     print(f"  nets run        : {', '.join(rec.nets_run)}")
     print(f"  expected counts : pinned for {len(rec.expected_counts)} surfaces")
     print()
