@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """sweep — find every surface still asserting a withdrawn claim.
 
-Built to DESIGN-supersession-sweep.md v3 (ratified 2026-08-04). Ruling IDs (R1, R2, R4a, …) in the
-comments below refer to that document; the design carries the reasoning, this file carries the
-mechanism, and neither is complete without the other.
+Built to DESIGN-supersession-sweep.md — v3 (ratified 2026-08-04) THROUGH v4/R15, R16 and R17, all
+ratified 2026-08-06 and built here. Ruling IDs (R1, R2, R4a, …) refer to that document; the design
+carries the reasoning, this file carries the mechanism, and neither is complete without the other.
+
+⚠ THIS LINE SAID "v3" FOR A DAY AFTER v4 WAS BUILT, AND A VERSION CLAIM IS RULED RATHER THAN TIDIED.
+An outside reviewer, given only this file, framed the mismatch as a binary — stale header, or a
+rationale citing an unratified design — and it was neither: the DESIGN's own title was the stale
+surface, and this header was right until v4 landed. Two surfaces, one status, and the false one hid
+behind the true one. The tool's entire subject, on line 4 of the tool.
 
 THE ONE-LINE REASON THIS EXISTS: on 2026-08-03 a withdrawn claim was swept FROM MEMORY, three carriers
 were named, and it lived on five. The two missed were the design document under active edit and a
@@ -37,6 +43,21 @@ EXIT_INSTRUMENT = 1   # control failed · surface missing · count dropped · un
 EXIT_TOMBSTONE = 2    # a correction was re-worded — STILL PRINTS EVERY HIT (R8)
 EXIT_HITS = 3         # live hits, read them
 EXIT_DEBT = 4         # a record is open (zero tombstones)
+EXIT_SEED = 5         # the SEED the caller supplied cannot be searched with (R16)
+EXIT_BIND = 6         # `retombstone` found nothing to bind (R4/R7)
+# ⚠ SIX, DELIBERATELY NOT TWO. `EXIT_TOMBSTONE` (2) means "a registered control BROKE"; this means
+# "there was nothing to register in the first place". Opposite ends of the same loop — one is a
+# correction that drifted, the other is a correction that was never written — and an operator shown
+# code 2 goes looking for a re-worded block that does not exist. Same stratification law as R16's
+# exit 5: different CAUSE, different remediation, so different code.
+# ⚠ R16 — WHY THE BROKEN SEED GETS ITS OWN STRATUM RATHER THAN REUSING EXIT_INSTRUMENT.
+# Every other code above names a failure of the CORPUS or the CHANNEL: a surface vanished, a fetch
+# truncated, a control did not travel, a file appeared unmanifested. A seed that will not compile is
+# none of those — it is a CALLER-INPUT failure, and the whole point of stratifying exits is that
+# DIFFERENT CAUSES GET DIFFERENT REMEDIATIONS. An operator who sees "instrument failure" goes and
+# checks the corpus, the board endpoint and the glob roots; the thing actually wrong is the string
+# they typed. Folding this into code 1 would send every future reader to the wrong place, which is
+# the same defect R4a exists to prevent one level in.
 
 CONFIG_PATH = Path(__file__).resolve().parent / "sweep.config.json"
 # ⚠ NOT COMMITTED. gated is PUBLIC and the real config names a private board endpoint and
@@ -392,29 +413,55 @@ _HYPHENS = ("-", "‐", "‑")
 # Eligibility for orthographic expansion: word-shaped parts only (see ``expand``).
 _ORTHO_PART = re.compile(r"^\w+$", re.UNICODE)
 
-# ⚠ THE PROMOTION RULE, AND THE MEASUREMENT THAT SET IT. ITS JUSTIFICATION LIVES HERE, AT THE VALUE.
+# ── R15 — THE CORPUS FIXPOINT LOOP IS GONE. ITS OBITUARY LIVES HERE, IN THE CODE (R15h).
 #
-# A candidate is promoted into the LOOP only if it appears in at least this many ALREADY-REACHED
-# carrier units. Everything else is still extracted, still scored on both legs, still written to the
-# manifest-registered candidate file, and still stored on the record — so the rule NARROWS WHAT IS
-# SEARCHED, never what is seen or kept. That is the difference R12 actually cares about: a cutoff is
-# banned for being SILENT, and this one is deterministic, printed every run, and reversible.
+# ⚠ THE JUSTIFICATION FOR A DELETION MUST LIVE WHERE THE NEXT READER LOOKS. Before this, the flood
+# measurements existed only in a consult and on a board — which is precisely the failure this tool
+# was built to close, performed by the tool's own history.
 #
-# ⚠ THE FIRST IMPLEMENTATION HAD NO CUTOFF AT ALL, AND THAT WAS WRONG FOR A REASON I DID NOT EXPECT.
-# It is not that promoting everything is SLOW — round-1 scoring measured ~18s. It is that promoting
-# all 1745 round-1 candidates puts GENERIC identifiers into the net, which then reach essentially
-# every unit in the corpus, so the next extraction harvests THE WHOLE CORPUS VOCABULARY. The loop
-# still terminates — at the TRIVIAL fixpoint, where the net reaches everything and discriminates
-# nothing. MEASURED: the uncapped run did not finish in 600s.
+# WHAT THE LOOP DID: seed the net, search the corpus, extract vocabulary from every unit that
+# matched, promote what recurred, search again. It terminated. It terminated at the TRIVIAL FIXPOINT
+# — the net reaching everything and discriminating nothing.
 #
-# WHY 2, MEASURED ON THE 2026-08-04 INCIDENT, seed "no egress", 2861 carrier units:
-#   1745 candidates total · DF>=2 promotes 133 (7.6%) · DF==1 is a 494-long tail · DF==0 is 1118
-#   pure expansions, which match nothing TODAY and are exactly the tripwires.
-#   All four pre-registered terms survive: zero-gate 11 · false-pass 10 · false pass 7 · false-passes 4.
-# ⚠ THIS IS A DEFENSIBLE FLOOR, NOT A CALIBRATION. It was chosen as the weakest rule that both
-# bounds the net and retains every term the experiment named; it has been measured on ONE incident
-# and one corpus, and it is not known to transfer.
-PROMOTE_MIN_CARRIER_DF = 2
+#   MEASURED, 2026-08-04 incident, seed "no egress":  uncapped 98% of the corpus at round 4
+#   MEASURED, same corpus, commonness-capped:         85% and STILL CLIMBING at round 7
+#   MEASURED, 2026-08-06, a corpus NOT chosen for the test and a carrier nobody planted:
+#       2,727 of 2,752 units = 99.1%, 8,848 terms held, ~32 minutes, FROM A SEED OCCURRING 5 TIMES
+#
+# ⚠ AND THE OBVIOUS READING OF THAT LAST RUN IS WRONG, WHICH IS WHY IT IS WRITTEN DOWN. It promoted
+# `and` (carrier-DF 2003), `for`, `str`, `int`, `---`. That looks like a broken expander, and it is
+# NOT: every one has origin=extraction, and the orthographic class gate on `expand` does not touch a
+# single one. THE PATH IS `_C_QUOTED` PLUS A LENGTH FLOOR OF 3 — any backticked span of 3-60 chars
+# becomes a candidate, and technical prose is full of them. MEASURED on that corpus, the commonest
+# short backticked spans are inline separators: ` | ` x94, ` / ` x76, ` + ` x61, ` and ` x34. So
+# ` and ` mints `and`. ONE OCCURRENCE IS ENOUGH — the term is minted once and its carrier-DF is then
+# computed over the whole reached set, which for an ordinary English word is thousands.
+# THAT IS STRUCTURAL TO SHAPE-BASED EXTRACTION OVER PROSE-CONTAINING-CODE, not a defect in one class.
+#
+# FOUR RESCUES DIED BY MEASUREMENT, NOT BY OPINION, and they are named so none is re-proposed:
+#   1. NO CUTOFF AT ALL          — did not finish in 600s; promoting everything harvests the corpus.
+#   2. CORPUS-RARITY             — refuted; the flood is not made of rare terms.
+#   3. CARRIER-UNIT SIZE         — bounded units flood within ONE percentage point.
+#   4. A COMMONNESS CAP          — fitted to retain the known-good, and STILL 85% and climbing.
+# ⚠ RAISING THE LENGTH FLOOR FROM 3 TO 4 WOULD DROP `and`/`for`/`str`/`int` AND IS THE SAME MISTAKE
+# A FIFTH TIME. The tune is not the answer; the POPULATION is.
+#
+# > Same corpus. Same extractor. Same expander. THE ONLY THING THAT CHANGED WAS THE POPULATION READ.
+# The loop extracted from documents that HAPPENED TO CONTAIN THE SEED. Claim-span seeding extracts
+# from THE PLACES THE CLAIM WAS ACTUALLY MADE. Three refuted mechanisms were all statistics over the
+# wrong population, and NO REPARAMETRISATION REPAIRS A POPULATION.
+#
+# ⚠ AND WHAT THE REPLACEMENT BUYS IS NOT BETTER FILTERING. It is a candidate set bounded by ONE SPAN
+# rather than by the corpus's supply of short quoted tokens. The claim-span set never contained `and`
+# BECAUSE `and` IS NOT IN THE CLAIM'S BLOCK — not because any rule rejected it. No rule fires. The
+# population is different. Describing it as filtering would invite the reparametrisation above.
+#
+# THERE IS NO PROMOTION RULE ANY MORE, SO R12'S SILENT-CUTOFF HAZARD DOES NOT ARISE: there is no
+# cutoff left to be silent about.
+BOUNDARY_RULE = "carrier_units/heading-bounded/fence-aware@2026-08-06"
+# ⚠ VERSIONED BECAUSE A RECORD MUST BE DIAGNOSABLE LATER. If a re-run disagrees with a stored record,
+# the question is CORPUS CHANGED versus RULE CHANGED, and without this pin the two are
+# distinguishable only by memory — which is the thing this tool exists not to rely on.
 
 
 def canonical(term: str) -> str:
@@ -448,8 +495,32 @@ def carrier_units(location: str, text: str) -> list[tuple[str, str]]:
     for i in range(len(bounds) - 1):
         body = text[bounds[i]:bounds[i + 1]]
         if body.strip():
-            out.append((f"{location}#{i}", body))
+            # ⚠ `#unit-<n>`, NOT `#<n>`. A board key may legitimately END in `#<digits>`, and a
+            # key with no headings is returned UNSUFFIXED — so `board/incident#42` and a unit of
+            # `board/incident` were indistinguishable, and `_unit_location` reduced the former to
+            # the latter, MERGING TWO DISTINCT LOCATIONS and understating the very figure it exists
+            # to report. An unambiguous separator makes the collision unrepresentable.
+            out.append((f"{location}#unit-{i}", body))
     return out
+
+
+def _unit_location(unit_id: str) -> str:
+    """The LOCATION a unit belongs to — `docs/a.md#3` -> `docs/a.md`.
+
+    ⚠ REACH MUST BE REPORTABLE AT BOTH GRANULARITIES, AND UNTIL NOW IT WAS NOT. Every reach figure
+    this project produced was a UNIT count, because nothing recorded which units were reached and the
+    location figure could not be recovered afterwards. **A HUMAN OPENS LOCATIONS** — `11% of units`
+    and `41% of locations` were the same run, and only the second is a reading list.
+
+    ⚠ ONLY A ``#unit-<digits>`` SUFFIX IS STRIPPED, AND THE FIRST VERSION OF THIS WAS WRONG. It
+    stripped any trailing `#<digits>` — but a board key may legitimately END in `#<digits>`, and a
+    location with no headings is returned by ``carrier_units`` UNSUFFIXED. So `board/incident#42`
+    was reduced to `board/incident` and MERGED WITH A DISTINCT LOCATION, understating the location
+    count. A blind `rsplit("#")` is worse still. The separator now makes the collision
+    unrepresentable rather than merely unlikely.
+    """
+    head, sep, tail = unit_id.rpartition("#unit-")
+    return head if sep and tail.isdigit() else unit_id
 
 
 def extract_candidates(text: str) -> set[str]:
@@ -512,6 +583,78 @@ def expand(term: str) -> set[str]:
     return ({" ".join(parts), "".join(parts)} | {h.join(parts) for h in _HYPHENS}) - {term}
 
 
+def seed_census(seed: str, units: list[tuple[str, str, str]]) -> dict:
+    """EVERY SEARCHED UNIT THE SEED OCCURS IN — the ADJUDICATION'S INPUT, recorded BEFORE anything
+    narrows it.
+
+    ⚠ "SEARCHED" IS NOT A HEDGE, IT IS THE SCOPE. The unit index this is handed EXCLUDES the tool's
+    own namespace (see ``harvest``), and until this line was written that exclusion was documented
+    only against EXTRACTION — so a docstring saying "every unit" described a population the caller
+    does not supply. Doc-vs-code drift inside the tool whose entire subject is doc-vs-code drift.
+
+    ⚠ THIS EXISTS BECAUSE THE DESIGN RECORDS THE OUTCOME OF AN ADJUDICATION AND NEVER THE
+    ADJUDICATION. Claim-span seeding asks which carrier holds the claim, and that answer is a
+    JUDGEMENT. MEASURED on the 2026-08-04 incident: ``no egress`` is ordinary vocabulary in a project
+    about network isolation, and SEVEN OF THE EIGHT locations using the phrase were HOMONYMS — they
+    meant ``--network=none``, not the withdrawn compound ``count == 0 ⇒ no egress``. A record that
+    stores the chosen carrier and nothing else has replaced an ENUMERATION with an UNRECORDED
+    JUDGEMENT — which is this tool's founding failure (a sweep that searches what its author
+    remembers) one level down, inside the command whose docstring claims to make the registry honest.
+
+    ⚠ IT COUNTS, IT NEVER CHOOSES (R5). No threshold, no ranking, no filter: every unit holding the
+    seed is listed. WHICH of them were actually used is recorded SEPARATELY, by the caller, from the
+    loop's own behaviour — so the census and the run can DISAGREE VISIBLY. Fusing the two would be the
+    adjudication wearing the instrument's clothes, and a census that also decided could never
+    contradict the decision.
+
+    ⚠ AND IT IS COMPUTED ON THE SAME UNIT INDEX THE RUN USES, from the same snapshot. A census built
+    by a second enumeration would be measuring a different population from the one seeded, and any
+    disagreement would then be attributable to the instrument rather than to the judgement — which is
+    exactly the confound that made the first ARM-1 grid unreadable.
+
+    An uncompilable seed yields ``error`` set and an empty population. It is reported rather than
+    raised, because the caller decides what an instrument condition costs; this function only counts.
+    """
+    out: dict = {"seed": seed, "unit_total": len(units), "units_holding": [],
+                 "surfaces": [], "occurrences_total": 0, "error": None}
+    try:
+        pat = compile_pattern(seed)
+    except ValueError as exc:
+        out["error"] = f"seed does not compile to a pattern: {exc}"
+        return out
+    for uid, sname, utext in units:
+        n = len(pat.findall(normalise(utext)))
+        if n:
+            out["units_holding"].append({"unit": uid, "surface": sname, "occurrences": n})
+    out["surfaces"] = sorted({h["surface"] for h in out["units_holding"]})
+    out["occurrences_total"] = sum(h["occurrences"] for h in out["units_holding"])
+    return out
+
+
+def census_adjudication(census: dict, seeded: Iterable[str], *,
+                        carriers_named: Iterable[str] = (), basis: str) -> dict:
+    """What was DONE with the census — kept separate from the census itself, and PURE so it can be
+    tested on inputs that DISAGREE.
+
+    ⚠ THE SEPARATION IS THE POINT. ``seeded`` is measured by the caller from the run's own behaviour,
+    never copied from the census, so the two can contradict each other and the record will say so.
+    Inlining this as a set difference over a variable derived from the census would make the
+    contradiction UNREPRESENTABLE — the record would agree with itself by construction, which is the
+    property a self-check must not have.
+
+    ⚠ AND IT IS A FUNCTION SO THE DISAGREEMENT PATH CAN BE EXERCISED AT ALL. In the current build the
+    census and round 1 search the same seed over the same units, so they agree BY CONSTRUCTION and no
+    end-to-end test can distinguish a measurement from a copy. Extracting the reconciliation is what
+    makes the difference testable today rather than a claim waiting for ``--carrier`` to arrive.
+    """
+    held_units = {h["unit"] for h in census["units_holding"]}
+    seeded = list(seeded)
+    return {"carriers_named": list(carriers_named),
+            "seeded": sorted(seeded),
+            "adjudicated_out": sorted(held_units - set(seeded)),
+            "basis": basis}
+
+
 # ── registry (R3, R4, R13) ────────────────────────────────────────────────────────────────────────
 @dataclass
 class Record:
@@ -528,9 +671,33 @@ class Record:
     # ── R3 state. ⚠ DEFAULTED SO AN OLDER RECORD STILL LOADS: ``Record(**d)`` would otherwise raise
     # on every pre-R3 record in the registry, and a tool that cannot read its own history has no
     # history. New fields are added ONLY with defaults, for the same reason.
+    # ⚠ R15g — THESE THREE ARE DEAD STATE AND THEY STAY. `rounds`, `candidates` and `at_fixpoint`
+    # belonged to the fixpoint loop, which R15 deleted. Removing the FIELDS would make every record
+    # written before 2026-08-06 fail to load, and a tool that cannot read its own history has none.
+    # They are never written by the current code; they are read, preserved, and printed as history.
     rounds: list[dict] = field(default_factory=list)      # [{round, carriers, promoted, unpromoted}]
     candidates: dict = field(default_factory=dict)        # canonical -> provenance + both DF legs
     at_fixpoint: bool = False
+    # ⚠ THE SEED CENSUS AND THE ADJUDICATION OVER IT — the population the seeding decision was made
+    # FROM, not merely the decision's outcome. Defaulted like every other added field so an older
+    # record still loads; a record written before this field existed carries {} and says so, which is
+    # honest, rather than an empty census implying a measured zero.
+    seed_census: dict = field(default_factory=dict)
+    # ── R15/R15g. ALL DEFAULTED, for the same reason as every field above it.
+    # `carriers`      — the location(s) the operator NAMED as holding the claim. An adjudication.
+    # `boundary_rule` — which unit-boundary rule produced those spans, so a later disagreement is
+    #                   diagnosable as CORPUS CHANGED versus RULE CHANGED.
+    # `seeding_units` — WHICH units seeded, and what each contributed (R15f: the migrated audit
+    #                   target — the candidates TSV recorded a FILTERING decision that no longer
+    #                   exists, but WHICH TEXT SEEDED THE VOCABULARY is still a decision).
+    # `reach`         — R15c's one corpus pass, at BOTH granularities. ⚠ THE REACHED SET ITSELF IS
+    #                   PERSISTED, not just its size: every reach figure this project produced before
+    #                   today was unit-only, because nothing recorded WHICH units were reached, and
+    #                   a human opens LOCATIONS.
+    carriers: list[str] = field(default_factory=list)
+    boundary_rule: str = ""
+    seeding_units: dict = field(default_factory=dict)     # unit_id -> {surface, extracted[]}
+    reach: dict = field(default_factory=dict)             # units/locations reached + totals
 
     @property
     def is_open(self) -> bool:
@@ -826,6 +993,12 @@ def sweep(args) -> int:
             L.append(f"⚠ SURFACE DRIFT {rid}: recorded but not swept now: {sorted(drift)}")
     if open_records:
         L.append(f"OPEN RECORDS  {', '.join(open_records)}   <-- process debt (exit {EXIT_DEBT})")
+    # ⚠ THE ZERO-SEED OBSERVABLE WAS REMOVED 2026-08-06, AND ITS ABSENCE IS THE RULING.
+    # It printed "seed matched nothing at harvest — tripwire, or typo?" for a record whose census
+    # measured zero. With ``--carrier`` REQUIRED and a zero inside a named carrier REFUSED, a new
+    # record CANNOT carry a zero census — so the line became unreachable. Leaving it would be dead
+    # code wearing a control's clothes, which is the defect class this project has shipped three
+    # times (R7 described-unimplemented, R14 persisted-never-diffed, harvest-not-discovering-variants).
     L.append("")
 
     if instrument_errors:
@@ -945,102 +1118,214 @@ def harvest(args) -> int:
             for uid, utext in carrier_units(loc, normalise(body)):
                 units.append((uid, surf.name, utext))
 
-    # ── THE FIXPOINT LOOP (R3). Add-only over a fixed snapshot ⇒ the reached set is monotone and
-    # bounded by the corpus, so it terminates in at most |units| rounds and CANNOT oscillate.
-    # ⚠ THERE IS NO --anchor FLAG, AND ITS ABSENCE IS THE RULING. The design states that ANCHORS ARE
-    # AN OUTPUT OF HARVEST, NEVER AN INPUT, and the CLI used to invite them in anyway — laundering a
-    # remembered guess into the registry wearing an output's clothing. MEASURED on the 2026-08-04
-    # incident: hand-chosen subject anchors reached 1 of 5 carriers, STRICTLY WORSE than the literal
-    # seed's 3 of 5, and recovered NOTHING the seed had missed. The bias is systematic — whoever
-    # picks anchors has just finished writing the correction, so they reach for the MECHANISM's
-    # vocabulary while the carriers are still speaking the CLAIM's.
-    held: dict[str, str] = {canonical(args.seed): args.seed}
-    reached: dict[str, str] = {}
-    occurrences: dict[str, int] = {}
-    rounds: list[dict] = []
-    candidates: dict[str, dict] = {}
-    rnd = 0
-    while True:
-        rnd += 1
-        compiled = []
-        for c, term in held.items():
-            try:
-                compiled.append((c, term, compile_pattern(term)))
-            except ValueError:
-                continue
-        new_units = {}
-        for uid, sname, utext in units:
-            for c, term, pat in compiled:
-                hits = pat.findall(utext)
-                if hits:
-                    occurrences[c] = occurrences.get(c, 0) + len(hits)
-                    if uid not in reached:
-                        new_units[uid] = utext
-        # ⚠ THE STOP RULE IS EVALUATED AFTER THE ROUND HAS SEARCHED THE TERMS THE PREVIOUS ROUND
-        # PROMOTED. Stopping when a round PROMOTES nothing would truncate one round early and drop
-        # exactly the opportunistic axis-crossing terms the loop exists for.
-        if not new_units:
-            rounds.append({"round": rnd, "new_carriers": 0, "promoted": 0, "held": len(held)})
-            break
-        reached.update(new_units)
+    # ── THE SEED CENSUS (P1-1). Computed on the unit index above, BEFORE the loop reaches anything,
+    # so it records the population the seeding decision was made FROM rather than the decision's
+    # outcome. See ``seed_census`` for why the design's ``--carrier`` needs this to exist.
+    #
+    # ⚠ DEFERRED TEST GAP, RECORDED RATHER THAN CLAIMED CLOSED. Moving this call BELOW the fixpoint
+    # loop SURVIVES THE WHOLE SUITE — ``units`` is not mutated by the loop, so every output is
+    # byte-identical. The ordering is therefore load-bearing in INTENT and inert in BEHAVIOUR today.
+    # It stops being inert the day ``--carrier`` narrows the seeded population, because then the
+    # census must describe what existed BEFORE the narrowing. NO TEST PINS THIS YET; the test that
+    # can arrives with the flag. Found by dissent, not by the red-proof, and written here rather
+    # than left to memory — a surviving mutant is a test gap or a bad mutant, and this one is a gap
+    # whose CONSEQUENCE IS DEFERRED, NOT ABSENT.
+    census = seed_census(args.seed, units)
 
-        # EXTRACT from every reached carrier, then EXPAND every candidate and every held term.
-        found: set[str] = set()
-        for utext in reached.values():
-            found |= extract_candidates(utext)
-        expansions: set[str] = set()
-        for t in list(found) + list(held.values()):
-            expansions |= expand(t)
+    # ── R16 — AN UNSEARCHABLE SEED IS A REFUSAL. RULED 2026-08-06.
+    # ⚠ THE RECORD IT WOULD HAVE WRITTEN IS A FALSE INSTRUMENT, WHICH IS WORSE THAN AN EMPTY ONE.
+    # `variants` falls back to ``[args.seed]``, and every later sweep compiles the variants inside a
+    # ``try/except ValueError: continue`` — so the pattern NEVER RUNS, no observable says so, and the
+    # record SWEEPS CLEAN FOR EVER. A dead tripwire registered as a live one, in the tool whose whole
+    # subject is claims that stop being checked without anyone noticing.
+    #
+    # ⚠ TWO ZERO-SHAPED HARVEST ACTS, BOTH REFUSALS. AMENDED 2026-08-06 WHEN --carrier BECAME
+    # REQUIRED — the middle case was RETIRED rather than rescued:
+    #   (1) UNSEARCHABLE SEED                    → REFUSE here, exit 5. The pattern CAN NEVER FIRE.
+    #   (2) ZERO INSIDE A NAMED --carrier (R15d) → REFUSE. A location was ASSERTED and is empty.
+    #
+    # ⚠ THE RETIRED CASE WAS "corpus-wide zero on a BARE harvest is PERMITTED, as a tripwire". It
+    # died with the bare harvest, and it was NOT replaced by a flag. A flag invented to rescue
+    # yesterday's table is the same act as the fallback invented to rescue a mechanism.
+    # TRIPWIRE INTENT ALREADY LIVES IN ``expand``'s ZERO-HIT FORMS, which guard the carrier written
+    # tomorrow; and a typo against a named carrier is correctly caught by (2). If "register a guard
+    # at a location that does not yet hold the seed" is ever genuinely needed, IT IS A NEW CONSULT.
+    if census["error"]:
+        print("⚠ SEED FAILURE — the seed cannot be compiled into a pattern. NOTHING WAS WRITTEN.")
+        print(f"    {census['error']}")
+        print("  A record written now would carry this seed as its only variant, and every sweep")
+        print("  compiles variants inside `except ValueError: continue` — so the pattern would")
+        print("  NEVER RUN and the record would report CLEAN for ever, with no observable saying")
+        print("  the search did not happen. A dead tripwire registered as a live one.")
+        print(f"  This is exit {EXIT_SEED}, NOT the instrument code: the corpus is fine, the seed is not.")
+        return EXIT_SEED
 
-        promoted = 0
-        for term, origin in [(t, "extraction") for t in sorted(found)] + \
-                            [(t, "expansion") for t in sorted(expansions)]:
-            c = canonical(term)
-            if not c:
-                continue
-            # carrier-DF and corpus-DF are recorded as TWO LEGS, never fused into one score. A single
-            # scalar hides WHICH leg moved a candidate, and R5's whole posture is observables over
-            # verdicts. Nothing is excluded on either leg — they RANK.
-            if c not in candidates:
-                try:
-                    cpat = compile_pattern(term)
-                except ValueError:
-                    continue
-                # ⚠ ONLY THE CHEAP LEG IS COMPUTED IN THE LOOP. carrier_df scans the REACHED set
-                # (tens to hundreds of units) and is what the promotion rule consults. corpus_df
-                # scans the WHOLE corpus and is a printed RANKING leg only — computing it per
-                # candidate per round measured ~10ms x thousands of candidates and did not finish
-                # in 600s. It is computed once, at the end, for the candidates actually recorded.
-                candidates[c] = {"term": term, "origin": origin, "round": rnd,
-                                 "carrier_df": sum(1 for u in reached.values() if cpat.search(u)),
-                                 "corpus_df": None}
-            if c not in held and candidates[c]["carrier_df"] >= PROMOTE_MIN_CARRIER_DF:
-                held[c] = term
-                promoted += 1
-        rounds.append({"round": rnd, "new_carriers": len(new_units), "promoted": promoted,
-                       "held": len(held)})
+    # ── R15 — CLAIM-SPAN SEEDING. THE CANDIDATE SET COMES FROM THE CLAIM, NOT FROM THE CORPUS.
+    # The fixpoint loop that stood here is DELETED; its obituary and the four dead rescues are at
+    # ``BOUNDARY_RULE`` above, in the code, because a deletion whose justification lives only in a
+    # consult is this tool's own failure mode wearing a commit message.
 
-    # The second leg, once, at the end. R5: BOTH legs are reported, never fused into one score —
-    # a single scalar hides WHICH leg moved a candidate.
-    for c, d in candidates.items():
-        try:
-            cpat = compile_pattern(d["term"])
-        except ValueError:
-            d["corpus_df"] = -1
+    # ⚠ R15b — ``--carrier`` MUST NOT NAME THE TOOL'S OWN NAMESPACE. A stored run report carries the
+    # claim's FULL MATCHED SPAN, so seeding from one bootstraps the vocabulary tautologically out of
+    # the tool's own output — and under claim-span seeding it does so CLEANLY, producing a plausible
+    # 5/5. The failure is silent and self-certifying, which is exactly why it is a refusal and not a
+    # warning. The old guard lived inside the unit index the deletion removed.
+    named = list(args.carrier or [])
+    # ⚠ RULED 2026-08-06 — ``--carrier`` IS REQUIRED, AND THE REFUSAL LIVES HERE RATHER THAN IN
+    # argparse. A bare harvest USED to seed from every unit holding the seed; that was inferred from
+    # a ruling about a different question, and it RESTORED THE FLOOD IN ONE PASS — every
+    # seed-holding unit contributes its backticked spans, so `variants` explodes exactly as it did
+    # under the deleted loop. Cost sealed it: ~1,000 seed-holding units x ~50 terms x ~5 expansions
+    # is ~250,000 variants over the whole corpus. It also inverted the flag's meaning, turning
+    # ``--carrier`` into a NARROWER of an existing population rather than THE ACT THAT CREATES ONE.
+    #
+    # ⚠ AND IT IS NOT `required=True` ON THE ARGUMENT. argparse exits **2** on a missing required
+    # flag, and 2 is EXIT_TOMBSTONE — a forgotten flag would be indistinguishable from "a correction
+    # was re-worded", which is precisely the collision R4a's stratification exists to prevent.
+    if not named:
+        print("⚠ INSTRUMENT FAILURE — --carrier is REQUIRED. NOTHING WAS WRITTEN.")
+        print("  The seeding population IS the claim span; without a carrier there is no span, and")
+        print("  seeding from every unit holding the seed restores the flood this build deletes.")
+        return EXIT_INSTRUMENT
+    in_ns = [c for c in named if c.startswith(ns_str)]
+    if in_ns:
+        print("⚠ INSTRUMENT FAILURE — a --carrier names the tool's OWN namespace. NOTHING WRITTEN.")
+        for c in in_ns:
+            print(f"    {c}")
+        print("  Run reports store every hit's full matched span, so seeding from one would derive")
+        print("  the vocabulary from this tool's own output and produce a CLEAN-LOOKING result.")
+        return EXIT_INSTRUMENT
+
+    # Step 2 — locate each named carrier among the enumerated surfaces.
+    # ⚠ ABSENT IS AN INSTRUMENT FAILURE, NEVER AN EMPTY RESULT (R10's posture, applied to the input).
+    by_loc: dict[str, tuple[str, str]] = {}
+    for surf in surfaces:
+        if surf.error:
             continue
-        d["corpus_df"] = sum(1 for _, _, u in units if cpat.search(u))
+        for loc, body in surf.items:
+            by_loc[loc] = (surf.name, body)
+    missing = [c for c in named if c not in by_loc]
+    if missing:
+        print("⚠ INSTRUMENT FAILURE — --carrier not found on any enumerated surface. NOTHING WRITTEN.")
+        for c in missing:
+            print(f"    {c}")
+        print("  A carrier that cannot be located is not an empty carrier; the enumeration and the")
+        print("  operator disagree, and a record written now would pin that disagreement.")
+        return EXIT_INSTRUMENT
 
-    where = {sname for uid, sname, _ in units if uid in reached}
+    # Step 3 — EVERY occurrence of the seed, and the WHOLE ``carrier_units`` unit containing each.
+    # ⚠ EVERY OCCURRENCE, NEVER "THE CLAIM SENTENCE". MEASURED: one occurrence gives 4/5 and loses
+    # the carrier three prior passes had already missed; all occurrences give 5/5, recovering it via
+    # vocabulary from a span TWENTY LINES AWAY from the first occurrence. Reporting the first run
+    # alone would have boarded a failure caused by which paragraph happened to be picked.
+    #
+    seed_pat = compile_pattern(args.seed)
+    scope = [(uid, sname, utext) for uid, sname, utext in units
+             if _unit_location(uid) in named]
+    seeding = [(uid, sname, utext) for uid, sname, utext in scope if seed_pat.search(utext)]
+
+    # ⚠ R15d — ZERO OCCURRENCES IN A NAMED CARRIER IS A REFUSAL, NOT AN EMPTY RESULT.
+    # A carrier that exists but no longer holds the seed — renamed claim, rewritten under active
+    # edit — yields an empty union and would otherwise be written as AUTHORITATIVE STATE.
+    # ⚠ THIS IS NOT THE SAME ACT AS A CORPUS-WIDE ZERO ON A BARE HARVEST, WHICH IS PERMITTED (R16).
+    # There the pattern DOES NOT FIRE YET and is a tripwire; here THE CALLER ASSERTED A LOCATION and
+    # the assertion is refuted. Identical in the number, opposite in what they mean.
+    if not seeding:
+        print("⚠ INSTRUMENT FAILURE — the named carrier(s) contain ZERO occurrences of the seed.")
+        print("  NOTHING WAS WRITTEN. You asserted a location; the location does not hold the claim.")
+        for c in named:
+            print(f"    {c}")
+        print("  ⚠ THIS IS NOT A TRIPWIRE. Tripwire intent lives in `expand`'s zero-hit forms, which")
+        print("  guard a term that may be written tomorrow. A carrier you NAMED and that does not")
+        print("  hold the claim is a refuted assertion, and a typo is correctly caught here too.")
+        return EXIT_INSTRUMENT
+
+    # Step 4 — extract + expand over the UNION OF THOSE UNITS ONLY. No corpus. No rounds.
+    extracted: set[str] = set()
+    seeding_units: dict[str, dict] = {}
+    for uid, sname, utext in seeding:
+        terms = extract_candidates(utext)
+        # R15f — the candidates TSV recorded a FILTERING decision and the filtering is gone, so that
+        # audit target genuinely ceases to exist. But a decision REMAINS — WHICH TEXT SEEDED THE
+        # VOCABULARY — and a span sha256 is a commitment, not something a reviewer can read. So the
+        # per-unit contribution is recorded by UNIT IDENTITY, on the record and in a manifested spill.
+        seeding_units[uid] = {"surface": sname, "extracted": sorted(terms)}
+        extracted |= terms
+    expansions: set[str] = set()
+    for t in list(extracted) + [args.seed]:
+        expansions |= expand(t)
+
+    # ⚠ R15a — THE SEED IS IN ``variants`` BY CONSTRUCTION, AND THIS WAS CONFIRMED BY EXECUTION.
+    # ``extract_candidates`` excludes free prose BY DESIGN and ``expand`` excludes its own input BY
+    # CONSTRUCTION, so for a PROSE seed neither produces it. MEASURED on the real claim block: 15
+    # terms extracted and the seed was not among them — a record whose sweep never matches the exact
+    # withdrawn sentence. The old code guaranteed this twice, and BOTH guarantees lived inside the
+    # loop this change deletes.
+    variants_list = sorted({v for v in ({args.seed} | extracted | expansions) if v.strip()})
+
+    # ⚠ ``span_sha256`` IS STRUCK, NOT DEFERRED. It hashed the seeding text and NOTHING EVER
+    # RECOMPUTED OR COMPARED IT — by the same standard that killed R15e, an unverified hash is
+    # ceremony. What it claimed to protect is already carried by ``seeding_units`` and the spill:
+    # WHICH units seeded and WHAT each contributed, auditable by opening the unit, which a hash
+    # never was. If a consumer ever exists, it arrives WITH the consumer.
+
+    # ── R15c — STEP 4½: ONE CORPUS PASS. NO ITERATION, NO PROMOTION, NO THRESHOLD.
+    # ⚠ WITHOUT IT ``surfaces_at_withdrawal`` BECOMES MEMORY-AUTHORED AGAIN. Today it is COMPUTED
+    # from the reached set and the deletion removes the only thing computing it — the original
+    # disease persisting inside the registry, wearing a tool's clothing.
+    occurrences: dict[str, int] = {}
+    reached_units: set[str] = set()
+    for v in variants_list:
+        try:
+            vp = compile_pattern(v)
+        except ValueError:
+            continue
+        n = 0
+        for uid, _sname, utext in units:
+            hits = vp.findall(utext)
+            if hits:
+                n += len(hits)
+                reached_units.add(uid)
+        occurrences[canonical(v)] = n
+
+    # ⚠ BOTH GRANULARITIES, AND THE REACHED SET ITSELF IS PERSISTED — NOT MERELY ITS SIZE.
+    # Every reach figure this project has produced was UNIT-only, because nothing recorded WHICH
+    # units were reached, so the location figure could not be computed after the fact at all. A
+    # human opens LOCATIONS. Persisting the set is what makes a run scoreable at the granularity
+    # the cost is actually paid in.
+    all_locations = {_unit_location(uid) for uid, _, _ in units}
+    reached_locations = {_unit_location(uid) for uid in reached_units}
+    reach = {
+        "units_reached": len(reached_units), "units_total": len(units),
+        "locations_reached": len(reached_locations), "locations_total": len(all_locations),
+        "reached_units": sorted(reached_units), "reached_locations": sorted(reached_locations),
+    }
+
+    # ── THE ADJUDICATION OVER THE CENSUS (R5) — and with ``--carrier`` it finally records a REAL
+    # narrowing rather than an empty one. ``seeded`` is measured from what actually seeded above.
+    census["adjudication"] = census_adjudication(
+        census, [uid for uid, _, _ in seeding], carriers_named=named,
+        basis="carrier(s) named: the seeding population is the claim span inside them")
+
+    where = {sname for uid, sname, _ in units if uid in reached_units}
+
     rec = Record(
         id=args.id, seed=args.seed,
-        variants=sorted({v for v in held.values()}) or [args.seed],
-        anchors=[],   # OUTPUT-only; see the fixpoint loop above
-        nets_run=["literal-seed", "carrier-extraction", "orthographic-expansion"],
+        # ⚠ R15g — SORTED. The union is set-derived, and set iteration order would make record files
+        # nondeterministic across runs of identical input, so diffing two records would report
+        # changes nobody made.
+        variants=variants_list,
+        anchors=[],   # OUTPUT-only, never an input — see the --anchor ruling in main()
+        nets_run=["claim-span-seed", "carrier-extraction", "orthographic-expansion"],
         tombstones=[],                      # OPEN by construction — see R4
         surfaces_at_withdrawal=sorted(where),
         expected_counts={s.name: s.item_count for s in surfaces},
         parent=args.parent, created=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        rounds=rounds, candidates=candidates, at_fixpoint=True)
+        seed_census=census, carriers=named,
+        boundary_rule=BOUNDARY_RULE, seeding_units=seeding_units, reach=reach)
+    # ⚠ `rounds` / `candidates` / `at_fixpoint` ARE DELIBERATELY NOT WRITTEN. They were the fixpoint
+    # loop's state; the loop is gone. The FIELDS survive (defaulted) only so that records written
+    # before this change still load — a tool that cannot read its own history has none.
     variants = {v: occurrences.get(canonical(v), 0) for v in rec.variants}
 
     rd = NAMESPACE / "records"
@@ -1065,39 +1350,120 @@ def harvest(args) -> int:
     (NAMESPACE / rel).write_text(json.dumps(rec.__dict__, indent=2), encoding="utf-8")
     manifest_add(NAMESPACE, rel)
 
-    # R6 — the full ranked candidate list is SPILLED TO A MANIFESTED FILE, never destroyed. The
-    # display budget bounds what is SHOWN; it never bounds what is searched or what is recorded.
-    ranked = sorted(candidates.values(),
-                    key=lambda d: (-d["carrier_df"], d["corpus_df"], d["term"]))
-    crel = f"candidates/{rec.id}.tsv"
-    (NAMESPACE / "candidates").mkdir(parents=True, exist_ok=True)
+    # ── R15f — THE CANDIDATES TSV IS GONE; THE DECISION IT RECORDED HAS MIGRATED.
+    # ⚠ THAT FILE RECORDED A *FILTERING* DECISION — which candidates the promotion rule admitted —
+    # and the deletion removes the filtering, so nothing is dropped and that audit target genuinely
+    # CEASES TO EXIST. But a decision REMAINS: **WHICH TEXT SEEDED THE VOCABULARY**. A span sha256 is
+    # a COMMITMENT, not something a reviewer can read, so the replacement carries UNIT IDENTITIES and
+    # each unit's contribution — auditable by opening the unit, which is the point.
+    crel = f"seeding/{rec.id}.tsv"
+    (NAMESPACE / "seeding").mkdir(parents=True, exist_ok=True)
     (NAMESPACE / crel).write_text(
-        "carrier_df\tcorpus_df\tround\torigin\tterm\n" +
-        "\n".join(f"{d['carrier_df']}\t{d['corpus_df']}\t{d['round']}\t{d['origin']}\t{d['term']}"
-                  for d in ranked) + "\n", encoding="utf-8")
+        "surface\tunit\tterms_extracted\tterms\n" +
+        "\n".join(f"{d['surface']}\t{uid}\t{len(d['extracted'])}\t{' | '.join(d['extracted'])}"
+                  for uid, d in sorted(seeding_units.items())) + "\n", encoding="utf-8")
     manifest_add(NAMESPACE, crel)
+
+    # R6/R13 — and the REACHED SET spills too, at both granularities. Persisting the SET rather than
+    # its size is what makes a run scoreable in locations later; every figure before today was
+    # unit-only because nothing recorded which units were reached.
+    rrel = f"reach/{rec.id}.tsv"
+    (NAMESPACE / "reach").mkdir(parents=True, exist_ok=True)
+    (NAMESPACE / rrel).write_text(
+        "kind\tidentity\n" +
+        "\n".join(f"unit\t{u}" for u in reach["reached_units"]) + "\n" +
+        "\n".join(f"location\t{loc}" for loc in reach["reached_locations"]) + "\n",
+        encoding="utf-8")
+    manifest_add(NAMESPACE, rrel)
+
+    # R6/R12/R13 — the census SPILLS IN FULL to a manifested file. The printed view is bounded; what
+    # is recorded is not. A census that printed a top-N and kept nothing else would reproduce the
+    # silent cutoff it exists to expose.
+    seeded_set = set(census["adjudication"]["seeded"])
+    out_set = set(census["adjudication"]["adjudicated_out"])
+    named = census["adjudication"]["carriers_named"]
+    # ⚠ ORDERED BY LOCATION, NOT BY FREQUENCY, AND THE FILE ALREADY RULED THIS ABOUT ITSELF. ``sweep``
+    # sorts unknown-disposition FIRST because "leading with a suspected-live class primes confirmation
+    # over reading" — and an occurrence-ranked census primes by FREQUENCY, which on the founding
+    # incident points the wrong way: `no egress` was ordinary project vocabulary and 7 of its 8
+    # locations were HOMONYMS, so frequency plausibly ANTI-correlates with carrier-hood. The
+    # SINGLE-OCCURRENCE unit is where a forgotten carrier lives BY DEFINITION, and ranking sank it
+    # into the unprinted tail. Occurrence-ascending would be the opposite unjustified ranking; the
+    # answer is to present the POPULATION and let the occurrence column speak.
+    census_rows = sorted(census["units_holding"], key=lambda h: (h["surface"], h["unit"]))
+    srel = f"census/{rec.id}.tsv"
+    (NAMESPACE / "census").mkdir(parents=True, exist_ok=True)
+    (NAMESPACE / srel).write_text(
+        "occurrences\tseeded\tadjudicated_out\tsurface\tunit\n" +
+        "\n".join(f"{h['occurrences']}\t{h['unit'] in seeded_set}\t{h['unit'] in out_set}\t"
+                  f"{h['surface']}\t{h['unit']}" for h in census_rows) + "\n",
+        encoding="utf-8")
+    manifest_add(NAMESPACE, srel)
 
     print(f"HARVESTED {rec.id}")
     print(f"  seed            : {rec.seed!r}")
-    print(f"  carrier units   : {len(reached)} reached, of {len(units)} in the corpus")
-    print(f"  rounds          : {len(rounds)}  "
-          + " · ".join(f"r{r['round']}:+{r['new_carriers']}c/+{r['promoted']}p" for r in rounds))
-    print("  FIXPOINT        : reached — the final round searched every promoted term and found no")
-    print( "                    new carrier. Add-only over one snapshot, so this cannot oscillate.")
-    unprom = [d for d in candidates.values() if canonical(d["term"]) not in held]
-    print(f"  candidates      : {len(candidates)} scored  ·  {len(candidates)-len(unprom)} PROMOTED "
-          f"(carrier_df >= {PROMOTE_MIN_CARRIER_DF})  ·  {len(unprom)} NOT PROMOTED")
-    print( "  ⚠ NOT-PROMOTED IS NOT DISCARDED: every candidate above is scored on BOTH legs, written")
-    print(f"    to {crel}, and stored on the record. The rule narrows WHAT IS SEARCHED, never what is")
-    print( "    kept — and it is printed here every run, which is the whole of R12's requirement.")
-    print(f"  patterns held   : {len(rec.variants)}  (occurrences: {sum(variants.values())})")
-    print(f"  full ranked list: {crel}   [carrier_df, corpus_df — TWO LEGS, never fused]")
-    for d in ranked[:12]:
-        print(f"      c{d['carrier_df']:<3} n{d['corpus_df']:<4} r{d['round']} {d['origin'][:9]:<9} "
-              f"{d['term'][:64]}")
-    if len(ranked) > 12:
-        print(f"      … {len(ranked) - 12} more in {crel} — NOT truncated, SPILLED")
-    print(f"  surfaces        : {', '.join(rec.surfaces_at_withdrawal) or 'NONE — seed matched nothing'}")
+    # ── THE SEED CENSUS, PRINTED. The design records which carrier was chosen; this records what
+    # there was to choose FROM, which is the half a later reader cannot reconstruct.
+    if census["error"]:
+        print(f"  ⚠ SEED CENSUS   : NOT COMPUTED — {census['error']}")
+        print( "    The record below was built without one. Nothing downstream should be read as")
+        print( "    evidence about where the seed occurs.")
+    else:
+        print(f"  seed census     : {census['occurrences_total']} occurrences in "
+              f"{len(census['units_holding'])} of {census['unit_total']} carrier units, "
+              f"on {len(census['surfaces'])} surface(s): {', '.join(census['surfaces']) or 'NONE'}")
+        print(f"    seeded {len(seeded_set)}  ·  adjudicated out {len(out_set)}  ·  "
+              f"carriers named: {', '.join(named)}")
+        print(f"    {census['adjudication']['basis']}")
+        # ⚠ WHICH OF THE TWO THIS IS, IS DECIDED BY THE CODE AND NOT BY WHOEVER EDITS IT NEXT.
+        # A non-empty ``adjudicated_out`` means one of two OPPOSITE things, and the earlier version
+        # of this block asserted in PROSE that it could only ever mean the first: "this build
+        # adjudicates nothing, so the two must agree". That sentence goes FALSE the day ``--carrier``
+        # lands, and nothing would have failed to say so. Keying on ``carriers_named`` makes the
+        # distinction structural, which is this project's standing preference — mechanism over
+        # intent, because prose describing a behaviour the code has outgrown is the dangerous
+        # direction and this tool exists to find exactly that.
+        if out_set and not named:
+            print( "    ⚠ INSTRUMENT DISAGREEMENT — the census found the seed in units round 1 did")
+            print( "      not reach, and NO CARRIER WAS NAMED, so nothing narrowed the population.")
+            print( "      The two instruments disagree; this is NOT a recorded adjudication:")
+            for uid in sorted(out_set)[:8]:
+                print(f"        {uid}")
+        elif out_set:
+            print(f"    {len(out_set)} unit(s) held the seed and were ADJUDICATED OUT by the named")
+            print( "      carrier(s) above. This is the narrowing, RECORDED rather than silent:")
+            for uid in sorted(out_set)[:8]:
+                print(f"        {uid}")
+        for h in census_rows[:8]:
+            print(f"      x{h['occurrences']:<3} {h['surface'][:10]:<10} {h['unit'][:78]}")
+        if len(census_rows) > 8:
+            print(f"      … {len(census_rows) - 8} more in {srel} — NOT truncated, SPILLED")
+        print( "    ⚠ THESE ARE OCCURRENCES, NOT CARRIERS OF THE CLAIM. Whether a unit ASSERTS the")
+        print( "      withdrawn claim or merely uses the same words is a JUDGEMENT this tool does not")
+        print( "      make (R5). MEASURED on the founding incident: 7 of 8 were homonyms.")
+    # ── R15 — WHAT SEEDED, AND WHAT IT REACHED. Both, because they are different questions.
+    print(f"  carriers named  : {', '.join(named)}")
+    print(f"  seeding units   : {len(seeding_units)}")
+    print(f"  boundary rule   : {BOUNDARY_RULE}")
+    for uid, d in sorted(seeding_units.items())[:8]:
+        print(f"      {len(d['extracted']):>3} terms  {d['surface'][:10]:<10} {uid[:74]}")
+    if len(seeding_units) > 8:
+        print(f"      … {len(seeding_units) - 8} more in {crel} — NOT truncated, SPILLED")
+    print(f"  variants        : {len(rec.variants)}  (occurrences: {sum(variants.values())})")
+    print( "    = seed ∪ extracted ∪ orthographic expansions, over the seeding units ONLY.")
+    print( "    ⚠ NO ROUNDS, NO PROMOTION, NO THRESHOLD — so there is no cutoff left to be silent")
+    print( "      about (R12). The candidate set is bounded by the CLAIM SPAN, not by the corpus.")
+    # ⚠ REACH AT BOTH GRANULARITIES, ALWAYS. `11% of units` and `41% of locations` were the SAME
+    # run, and only the second is a reading list a human pays for.
+    print(f"  reach           : {reach['units_reached']}/{reach['units_total']} units "
+          f"({100 * reach['units_reached'] / max(1, reach['units_total']):.1f}%)  ·  "
+          f"{reach['locations_reached']}/{reach['locations_total']} LOCATIONS "
+          f"({100 * reach['locations_reached'] / max(1, reach['locations_total']):.1f}%)")
+    print(f"    the reached SET is persisted to {rrel}, not merely its size — so this run stays")
+    print( "    scoreable in locations later. A human opens locations.")
+    print( "    ⚠ ONE CORPUS PASS (R15c), no iteration and no promotion. This pins")
+    print( "      surfaces_at_withdrawal by MEASUREMENT; without it the record is memory-authored.")
+    print(f"  surfaces        : {', '.join(rec.surfaces_at_withdrawal)}")
     print(f"  nets run        : {', '.join(rec.nets_run)}")
     print(f"  expected counts : pinned for {len(rec.expected_counts)} surfaces")
     print()
@@ -1110,6 +1476,100 @@ def harvest(args) -> int:
     return EXIT_DEBT
 
 
+def retombstone(args) -> int:
+    """R4/R7.5 — BIND A RECORD'S CORRECTION BLOCKS. THE STEP THAT CLOSES THE LOOP.
+
+    ⚠ THIS WAS SPECIFIED AND NEVER SHIPPED, AND ITS ABSENCE BROKE THE TOOL'S OWN PROCESS. `harvest`
+    writes records OPEN; `sweep` CHECKS tombstones; **nothing created one.** So the loop the whole
+    design is built around — harvest → correct → register — COULD NOT BE COMPLETED WITH THE TOOL.
+    Two records sat open, exiting 4 for ever, beside a correct hash-verified withdrawn block with
+    nowhere to go.
+
+    That lands exactly on R4a's own warning: *"an exit that is always red trains the reader to route
+    around it"*. A permanently-open record is process debt the tool MANUFACTURES and then reports.
+    Fourth instance of built-enough-to-describe after R7, R14 and harvest-not-discovering-variants —
+    and, again, found by EXECUTION rather than by review.
+
+    ⚠ "HASH-VERIFIED" MEANS **COMPUTED, NEVER SUPPLIED**. The stored `block_sha256` is derived from
+    the bytes of the block actually found on the surface, so a caller cannot assert a hash that does
+    not match its text. There is deliberately NO `--expect <sha>` flag: an assertion the caller
+    writes by hand is one more thing to get wrong, and R7 already keys the control on the block.
+
+    ⚠ AND RE-BINDING IS AN OVERWRITE, WHICH IS THE ONE PLACE THAT IS CORRECT. `harvest` REFUSES to
+    overwrite a record precisely because it would silently reset tombstones; here, replacing a
+    tombstone with a freshly computed one IS the point — R7.5 exists because *"if updating the
+    control is harder than ignoring the failure, ignoring wins"*. Scope is still bounded: with
+    `--location`, tombstones OUTSIDE the named locations are PRESERVED, so a narrow re-bind cannot
+    quietly drop a control it was not asked about.
+    """
+    cfg = load_config()
+    surfaces = gather_surfaces(cfg)
+    records = load_records(NAMESPACE)
+    if args.record not in records:
+        print(f"⚠ INSTRUMENT FAILURE — no registered record {args.record!r}. NOTHING WAS WRITTEN.")
+        print(f"    known: {', '.join(sorted(records)) or 'none'}")
+        return EXIT_INSTRUMENT
+    errs, _ = instrument_gate(surfaces, cfg, records, list(records), NAMESPACE)
+    if errs:
+        # The blocks live ON the surfaces, so binding against an enumeration `sweep` would refuse to
+        # certify would pin a control to a reading the tool does not trust.
+        print("⚠ INSTRUMENT FAILURE — refusing to bind against surfaces that cannot be trusted.")
+        for e in errs:
+            print("   ", e)
+        return EXIT_INSTRUMENT
+
+    wanted = list(args.location or [])
+    found: list[tuple[str, str]] = []          # (location, block_sha256)
+    for s in surfaces:
+        if s.error:
+            continue
+        for loc, body in s.items:
+            if wanted and loc not in wanted:
+                continue
+            block = extract_blocks(body).get(args.record)
+            if block is not None:
+                found.append((loc, block_sha(block)))
+
+    if not found:
+        # ⚠ TWO DIFFERENT REFUSALS, AND THE MESSAGE MUST SAY WHICH. "You named a location and there
+        # is no block there" is a refuted assertion; "there is no block anywhere" is a correction
+        # that was never written. Same exit, different remediation, so the text carries the split.
+        print(f"⚠ NOTHING TO BIND for record {args.record!r}. NOTHING WAS WRITTEN.")
+        if wanted:
+            print(f"    no {BLOCK_OPEN}{args.record} --> block at: {', '.join(wanted)}")
+            print("  You named a location and the block is not there — a refuted assertion, not an")
+            print("  empty result. Check the location, or omit --location to bind wherever it is.")
+        else:
+            print(f"    no {BLOCK_OPEN}{args.record} --> block on ANY enumerated surface")
+            print("  The correction has not been written yet. Quote the withdrawn text inside a")
+            print(f"  {BLOCK_OPEN}{args.record} --> … {BLOCK_CLOSE} block, then bind it.")
+        print(f"  This is exit {EXIT_BIND}, NOT {EXIT_TOMBSTONE}: nothing BROKE — nothing EXISTS.")
+        return EXIT_BIND
+
+    rec = records[args.record]
+    # PRESERVE tombstones outside the scope that was asked about; replace those inside it.
+    touched = {loc for loc, _ in found} | set(wanted)
+    kept = [t for t in rec.tombstones if t.get("location") not in touched]
+    rec.tombstones = kept + [{"location": loc, "block_sha256": sha} for loc, sha in sorted(found)]
+
+    rel = f"records/{rec.id}.json"
+    (NAMESPACE / "records").mkdir(parents=True, exist_ok=True)
+    (NAMESPACE / rel).write_text(json.dumps(rec.__dict__, indent=2), encoding="utf-8")
+    manifest_add(NAMESPACE, rel)
+
+    print(f"BOUND {rec.id}")
+    for loc, sha in sorted(found):
+        print(f"  {sha[:16]}…  {loc}")
+    if kept:
+        print(f"  {len(kept)} tombstone(s) OUTSIDE the named scope were PRESERVED, not dropped.")
+    print(f"  record is now {'CLOSED' if not rec.is_open else 'OPEN'} "
+          f"({len(rec.tombstones)} tombstone(s))")
+    print("  ⚠ CLOSED DOES NOT MEAN GONE (R1). The withdrawn text is still live in the world, and")
+    print("    every sweep still searches this record's variants — closed means the correction was")
+    print("    made once, not that the claim stopped existing.")
+    return EXIT_CLEAN
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1117,11 +1577,32 @@ def main(argv: list[str] | None = None) -> int:
     sw.add_argument("records", nargs="*", help="record ids; omit for all (R1)")
     sw.add_argument("--show", type=int, default=40)
     sw.set_defaults(fn=sweep)
-    hv = sub.add_parser("harvest", help="harvest actual variants and register a record (R3/R4)")
+    hv = sub.add_parser("harvest", help="harvest actual variants and register a record (R3/R4/R15)")
     hv.add_argument("id")
     hv.add_argument("seed")
+    # ⚠ REPEATABLE, AND THAT IS A RULING RATHER THAN A CONVENIENCE. A claim can be made in more than
+    # one place before anyone notices it is wrong — the founding incident had FIVE carriers — so a
+    # single-valued flag would force the operator to pick one and silently discard the rest of the
+    # span they had already found. `action="append"` keeps the adjudication explicit and RECORDED:
+    # every named carrier lands in `Record.carriers` and in the census adjudication.
+    hv.add_argument("--carrier", action="append", default=[], metavar="LOCATION",
+                    help="location holding the claim; REPEATABLE and REQUIRED. The seeding "
+                         "population IS the claim span inside these carriers (R15)")
+    # ⚠ RETAINED DELIBERATELY, AND ITS ABSENCE WOULD BE SILENT. `--parent` is the ONLY input to
+    # `ancestor_closure`, so dropping it by omission would leave R1's nested-withdrawal case with
+    # nothing to close over — and the NESTED withdrawal is half of the founding failure. A flag that
+    # goes missing takes a whole ruling dark without anything failing.
     hv.add_argument("--parent", default=None, help="supersession parent record id (R1)")
     hv.set_defaults(fn=harvest)
+    # R7.5 — "re-binds in ONE command. If updating the control is harder than ignoring the failure,
+    # ignoring wins." The friction IS the design constraint, so the shape stays one positional.
+    rt = sub.add_parser("retombstone",
+                        help="bind a record's correction blocks — closes the loop (R4/R7)")
+    rt.add_argument("record")
+    rt.add_argument("--location", action="append", default=[], metavar="LOCATION",
+                    help="restrict to these locations; REPEATABLE. Omit to bind wherever the "
+                         "block is. Tombstones outside the named scope are PRESERVED")
+    rt.set_defaults(fn=retombstone)
     a = ap.parse_args(argv)
     return a.fn(a)
 
