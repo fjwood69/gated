@@ -694,6 +694,27 @@ class Record:
     #                   PERSISTED, not just its size: every reach figure this project produced before
     #                   today was unit-only, because nothing recorded WHICH units were reached, and
     #                   a human opens LOCATIONS.
+    # ── R18 SHAPE ONLY. RULED 2026-08-06: ADOPT THE FIELDS, BUILD NO COMMAND YET.
+    # ⚠ NOTHING EXCLUDES A RETIRED RECORD FROM ANYTHING. These fields are carried, printed, and
+    # otherwise INERT — a retired record is still swept, still counted, still pinned, still checked.
+    # That is deliberate: the design review found THREE SEMANTIC ERRORS BY OMISSION in the retire
+    # draft, and the one that matters here is that `selected` feeds SIX consumers (count pins,
+    # tombstone-loss checks, variant sweeping, process debt, drift printing, and R7 exclusion
+    # licensing). "Leaves the default sweep set, and nothing else" is UNIMPLEMENTABLE AS STATED, and
+    # the obvious implementation — filter `selected` once, early — silently changes all six and
+    # VOIDS THE DRAFT'S OWN DEBT SAFEGUARD while the header still claims it holds.
+    #
+    # ⚠ SO THE SAFEGUARD SHIPS BEFORE THE LEVER, WHICH IS THE ORDER THAT MATTERS. `sweep` prints
+    # every retired record with its reason from today; the act that would exclude one does not exist
+    # yet. An exclusion whose visibility arrives later is the R7 self-service-exclusion defect
+    # waiting to happen, and R7 was found in dissent inside the tool built to stop claims
+    # disappearing without record.
+    #
+    # THE MANUAL PROCEDURE, until a second hand-edit justifies a command: set these two fields by
+    # hand on the record JSON. `load_records` tolerates it (defaulted, unknown keys dropped), every
+    # sweep prints it, and NOTHING is silently un-hunted — because nothing is un-hunted at all.
+    retired_at: str = ""
+    retired_reason: str = ""
     carriers: list[str] = field(default_factory=list)
     boundary_rule: str = ""
     seeding_units: dict = field(default_factory=dict)     # unit_id -> {surface, extracted[]}
@@ -924,6 +945,22 @@ def sweep(args) -> int:
     # "closed", but its withdrawn text is still live in the world: closed means the correction was made
     # once, not that the text is gone. A-variants inside B's correction prose are exactly the miss.
     if args.records:
+        # ⚠ AN UNKNOWN RECORD ID IS AN INSTRUMENT FAILURE, NOT A CLEAN SWEEP. RULED 2026-08-06.
+        # `ancestor_closure` skips ids it does not know (`rid not in records: continue`), so
+        # `sweep TYPO-ID` used to yield an EMPTY selected set, search nothing, find nothing, and
+        # EXIT 0 CLEAN — with the header printing the id it never swept. A typo and a genuinely
+        # clean sweep were INDISTINGUISHABLE, and the wrong one is the reassuring one.
+        # Same posture as `retombstone`'s unknown-record refusal: the caller named something that
+        # does not exist, so the remediation is to check what they typed, not to trust the zero.
+        unknown = [r for r in args.records if r not in records]
+        if unknown:
+            print("⚠ INSTRUMENT FAILURE — unknown record id(s). NOTHING WAS SWEPT.")
+            for r in unknown:
+                print(f"    {r}")
+            print(f"  known: {', '.join(sorted(records)) or 'none'}")
+            print("  A sweep that searched nothing must never report clean — a typo would then be")
+            print("  indistinguishable from a corpus with no live carriers.")
+            return EXIT_INSTRUMENT
         selected = ancestor_closure(args.records, records)
         swept_label = f"{','.join(args.records)} + ancestors: {','.join(selected)}"
     else:
@@ -993,6 +1030,20 @@ def sweep(args) -> int:
             L.append(f"⚠ SURFACE DRIFT {rid}: recorded but not swept now: {sorted(drift)}")
     if open_records:
         L.append(f"OPEN RECORDS  {', '.join(open_records)}   <-- process debt (exit {EXIT_DEBT})")
+    # ── R18 — THE ALWAYS-PRINT CONTROL, SHIPPED BEFORE THE LEVER IT GUARDS.
+    # ⚠ RETIREMENT EXCLUDES NOTHING TODAY. This prints what a record CLAIMS about itself and changes
+    # no behaviour whatsoever: a retired record is still swept, still contributes count pins, still
+    # has its tombstones checked, still licenses R7 exclusions, still fires process debt. The header
+    # says so explicitly, because a reader who saw "RETIRED" and assumed "not searched" would have
+    # the exclusion's danger without the exclusion existing.
+    # ⚠ AND THE DRIFT LINE FOR A RETIRED RECORD BELONGS HERE, NOT DROPPED (ruled): the information
+    # survives, scoped, rather than polluting the live section or vanishing.
+    retired = [rid for rid in selected if records[rid].retired_at]
+    for rid in retired:
+        rec_r = records[rid]
+        L.append(f"RETIRED {rid} @ {rec_r.retired_at}: {rec_r.retired_reason or '(no reason given)'}")
+        L.append(f"        {len(rec_r.variants)} variants — ⚠ STILL SWEPT. Retirement carries no "
+                 f"exclusion yet; the `retire` command is not built.")
     # ⚠ THE ZERO-SEED OBSERVABLE WAS REMOVED 2026-08-06, AND ITS ABSENCE IS THE RULING.
     # It printed "seed matched nothing at harvest — tripwire, or typo?" for a record whose census
     # measured zero. With ``--carrier`` REQUIRED and a zero inside a named carrier REFUSED, a new
