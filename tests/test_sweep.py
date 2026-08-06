@@ -1366,6 +1366,150 @@ class Retombstone(unittest.TestCase):
         self.assertIn("unrecognized arguments: --nonsense", err.getvalue())
 
 
+class UnknownRecordId(unittest.TestCase):
+    """⚠ `sweep TYPO-ID` USED TO EXIT 0 CLEAN. Found by a design review of an unrelated feature.
+
+    `ancestor_closure` skips ids it does not know, so an unknown id yielded an EMPTY selected set:
+    nothing searched, nothing found, **exit 0**, and the header printing the id it never swept. A
+    typo and a genuinely clean corpus were indistinguishable — and **the wrong one is the reassuring
+    one**, which is this tool's entire subject.
+    """
+
+    TOKEN = "ZZ-SWEEP-CONTROL-TOKEN"
+
+    def _sweep(self, ids, with_record=True):
+        import contextlib
+        import io
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+        ns = Path(tempfile.mkdtemp())
+        if with_record:
+            (ns / "records").mkdir()
+            (ns / "records" / "REAL.json").write_text(json.dumps({
+                "id": "REAL", "seed": "x", "variants": ["x"], "anchors": [], "nets_run": [],
+                "tombstones": [{"location": "docs/a.md", "block_sha256": "s"}],
+                "surfaces_at_withdrawal": [], "expected_counts": {}, "parent": None,
+                "created": ""}), encoding="utf-8")
+            (ns / "manifest.json").write_text(json.dumps(["records/REAL.json"]), encoding="utf-8")
+        cfg = {"control_token": self.TOKEN, "surfaces": [], "expected_counts": {}}
+        surf = S.SurfaceResult("docs", "filesystem", "1 files", 1, [("docs/a.md", self.TOKEN)])
+        out = io.StringIO()
+        with mock.patch.object(S, "load_config", return_value=cfg), \
+             mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
+             mock.patch.object(S, "NAMESPACE", ns), contextlib.redirect_stdout(out):
+            rc = S.sweep(SimpleNamespace(records=ids, show=10))
+        return rc, out.getvalue()
+
+    def test_an_unknown_id_REFUSES_instead_of_reporting_clean(self):
+        rc, out = self._sweep(["TYPO-ID"])
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIn("unknown record id", out)
+        self.assertNotEqual(rc, S.EXIT_CLEAN, "a sweep that searched nothing must never read clean")
+
+    def test_a_KNOWN_id_still_sweeps(self):
+        """Correlated control: prove the refusal is the unknown-id check and not a broken path."""
+        rc, out = self._sweep(["REAL"])
+        self.assertNotEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIn("REAL", out)
+
+    def test_one_unknown_among_known_ids_STILL_refuses(self):
+        """⚠ A partial match is the dangerous case: the run would sweep the real ids, find nothing,
+        and the caller would believe the typo'd one was covered too."""
+        rc, out = self._sweep(["REAL", "TYPO-ID"])
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIn("TYPO-ID", out)
+
+
+class RetirementShapeOnly(unittest.TestCase):
+    """R18 — ⚠ THE SHAPE IS ADOPTED AND THE COMMAND IS NOT BUILT. RULED 2026-08-06.
+
+    A design review found three semantic errors by omission in the `retire` draft, the load-bearing
+    one being that `selected` feeds SIX consumers — count pins, tombstone-loss checks, variant
+    sweeping, process debt, drift printing, and R7 exclusion licensing. "Leaves the default sweep
+    set, and nothing else" is **unimplementable as stated**, and filtering `selected` once would
+    void the draft's own debt safeguard while the header still claimed it held.
+
+    ⚠ **SO THE SAFEGUARD SHIPS BEFORE THE LEVER.** The always-print control exists from today; the
+    act that would exclude anything does not. An exclusion whose visibility arrives later is the R7
+    self-service-exclusion defect waiting to happen.
+    """
+
+    def _rec(self, **kw):
+        d = {"id": "R", "seed": "x", "variants": ["x", "y"], "anchors": [], "nets_run": [],
+             "tombstones": [], "surfaces_at_withdrawal": [], "expected_counts": {},
+             "parent": None, "created": ""}
+        d.update(kw)
+        return d
+
+    def test_the_fields_default_and_an_OLD_record_still_loads(self):
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        (ns / "records").mkdir()
+        (ns / "records" / "R.json").write_text(json.dumps(self._rec()), encoding="utf-8")
+        r = S.load_records(ns)["R"]
+        self.assertEqual(r.retired_at, "")
+        self.assertEqual(r.retired_reason, "")
+
+    def test_a_HAND_EDITED_retirement_is_carried_by_the_loader(self):
+        """The manual procedure: set the two fields by hand. The loader must tolerate it, or the
+        procedure the ruling adopted does not work at all."""
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        (ns / "records").mkdir()
+        (ns / "records" / "R.json").write_text(json.dumps(
+            self._rec(retired_at="2026-08-06", retired_reason="loop artefact")), encoding="utf-8")
+        r = S.load_records(ns)["R"]
+        self.assertEqual(r.retired_at, "2026-08-06")
+        self.assertEqual(r.retired_reason, "loop artefact")
+
+    def test_sweep_PRINTS_a_retired_record_with_its_reason(self):
+        """⚠ THE ALWAYS-PRINT CONTROL. An exclusion that is invisible is the R7 defect reinvented,
+        so the visibility ships first — before anything can be excluded at all."""
+        rc, out = self._sweep_with(retired_at="2026-08-06", retired_reason="loop artefact")
+        self.assertIn("RETIRED R @ 2026-08-06: loop artefact", out)
+
+    def test_the_header_says_a_retired_record_is_STILL_SWEPT(self):
+        """⚠ A reader who saw RETIRED and assumed "not searched" would have the exclusion's danger
+        without the exclusion existing. The line must say what is true TODAY."""
+        _, out = self._sweep_with(retired_at="2026-08-06", retired_reason="noise")
+        self.assertIn("STILL SWEPT", out)
+
+    def test_retirement_changes_NOTHING_about_the_run(self):
+        """⚠ THE WHOLE POINT OF SHAPE-ONLY. Retirement must be inert until the consumer table is
+        ruled and built: same exit, same debt, same everything."""
+        rc_plain, _ = self._sweep_with()
+        rc_retired, _ = self._sweep_with(retired_at="2026-08-06", retired_reason="noise")
+        self.assertEqual(rc_plain, rc_retired,
+                         "a retired record must still fire process debt — the draft's own safeguard")
+
+    def test_a_NON_retired_record_prints_no_RETIRED_line(self):
+        """Correlated negative control: without it the print tests pass on code that labels every
+        record retired."""
+        _, out = self._sweep_with()
+        self.assertNotIn("RETIRED", out)
+
+    def _sweep_with(self, **kw):
+        import contextlib
+        import io
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+        token = "ZZ-SWEEP-CONTROL-TOKEN"
+        ns = Path(tempfile.mkdtemp())
+        (ns / "records").mkdir()
+        (ns / "records" / "R.json").write_text(json.dumps(self._rec(**kw)), encoding="utf-8")
+        (ns / "manifest.json").write_text(json.dumps(["records/R.json"]), encoding="utf-8")
+        cfg = {"control_token": token, "surfaces": [], "expected_counts": {}}
+        surf = S.SurfaceResult("docs", "filesystem", "1 files", 1, [("docs/a.md", token)])
+        out = io.StringIO()
+        with mock.patch.object(S, "load_config", return_value=cfg), \
+             mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
+             mock.patch.object(S, "NAMESPACE", ns), contextlib.redirect_stdout(out):
+            rc = S.sweep(SimpleNamespace(records=[], show=10))
+        return rc, out.getvalue()
+
+
 # ⚠ THIS ENTRY POINT MUST STAY AT THE END OF THE FILE, AND IT USED TO SIT IN THE MIDDLE.
 # ``unittest.main()`` runs at the point it is reached during module execution, so every class defined
 # BELOW it was never registered when the file was run as a script: `python3 test_sweep.py` reported
