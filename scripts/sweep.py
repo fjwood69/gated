@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """sweep — find every surface still asserting a withdrawn claim.
 
-Built to DESIGN-supersession-sweep.md v3 (ratified 2026-08-04). Ruling IDs (R1, R2, R4a, …) in the
-comments below refer to that document; the design carries the reasoning, this file carries the
-mechanism, and neither is complete without the other.
+Built to DESIGN-supersession-sweep.md — v3 (ratified 2026-08-04) THROUGH v4/R15, R16 and R17, all
+ratified 2026-08-06 and built here. Ruling IDs (R1, R2, R4a, …) refer to that document; the design
+carries the reasoning, this file carries the mechanism, and neither is complete without the other.
+
+⚠ THIS LINE SAID "v3" FOR A DAY AFTER v4 WAS BUILT, AND A VERSION CLAIM IS RULED RATHER THAN TIDIED.
+An outside reviewer, given only this file, framed the mismatch as a binary — stale header, or a
+rationale citing an unratified design — and it was neither: the DESIGN's own title was the stale
+surface, and this header was right until v4 landed. Two surfaces, one status, and the false one hid
+behind the true one. The tool's entire subject, on line 4 of the tool.
 
 THE ONE-LINE REASON THIS EXISTS: on 2026-08-03 a withdrawn claim was swept FROM MEMORY, three carriers
 were named, and it lived on five. The two missed were the design document under active edit and a
@@ -38,6 +44,12 @@ EXIT_TOMBSTONE = 2    # a correction was re-worded — STILL PRINTS EVERY HIT (R
 EXIT_HITS = 3         # live hits, read them
 EXIT_DEBT = 4         # a record is open (zero tombstones)
 EXIT_SEED = 5         # the SEED the caller supplied cannot be searched with (R16)
+EXIT_BIND = 6         # `retombstone` found nothing to bind (R4/R7)
+# ⚠ SIX, DELIBERATELY NOT TWO. `EXIT_TOMBSTONE` (2) means "a registered control BROKE"; this means
+# "there was nothing to register in the first place". Opposite ends of the same loop — one is a
+# correction that drifted, the other is a correction that was never written — and an operator shown
+# code 2 goes looking for a re-worded block that does not exist. Same stratification law as R16's
+# exit 5: different CAUSE, different remediation, so different code.
 # ⚠ R16 — WHY THE BROKEN SEED GETS ITS OWN STRATUM RATHER THAN REUSING EXIT_INSTRUMENT.
 # Every other code above names a failure of the CORPUS or the CHANNEL: a surface vanished, a fetch
 # truncated, a control did not travel, a file appeared unmanifested. A seed that will not compile is
@@ -1464,6 +1476,100 @@ def harvest(args) -> int:
     return EXIT_DEBT
 
 
+def retombstone(args) -> int:
+    """R4/R7.5 — BIND A RECORD'S CORRECTION BLOCKS. THE STEP THAT CLOSES THE LOOP.
+
+    ⚠ THIS WAS SPECIFIED AND NEVER SHIPPED, AND ITS ABSENCE BROKE THE TOOL'S OWN PROCESS. `harvest`
+    writes records OPEN; `sweep` CHECKS tombstones; **nothing created one.** So the loop the whole
+    design is built around — harvest → correct → register — COULD NOT BE COMPLETED WITH THE TOOL.
+    Two records sat open, exiting 4 for ever, beside a correct hash-verified withdrawn block with
+    nowhere to go.
+
+    That lands exactly on R4a's own warning: *"an exit that is always red trains the reader to route
+    around it"*. A permanently-open record is process debt the tool MANUFACTURES and then reports.
+    Fourth instance of built-enough-to-describe after R7, R14 and harvest-not-discovering-variants —
+    and, again, found by EXECUTION rather than by review.
+
+    ⚠ "HASH-VERIFIED" MEANS **COMPUTED, NEVER SUPPLIED**. The stored `block_sha256` is derived from
+    the bytes of the block actually found on the surface, so a caller cannot assert a hash that does
+    not match its text. There is deliberately NO `--expect <sha>` flag: an assertion the caller
+    writes by hand is one more thing to get wrong, and R7 already keys the control on the block.
+
+    ⚠ AND RE-BINDING IS AN OVERWRITE, WHICH IS THE ONE PLACE THAT IS CORRECT. `harvest` REFUSES to
+    overwrite a record precisely because it would silently reset tombstones; here, replacing a
+    tombstone with a freshly computed one IS the point — R7.5 exists because *"if updating the
+    control is harder than ignoring the failure, ignoring wins"*. Scope is still bounded: with
+    `--location`, tombstones OUTSIDE the named locations are PRESERVED, so a narrow re-bind cannot
+    quietly drop a control it was not asked about.
+    """
+    cfg = load_config()
+    surfaces = gather_surfaces(cfg)
+    records = load_records(NAMESPACE)
+    if args.record not in records:
+        print(f"⚠ INSTRUMENT FAILURE — no registered record {args.record!r}. NOTHING WAS WRITTEN.")
+        print(f"    known: {', '.join(sorted(records)) or 'none'}")
+        return EXIT_INSTRUMENT
+    errs, _ = instrument_gate(surfaces, cfg, records, list(records), NAMESPACE)
+    if errs:
+        # The blocks live ON the surfaces, so binding against an enumeration `sweep` would refuse to
+        # certify would pin a control to a reading the tool does not trust.
+        print("⚠ INSTRUMENT FAILURE — refusing to bind against surfaces that cannot be trusted.")
+        for e in errs:
+            print("   ", e)
+        return EXIT_INSTRUMENT
+
+    wanted = list(args.location or [])
+    found: list[tuple[str, str]] = []          # (location, block_sha256)
+    for s in surfaces:
+        if s.error:
+            continue
+        for loc, body in s.items:
+            if wanted and loc not in wanted:
+                continue
+            block = extract_blocks(body).get(args.record)
+            if block is not None:
+                found.append((loc, block_sha(block)))
+
+    if not found:
+        # ⚠ TWO DIFFERENT REFUSALS, AND THE MESSAGE MUST SAY WHICH. "You named a location and there
+        # is no block there" is a refuted assertion; "there is no block anywhere" is a correction
+        # that was never written. Same exit, different remediation, so the text carries the split.
+        print(f"⚠ NOTHING TO BIND for record {args.record!r}. NOTHING WAS WRITTEN.")
+        if wanted:
+            print(f"    no {BLOCK_OPEN}{args.record} --> block at: {', '.join(wanted)}")
+            print("  You named a location and the block is not there — a refuted assertion, not an")
+            print("  empty result. Check the location, or omit --location to bind wherever it is.")
+        else:
+            print(f"    no {BLOCK_OPEN}{args.record} --> block on ANY enumerated surface")
+            print("  The correction has not been written yet. Quote the withdrawn text inside a")
+            print(f"  {BLOCK_OPEN}{args.record} --> … {BLOCK_CLOSE} block, then bind it.")
+        print(f"  This is exit {EXIT_BIND}, NOT {EXIT_TOMBSTONE}: nothing BROKE — nothing EXISTS.")
+        return EXIT_BIND
+
+    rec = records[args.record]
+    # PRESERVE tombstones outside the scope that was asked about; replace those inside it.
+    touched = {loc for loc, _ in found} | set(wanted)
+    kept = [t for t in rec.tombstones if t.get("location") not in touched]
+    rec.tombstones = kept + [{"location": loc, "block_sha256": sha} for loc, sha in sorted(found)]
+
+    rel = f"records/{rec.id}.json"
+    (NAMESPACE / "records").mkdir(parents=True, exist_ok=True)
+    (NAMESPACE / rel).write_text(json.dumps(rec.__dict__, indent=2), encoding="utf-8")
+    manifest_add(NAMESPACE, rel)
+
+    print(f"BOUND {rec.id}")
+    for loc, sha in sorted(found):
+        print(f"  {sha[:16]}…  {loc}")
+    if kept:
+        print(f"  {len(kept)} tombstone(s) OUTSIDE the named scope were PRESERVED, not dropped.")
+    print(f"  record is now {'CLOSED' if not rec.is_open else 'OPEN'} "
+          f"({len(rec.tombstones)} tombstone(s))")
+    print("  ⚠ CLOSED DOES NOT MEAN GONE (R1). The withdrawn text is still live in the world, and")
+    print("    every sweep still searches this record's variants — closed means the correction was")
+    print("    made once, not that the claim stopped existing.")
+    return EXIT_CLEAN
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1488,6 +1594,15 @@ def main(argv: list[str] | None = None) -> int:
     # goes missing takes a whole ruling dark without anything failing.
     hv.add_argument("--parent", default=None, help="supersession parent record id (R1)")
     hv.set_defaults(fn=harvest)
+    # R7.5 — "re-binds in ONE command. If updating the control is harder than ignoring the failure,
+    # ignoring wins." The friction IS the design constraint, so the shape stays one positional.
+    rt = sub.add_parser("retombstone",
+                        help="bind a record's correction blocks — closes the loop (R4/R7)")
+    rt.add_argument("record")
+    rt.add_argument("--location", action="append", default=[], metavar="LOCATION",
+                    help="restrict to these locations; REPEATABLE. Omit to bind wherever the "
+                         "block is. Tombstones outside the named scope are PRESERVED")
+    rt.set_defaults(fn=retombstone)
     a = ap.parse_args(argv)
     return a.fn(a)
 

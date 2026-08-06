@@ -1198,6 +1198,174 @@ class ClaimSpanSeeding(unittest.TestCase):
         self.assertTrue(all(S._unit_location(uid) == "board/incident#42" for uid, _ in units))
 
 
+class Retombstone(unittest.TestCase):
+    """R4/R7.5 — ⚠ THE COMMAND THAT CLOSES THE LOOP, SPECIFIED AND NEVER SHIPPED UNTIL NOW.
+
+    `harvest` wrote records OPEN; `sweep` CHECKED tombstones; **NOTHING CREATED ONE.** So the loop
+    the whole design is built around — harvest → correct → register — could not be completed with
+    the tool. Two records sat open, exiting 4 for ever, beside a correct hash-verified withdrawn
+    block with nowhere to go.
+
+    That is R4a's own warning arriving through the door built to prevent it: *"an exit that is
+    always red trains the reader to route around it"* — process debt the tool MANUFACTURES and then
+    reports. Fourth built-enough-to-describe defect, and again found by EXECUTION, not review.
+    """
+
+    TOKEN = "ZZ-SWEEP-CONTROL-TOKEN"
+
+    def _ns_with_record(self, tombstones=None):
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        (ns / "records").mkdir()
+        (ns / "records" / "REC.json").write_text(json.dumps({
+            "id": "REC", "seed": "the withdrawn claim", "variants": ["the withdrawn claim"],
+            "anchors": [], "nets_run": [], "tombstones": tombstones or [],
+            "surfaces_at_withdrawal": [], "expected_counts": {}, "parent": None,
+            "created": ""}), encoding="utf-8")
+        (ns / "manifest.json").write_text(json.dumps(["records/REC.json"]), encoding="utf-8")
+        return ns
+
+    def _doc(self, rid="REC", body="the withdrawn claim"):
+        return (f"⚠ CORRECTED. It read:\n{S.BLOCK_OPEN}{rid} -->\n{body}\n{S.BLOCK_CLOSE}\n"
+                f"and here is why it was wrong.\n{self.TOKEN}\n")
+
+    def _run(self, ns, items, record="REC", location=None):
+        import contextlib
+        import io
+        from types import SimpleNamespace
+        from unittest import mock
+        cfg = {"control_token": self.TOKEN, "surfaces": [], "expected_counts": {}}
+        surf = S.SurfaceResult("docs", "filesystem", f"{len(items)} files", len(items), items)
+        args = SimpleNamespace(record=record, location=list(location or []))
+        out = io.StringIO()
+        with mock.patch.object(S, "load_config", return_value=cfg), \
+             mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
+             mock.patch.object(S, "NAMESPACE", ns), contextlib.redirect_stdout(out):
+            rc = S.retombstone(args)
+        rec = json.loads((ns / "records" / "REC.json").read_text(encoding="utf-8"))
+        return rc, out.getvalue(), rec
+
+    # ── the loop actually closes ─────────────────────────────────────────────────────────────────
+    def test_binding_CLOSES_an_open_record(self):
+        """⚠ THE PROPERTY THE WHOLE COMMAND EXISTS FOR. Before this, a record could only ever go
+        from OPEN to OPEN, and exit 4 was permanent by construction."""
+        ns = self._ns_with_record()
+        self.assertTrue(S.load_records(ns)["REC"].is_open)
+        rc, out, rec = self._run(ns, [("docs/a.md", self._doc())])
+        self.assertEqual(rc, S.EXIT_CLEAN)
+        self.assertEqual(len(rec["tombstones"]), 1)
+        self.assertEqual(rec["tombstones"][0]["location"], "docs/a.md")
+        self.assertFalse(S.load_records(ns)["REC"].is_open, "the record must now be CLOSED")
+
+    def test_the_stored_hash_is_COMPUTED_from_the_block_and_MATCHES_a_sweep(self):
+        """⚠ "HASH-VERIFIED" MEANS COMPUTED, NEVER SUPPLIED. The bound hash must be the one a later
+        sweep recomputes from the same bytes, or the control is decorative."""
+        ns = self._ns_with_record()
+        doc = self._doc()
+        _, _, rec = self._run(ns, [("docs/a.md", doc)])
+        self.assertEqual(rec["tombstones"][0]["block_sha256"],
+                         S.block_sha(S.extract_blocks(doc)["REC"]))
+
+    def test_the_bound_block_is_then_EXCLUDED_from_the_live_count(self):
+        """End-to-end: binding must actually license the R7 exclusion, or the loop closes on paper
+        while every sweep still reports the quoted text as a live hit."""
+        ns = self._ns_with_record()
+        doc = self._doc()
+        self._run(ns, [("docs/a.md", doc)])
+        recs = S.load_records(ns)
+        reg, unreg = S.registered_spans(doc, "docs/a.md", recs, ["REC"])
+        hits = S.find_hits(doc, S.compile_pattern("the withdrawn claim"), label="p", surface="s",
+                           location_of=lambda a, b: "docs/a.md", registered=reg, unregistered=unreg)
+        self.assertTrue(hits, "the quoted text must still be FOUND")
+        self.assertFalse(any(h.counts_as_live() for h in hits),
+                         "and a BOUND block must not count as a live finding (R7)")
+
+    def test_it_binds_EVERY_location_carrying_the_block(self):
+        """R7.5 — "re-binds in ONE command". A correction quoted in three places must not need three
+        invocations; friction is what makes ignoring the failure win."""
+        ns = self._ns_with_record()
+        rc, _, rec = self._run(ns, [("docs/a.md", self._doc()), ("docs/b.md", self._doc()),
+                                    ("docs/c.md", "unrelated\n" + self.TOKEN)])
+        self.assertEqual(rc, S.EXIT_CLEAN)
+        self.assertEqual(sorted(t["location"] for t in rec["tombstones"]),
+                         ["docs/a.md", "docs/b.md"])
+
+    # ── refusals, and the stratification ─────────────────────────────────────────────────────────
+    def test_NOTHING_TO_BIND_is_exit_6_and_NOT_the_tombstone_code(self):
+        """⚠ SIX, NOT TWO. `EXIT_TOMBSTONE` means a registered control BROKE; this means there was
+        nothing to register. An operator shown code 2 goes looking for a re-worded block that does
+        not exist — different cause, different remediation, different code."""
+        ns = self._ns_with_record()
+        rc, out, rec = self._run(ns, [("docs/a.md", "no block here\n" + self.TOKEN)])
+        self.assertEqual(rc, S.EXIT_BIND)
+        self.assertNotEqual(S.EXIT_BIND, S.EXIT_TOMBSTONE)
+        self.assertEqual(rec["tombstones"], [], "a failed bind must write nothing")
+        self.assertIn("has not been written yet", out)
+
+    def test_a_NAMED_location_without_the_block_is_a_REFUTED_ASSERTION(self):
+        """The other half of the same exit, and the message must distinguish them: you named a
+        location and the block is not there, which is not the same as no correction existing."""
+        ns = self._ns_with_record()
+        rc, out, _ = self._run(ns, [("docs/a.md", self._doc()), ("docs/b.md", self.TOKEN)],
+                               location=["docs/b.md"])
+        self.assertEqual(rc, S.EXIT_BIND)
+        self.assertIn("refuted assertion", out)
+
+    def test_an_unknown_record_is_refused(self):
+        ns = self._ns_with_record()
+        rc, out, _ = self._run(ns, [("docs/a.md", self._doc())], record="NOPE")
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIn("no registered record", out)
+
+    def test_it_refuses_to_bind_against_an_UNTRUSTED_enumeration(self):
+        """⚠ The blocks live ON the surfaces. Binding against a reading `sweep` would refuse to
+        certify pins a control to an enumeration the tool does not trust."""
+        import contextlib
+        import io
+        from types import SimpleNamespace
+        from unittest import mock
+        ns = self._ns_with_record()
+        cfg = {"control_token": self.TOKEN, "surfaces": [], "expected_counts": {}}
+        empty = S.SurfaceResult("docs", "filesystem", "0 files", 0, [])
+        with mock.patch.object(S, "load_config", return_value=cfg), \
+             mock.patch.object(S, "gather_surfaces", return_value=[empty]), \
+             mock.patch.object(S, "NAMESPACE", ns), contextlib.redirect_stdout(io.StringIO()):
+            rc = S.retombstone(SimpleNamespace(record="REC", location=[]))
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertEqual(json.loads((ns / "records" / "REC.json").read_text())["tombstones"], [])
+
+    # ── re-binding is an overwrite, and the scope of that overwrite is bounded ───────────────────
+    def test_REBINDING_replaces_a_stale_hash(self):
+        """R7.5's actual subject: a correction was re-worded, the control broke, and re-binding must
+        fix it in one command — otherwise ignoring the failure wins."""
+        ns = self._ns_with_record([{"location": "docs/a.md", "block_sha256": "STALE"}])
+        _, _, rec = self._run(ns, [("docs/a.md", self._doc())])
+        self.assertEqual(len(rec["tombstones"]), 1)
+        self.assertNotEqual(rec["tombstones"][0]["block_sha256"], "STALE")
+
+    def test_a_NARROW_rebind_PRESERVES_tombstones_outside_its_scope(self):
+        """⚠ THE GUARD ON THE ONE PLACE AN OVERWRITE IS CORRECT. `harvest` refuses to overwrite a
+        record because it would silently reset tombstones; here the overwrite is the point, so the
+        SCOPE is what must be bounded. A re-bind of one location must not drop a control at
+        another — that would be the record-overwrite defect wearing this command's clothes."""
+        ns = self._ns_with_record([{"location": "docs/elsewhere.md", "block_sha256": "KEEPME"}])
+        _, out, rec = self._run(ns, [("docs/a.md", self._doc())], location=["docs/a.md"])
+        locs = {t["location"]: t["block_sha256"] for t in rec["tombstones"]}
+        self.assertEqual(locs.get("docs/elsewhere.md"), "KEEPME",
+                         "a tombstone outside the named scope must SURVIVE")
+        self.assertIn("docs/a.md", locs)
+        self.assertIn("PRESERVED", out)
+
+    def test_the_CLI_exposes_it(self):
+        """Behaviour and wiring are two claims — the SharedInstrumentGate lesson."""
+        import contextlib
+        import io
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            S.main(["retombstone", "REC", "--nonsense"])
+        self.assertIn("unrecognized arguments: --nonsense", err.getvalue())
+
+
 # ⚠ THIS ENTRY POINT MUST STAY AT THE END OF THE FILE, AND IT USED TO SIT IN THE MIDDLE.
 # ``unittest.main()`` runs at the point it is reached during module execution, so every class defined
 # BELOW it was never registered when the file was run as a script: `python3 test_sweep.py` reported
