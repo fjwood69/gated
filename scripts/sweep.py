@@ -763,6 +763,31 @@ def load_records(ns: Path) -> dict[str, Record]:
     return out
 
 
+def load_records_or_refuse(ns: Path) -> tuple[dict[str, Record] | None, int]:
+    """D3 — THE ONE ENTRY EVERY COMMAND USES. Returns (records, 0) or (None, EXIT_INSTRUMENT).
+
+    ⚠ ONE SHARED ENTRY, **NOT THREE CATCHES**, AND THE DISTINCTION IS THE RULING (2026-08-07).
+    Three separate try/excepts that must agree is the dual-site shape this tree has met FIVE times —
+    two argv sites, a hashed-but-literal flag set, a selected-vs-created prefix, `mypy`'s package
+    list against `_PACKAGES` with `demo` missing from one of them. **None of those survived contact.**
+    A reviewer who reads "move the catch into each command" and does so reintroduces the defect;
+    this docstring exists so that reading is unavailable.
+
+    ⚠ AND IT EXISTS BECAUSE D3's GUARANTEE WAS CLI-ONLY. `main` caught `RegistryUnreadable` and the
+    commands did not, so `S.sweep(...)` called directly RAISED — the very traceback D3 was written to
+    remove. MEASURED 2026-08-07. **The suite itself is a programmatic caller**: nearly every fixture
+    drives the commands directly, so the tests exercised the path WITHOUT the guarantee while one
+    test covered the path with it. `main` keeps a backstop; the guarantee now holds without it.
+    """
+    try:
+        return load_records(ns), EXIT_CLEAN
+    except RegistryUnreadable as exc:
+        print(f"⚠ INSTRUMENT FAILURE — {exc}")
+        print("  This is NOT an empty registry, which is clean. The registry EXISTS and cannot be")
+        print("  read, so the selected set is UNKNOWABLE and no run may report on it.")
+        return None, EXIT_INSTRUMENT
+
+
 def ancestor_closure(rec_ids: Iterable[str], records: dict[str, Record]) -> list[str]:
     """R1 — a caller-selected subset expands to its TRANSITIVE ANCESTORS.
 
@@ -1072,7 +1097,9 @@ def sweep(args) -> int:
     cfg = load_config()
     ns = NAMESPACE
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    records = load_records(ns)
+    records, _rc = load_records_or_refuse(ns)
+    if records is None:
+        return _rc
 
     # R1 — DEFAULT IS EVERY REGISTERED RECORD, closed ones included. A record with tombstones is
     # "closed", but its withdrawn text is still live in the world: closed means the correction was made
@@ -1333,7 +1360,9 @@ def harvest(args) -> int:
     # ⚠ THE FULL GATE, THE SAME ONE ``sweep`` RUNS. This used to be ``if s.error`` and nothing else,
     # so a harvest could certify — and PIN — an enumeration sweep would have refused. The pins in
     # force are EVERY registered record's, not the one being written: see instrument_gate.
-    records = load_records(NAMESPACE)
+    records, _rc = load_records_or_refuse(NAMESPACE)
+    if records is None:
+        return _rc
     errs, _ = instrument_gate(surfaces, cfg, records, list(records), NAMESPACE)
     if errs:
         print("⚠ INSTRUMENT FAILURE — refusing to harvest against surfaces that cannot be trusted.")
@@ -1768,7 +1797,9 @@ def retombstone(args) -> int:
     """
     cfg = load_config()
     surfaces = gather_surfaces(cfg)
-    records = load_records(NAMESPACE)
+    records, _rc = load_records_or_refuse(NAMESPACE)
+    if records is None:
+        return _rc
     if args.record not in records:
         print(f"⚠ INSTRUMENT FAILURE — no registered record {args.record!r}. NOTHING WAS WRITTEN.")
         print(f"    known: {', '.join(sorted(records)) or 'none'}")

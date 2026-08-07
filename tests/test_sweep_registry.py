@@ -262,6 +262,51 @@ class MalformedRegistry(_SweepHarness):
         self.assertIn("NOT an empty registry", out.getvalue(),
                       "the message must separate UNREADABLE from EMPTY, which is clean")
 
+    def test_ALL_THREE_COMMANDS_return_the_exit_code_not_a_traceback(self):
+        """⚠ THE PIN THAT D3 LACKED. `main` caught RegistryUnreadable and the commands did not, so
+        `S.sweep(...)` called directly RAISED — the traceback D3 exists to remove. MEASURED
+        2026-08-07 in dissent. **The suite is itself a programmatic caller**: nearly every fixture
+        drives the commands directly, so the tests exercised the unguaranteed path.
+
+        ⚠ ASSERT THE EXIT CODE, NOT assertRaises. `assertRaises(RegistryUnreadable)` on
+        `load_records` pins the exception and says NOTHING about whether any command converts it —
+        which is exactly how the gap survived.
+        """
+        import contextlib
+        import io
+        from types import SimpleNamespace
+        from unittest import mock
+        cfg = {"control_token": self.TOKEN, "surfaces": [], "expected_counts": {}}
+        surf = S.SurfaceResult("docs", "filesystem", "1 files", 1, [("docs/a.md", self.TOKEN)])
+        for name, fn, args in (
+            ("sweep", S.sweep, SimpleNamespace(records=[], show=10)),
+            ("harvest", S.harvest, SimpleNamespace(id="NEW", seed="s", parent=None,
+                                                   carrier=["docs/a.md"])),
+            ("retombstone", S.retombstone, SimpleNamespace(record="REC", location=[])),
+        ):
+            with self.subTest(command=name):
+                ns = self._ns_bad()
+                out = io.StringIO()
+                with mock.patch.object(S, "load_config", return_value=cfg), \
+                     mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
+                     mock.patch.object(S, "NAMESPACE", ns), \
+                     contextlib.redirect_stdout(out):
+                    rc = fn(args)
+                self.assertEqual(rc, S.EXIT_INSTRUMENT,
+                                 f"{name} must RETURN the stratified code, not raise")
+                # ⚠ THE EXIT CODE ALONE COULD NOT TELL WHICH GUARD FIRED. The malformed record is
+                # ALSO named in the manifest, so a helper that swallowed the error and returned an
+                # empty registry still hit R-A's manifest-vs-record check and still produced
+                # EXIT_INSTRUMENT — MEASURED: mutant E2 survived the code assertion. The MESSAGE is
+                # the discriminator: UNREADABLE (the loader refused) vs CORRUPTED (the manifest
+                # caught an orphan).
+                self.assertIn("REGISTRY UNREADABLE", out.getvalue())
+                self.assertNotIn("REGISTRY CORRUPTED", out.getvalue(),
+                                 f"{name} must STOP at the loader. A helper that swallowed the "
+                                 f"error and returned an empty registry would fall through and let "
+                                 f"R-A's manifest check fire too — same exit code, TWO messages, "
+                                 f"and a reader sent to the wrong remediation.")
+
     def test_a_WELL_FORMED_registry_still_loads(self):
         """Correlated positive: prove the refusals are the guard, not the loader broken."""
         ns = self._ns(records=[self._rec()], manifest=["records/R.json"])
