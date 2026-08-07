@@ -265,6 +265,7 @@ not carry across to another.
 - `engine/` — trials, aggregation and runtime assertions
 - `gate/` — calibration, governance, admission, GitHub App and durable stores
 - `cli/` — command-line package
+- `scripts/` — the repository gates CI runs, and the supersession sweep
 - `tests/` — unit, adversarial and real-Podman tests
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for trust boundaries, invariants and
@@ -294,15 +295,23 @@ python -W error -m unittest discover -s tests
 Run the static gates:
 
 ```bash
-mypy --strict core sandbox engine observe gate cli
+mypy --strict core sandbox engine observe gate cli demo
 ruff check .
 python scripts/check-overclaim.py
 python scripts/check-sterility.py
+python scripts/check-voice.py
 ```
 
 Tests requiring an OCI runtime self-skip when Podman or the configured test
 image is unavailable; the boundary mechanism is exercised in full where one is
 present.
+
+`scripts/sweep.py` is a development instrument, not part of the demonstration: it
+finds surfaces still asserting a claim that has been withdrawn. Its configuration
+and its registry of records are deliberately absent from this repository, because
+the corpus it reads is private and its run reports store every matched span in
+full. It will refuse to run without a config; `scripts/sweep.config.example.json`
+carries the shape.
 
 ## Deployment
 
