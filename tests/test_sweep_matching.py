@@ -82,6 +82,16 @@ class MatchingSemantics(unittest.TestCase):
         self.assertIsNotNone(S.compile_pattern("no egress").search(nfc),
                              "so the \\s+ rule -- not NFKC -- is what crosses the NBSP axis")
 
+    def test_matching_is_CASE_INSENSITIVE(self):
+        """⚠ FOUND BY CONSULT 2026-08-07 AS A SURVIVING MUTATION. Every fixture in this file matched
+        in the SAME CASE, so deleting `re.IGNORECASE` from `compile_pattern` passed the whole suite —
+        while the extraction classes are documented as case-insensitive BY CONSTRUCTION BECAUSE THE
+        MATCHER IS, and a lowercase-only class was measured to see nothing in a carrier spelling its
+        terms in capitals. The ruling had no pin at all."""
+        pat = S.compile_pattern("No Egress")
+        self.assertIsNotNone(pat.search(S.normalise("the claim says NO EGRESS here")))
+        self.assertIsNotNone(S.compile_pattern("ZERO-GATE").search(S.normalise("zero-gate")))
+
     def test_indent_and_reflow_survive(self):
         pat = S.compile_pattern("count is stable")
         self.assertIsNotNone(pat.search(S.normalise("    count\n        is\n  stable")))

@@ -143,6 +143,61 @@ class UndisposedDiff(unittest.TestCase):
         keys, _ = S._previous_hits(self._ns(body))
         self.assertEqual(keys, {"docs/c.md:5|REC:v0"})
 
+    def test_the_LATEST_report_is_the_baseline_not_the_first(self):
+        """⚠ SURVIVING MUTATION, CONSULT 2026-08-07: every fixture wrote exactly ONE report, so
+        `reports[-1]` and `reports[0]` were indistinguishable. The diff would then compare against
+        the OLDEST run for ever — every disposed hit returning as "still undisposed", which is the
+        noise R4a says trains a reader to route around the code."""
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        (ns / "reports").mkdir()
+        (ns / "reports" / "20260101T000000.txt").write_text(
+            "RUN 2026-01-01T00:00:00+00:00\n\nFULL HIT LIST:\n"
+            "no-marker-within-window\tdocs/OLD.md:1|REC:v0\tstale\n", encoding="utf-8")
+        (ns / "reports" / "20260807T000000.txt").write_text(
+            "RUN 2026-08-07T00:00:00+00:00\n\nFULL HIT LIST:\n"
+            "no-marker-within-window\tdocs/NEW.md:1|REC:v0\tfresh\n", encoding="utf-8")
+        keys, stamp = S._previous_hits(ns)
+        self.assertEqual(stamp, "2026-08-07T00:00:00+00:00", "the NEWEST run is the baseline")
+        self.assertEqual(keys, {"docs/NEW.md:1|REC:v0"})
+
+    def test_a_marker_BEYOND_the_window_is_not_attributed(self):
+        """⚠ SURVIVING MUTATION: no fixture placed a marker further than 4 lines from a hit, so the
+        ±20 window could be narrowed to any value >=4 unchallenged. The window is what decides
+        whether a hit reads as marker-adjacent, which is the ranking R5 permits."""
+        far = "\u26a0 CORRECTED\n" + ("filler\n" * 25) + "the claim is live here anyway"
+        hits = S.find_hits(far, S.compile_pattern("the claim is live here"),
+                           label="t", surface="s", location_of=lambda a, b: "f")
+        self.assertEqual(hits[0].disposition(), "no-marker-within-window",
+                         "a marker 26 lines away is outside the window and must not be attributed")
+        # ⚠ AND THE OTHER DIRECTION, WHICH IS THE ONE THAT ACTUALLY PINS THE WIDTH. The assertion
+        # above holds for ANY window <= 25, so on its own it let the width be narrowed to 4 with the
+        # suite green — MEASURED: mutant C3 survived it. A narrowing is only visible from INSIDE the
+        # old window, so a marker at 10 lines must still be ATTRIBUTED.
+        near = "\u26a0 CORRECTED\n" + ("filler\n" * 9) + "the claim is live here anyway"
+        h2 = S.find_hits(near, S.compile_pattern("the claim is live here"),
+                         label="t", surface="s", location_of=lambda a, b: "f")
+        self.assertEqual(h2[0].disposition(), "marker-10-lines-before",
+                         "a marker 10 lines away is INSIDE the ruled window and must be attributed")
+
+    def test_RETIRED_is_a_CORRECTION_MARKER_for_ranking(self):
+        """⚠ SURVIVING MUTATION: nothing asserted that `RETIRED` is in `_MARKERS`. It could be
+        deleted from the pattern with the suite green, because the retirement tests check PRINTING
+        and never proximity ranking. It predates PR #42 (3ca20df) and is load-bearing for prose that
+        says a claim was retired."""
+        # ⚠ THE FIXTURE MUST CARRY **RETIRED AND NOTHING ELSE**. The first version read
+        # "RETIRED 2026-08-06: superseded." and passed via `SUPERSED`, which `_MARKERS` also
+        # matches — so it went green with RETIRED deleted from the pattern. MEASURED: mutant C4
+        # survived it. A test named for one marker, discharged by another.
+        text = "RETIRED 2026-08-06.\nthe claim is live here anyway"
+        self.assertEqual(len([m for m in ("CORRECTED", "WITHDRAWN", "SUPERSED", "REWRITTEN",
+                                          "It read", "\u26a0") if m.lower() in text.lower()]), 0,
+                         "the fixture must contain NO other marker, or this pins the wrong one")
+        hits = S.find_hits(text, S.compile_pattern("the claim is live here"),
+                           label="t", surface="s", location_of=lambda a, b: "f")
+        self.assertTrue(hits[0].disposition().startswith("marker-"),
+                        "RETIRED must rank as a correction marker, never suppress")
+
     def test_no_previous_run_is_a_baseline_not_a_clean_result(self):
         import tempfile
         keys, stamp = S._previous_hits(Path(tempfile.mkdtemp()))

@@ -201,6 +201,17 @@ class RegistryIntegrity(_SweepHarness):
         rc, _ = self._sweep(ns)
         self.assertEqual(rc, S.EXIT_CLEAN)
 
+    def test_a_NON_record_JSON_artefact_earns_nothing_either(self):
+        """⚠ FOUND BY CONSULT 2026-08-07, AND THE CONTROL ABOVE COULD NOT SEE IT. Every artefact it
+        names ends `.txt` or `.tsv`, so deleting `rel.startswith("records/")` and keeping only the
+        `.json` suffix check SURVIVED THE WHOLE SUITE — no fixture had a non-record `.json`, and the
+        registry writes several (`reach/`, spills). The prefix is what makes the check about RECORDS
+        rather than about file extensions."""
+        ns = self._ns(records=[], manifest=["reach/NEW.json", "census/X.json"])
+        rc, out = self._sweep(ns)
+        self.assertEqual(rc, S.EXIT_CLEAN,
+                         f"a .json OUTSIDE records/ is not a record and must earn nothing: {out}")
+
 
 class MalformedRegistry(_SweepHarness):
     """R19 DOORWAY 6 — ⚠ `load_records` RAN BEFORE ANY GATE AND CRASHED.

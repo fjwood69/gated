@@ -49,16 +49,30 @@ class SplitIntegrity(unittest.TestCase):
 
     def test_NO_CLASS_WAS_LOST_IN_THE_SPLIT(self):
         """⚠ THE ONE THAT MATTERS. Names, not counts — a count alone would pass if one class were
-        dropped and another added."""
+        dropped and another added.
+
+        ⚠ SUBSET, NOT EQUALITY, AND THE CHANGE IS ITSELF A FINDING. The first version asserted
+        EQUALITY and went red the moment a legitimate new test class arrived — equality was true only
+        at the INSTANT of the cut, so the guard was pinning "the suite never changes" rather than
+        "the split lost nothing". A guard that reds on correct work gets loosened by whoever is
+        blocked by it, and R4a already names where that ends: an exit that is always red trains the
+        reader to route around it. The property is CONTAINMENT.
+        """
         before = set(self.census["classes"])
         after = {type(t).__name__ for t in self.found} - {"SplitIntegrity"}
-        self.assertEqual(after, before,
-                         f"lost: {sorted(before - after)} · unexpected: {sorted(after - before)}")
+        self.assertEqual(before - after, set(),
+                         f"CLASSES LOST IN THE SPLIT: {sorted(before - after)}")
 
     def test_NO_TEST_WAS_LOST_IN_THE_SPLIT(self):
-        """A class can survive while its methods do not — e.g. a body truncated at a bad boundary."""
+        """A class can survive while its methods do not — e.g. a body truncated at a bad boundary.
+
+        ⚠ A FLOOR, NOT AN EQUALITY, for the reason above — but a floor is WEAKER, and the weakness is
+        stated rather than hidden: dropping one test while adding two would pass here. The class-name
+        subset above is what carries the real guarantee; this catches wholesale truncation only.
+        """
         n = len([t for t in self.found if type(t).__name__ != "SplitIntegrity"])
-        self.assertEqual(n, self.census["test_count"])
+        self.assertGreaterEqual(n, self.census["test_count"],
+                                f"TESTS LOST: {self.census['test_count']} before, {n} now")
 
     def test_the_HARNESS_IS_NOT_COLLECTED_AS_TESTS(self):
         """⚠ THE CORRELATED CONTROL. If ``_sweep_harness`` were discoverable, it would inflate the

@@ -130,8 +130,13 @@ class UnsearchableRecord(_SweepHarness):
         version that refuses whenever ANY variant fails — which would red every record carrying a
         zero-hit tripwire, and tripwires are the mechanism `expand` exists to create."""
         ns = self._ns(records=[self._rec(variants=["   ", "a seed"])], manifest=["records/R.json"])
-        rc, out = self._sweep(ns)
-        self.assertNotEqual(rc, S.EXIT_INSTRUMENT, out)
+        rc, out = self._sweep(ns, items=[("docs/a.md", f"{self.TOKEN}\na seed lives here\n")])
+        # ⚠ assertNotEqual(EXIT_INSTRUMENT) WAS TOO WEAK — CONSULT 2026-08-07. It passed on ANY
+        # non-instrument code, including CLEAN, so it proved the record was not refused WITHOUT
+        # proving the good variant was ever searched. The per-pattern line is the evidence that it
+        # compiled AND ran.
+        self.assertEqual(rc, S.EXIT_HITS, out)
+        self.assertIn("R:v1 [1]", out, "the COMPILABLE variant must actually have been searched")
 
     def test_a_HEALTHY_record_still_sweeps(self):
         """Second correlated positive: prove the refusals are the guard and not sweep broken."""
