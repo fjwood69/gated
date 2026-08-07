@@ -409,10 +409,22 @@ class ClaimSpanSeeding(unittest.TestCase):
     # ── Ruling 1 — --carrier is REQUIRED ─────────────────────────────────────────────────────────
     def test_a_BARE_harvest_is_REFUSED(self):
         """⚠ RULED 2026-08-06, AND THE FALLBACK IT REPLACES WAS MY OWN INVENTION — inferred from a
-        ruling about a different question and never designed, consulted or boarded. It RESTORED THE
-        FLOOD IN ONE PASS: every seed-holding unit contributes its backticked spans, so `variants`
-        explodes exactly as under the deleted loop. Cost sealed it — ~1,000 seed-holding units at
-        ~50 terms and ~5 expansions each is ~250,000 variants over the whole corpus."""
+        ruling about a different question and never designed, consulted or boarded.
+
+        The mechanism is the argument: every seed-holding unit would contribute its backticked
+        spans, so `variants` grows with the corpus rather than with the claim — the shape the
+        deleted loop had.
+
+        ⚠ AND THE NUMBER THAT USED TO BE HERE IS WITHDRAWN. It read "it RESTORED THE FLOOD IN ONE
+        PASS ... ~1,000 seed-holding units at ~50 terms and ~5 expansions each is ~250,000 variants
+        over the whole corpus", phrased as though sealed by measurement. IT WAS AN ARITHMETIC
+        ESTIMATE FROM THREE ROUNDED GUESSES, AND NOTHING EVER RAN IT. This test asserts only that
+        the bare harvest is REFUSED; it measures no variant count at all.
+
+        That is the stated-reason-stronger-than-mechanism defect — live in the file that condemns
+        it, three classes away from the NBSP test written to record the same failure. Found by
+        consult 2026-08-07. **The refusal stands on the mechanism; it never needed the number.**
+        """
         rc, _, out, rec = self._run("no egress", [("docs/a.md", "no egress")])
         self.assertEqual(rc, S.EXIT_INSTRUMENT)
         self.assertIsNone(rec, "a harvest with no claim span must write nothing")
