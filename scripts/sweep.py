@@ -737,7 +737,24 @@ def load_records(ns: Path) -> dict[str, Record]:
         return out
     known = {f.name for f in fields(Record)}
     for p in sorted(rd.glob("*.json")):
-        d = json.loads(p.read_text(encoding="utf-8"))
+        # ⚠ D3 — A MALFORMED RECORD REFUSES THE **WHOLE REGISTRY**, AND THAT IS THE RULING RATHER
+        # THAN A CONVENIENCE. This used to be a bare `json.loads` / `Record(**d)`, so a malformed
+        # file raised straight out of `load_records` — which every command calls BEFORE
+        # `instrument_gate` — producing an unstratified traceback where R4a requires a named code.
+        #
+        # ⚠ AND SKIPPING THE BAD FILE WOULD BE WORSE THAN CRASHING. The selected set becomes
+        # UNKNOWABLE, not merely smaller: the tool cannot say which records it failed to load, so
+        # every downstream count, pin and closure is computed over a population nobody can name.
+        # That is the sixth doorway — searched less than the caller believes — reached through the
+        # loader instead of through the CLI.
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(d, dict) or "id" not in d:
+                raise ValueError("record is not an object carrying an 'id'")
+        except (OSError, ValueError, TypeError) as exc:
+            raise RegistryUnreadable(
+                f"REGISTRY UNREADABLE: {p} — {type(exc).__name__}: {exc}. The selected set is "
+                f"UNKNOWABLE, not merely smaller, so nothing was swept.") from exc
         # ⚠ UNKNOWN KEYS ARE DROPPED, NOT FATAL. R3 added fields to the record; without this an
         # OLDER checkout of the tool crashes on the whole registry the moment a NEWER one writes to
         # it — and a tool that cannot read its own history has no history. Pairs with the defaults
@@ -764,6 +781,16 @@ def ancestor_closure(rec_ids: Iterable[str], records: dict[str, Record]) -> list
         if parent:
             stack.append(parent)
     return seen
+
+
+class RegistryUnreadable(Exception):
+    """D3/D4 — the registry cannot be read, so the selected set is UNKNOWABLE.
+
+    ⚠ A TYPED CONDITION RATHER THAN A BARE RAISE, so every command can turn it into the SAME
+    stratified exit code instead of each inventing its own handling — the dual-site shape this file
+    has met repeatedly. Carries the file and the exception class in its message, because "the
+    registry is broken" sends the operator to look at everything.
+    """
 
 
 def _read_manifest(ns: Path) -> tuple[set[str], str | None]:
@@ -816,8 +843,24 @@ def manifest_check(ns: Path) -> list[str]:
 
 
 def manifest_add(ns: Path, rel: str) -> None:
+    """⚠ D4 — REFUSES THE WRITE ON AN UNREADABLE MANIFEST. It does NOT archive-and-continue.
+
+    This carried an unguarded ``json.loads`` behind the comment that "recovering would rewrite the
+    manifest with only the new entry and destroy the record of everything else". THAT REASONING WAS
+    SOUND AND JUSTIFIED A DIFFERENT BEHAVIOUR THAN THE ONE SHIPPED: it argues against silent
+    recovery, not for an unstratified traceback. Conceded in consult, ruled 2026-08-07.
+
+    ⚠ AND ARCHIVING TO ``manifest.json.broken`` WAS ALSO REFUSED. It mutates the namespace during a
+    command that is already failing, so the operator's next look is at a tree the tool rearranged
+    while in a state it could not read. Repair is a deliberate act, never a side effect of a write.
+    """
     mf = ns / "manifest.json"
-    known = set(json.loads(mf.read_text(encoding="utf-8"))) if mf.exists() else set()
+    known, err = _read_manifest(ns)
+    if err is not None:
+        raise RegistryUnreadable(
+            f"REGISTRY UNREADABLE: {err}. NOTHING WAS WRITTEN and the manifest was NOT modified — "
+            f"repair it by hand; the tool will not rewrite a file it cannot read.")
+    known = set(known)
     known.add(rel)
     mf.parent.mkdir(parents=True, exist_ok=True)
     mf.write_text(json.dumps(sorted(known), indent=2), encoding="utf-8")
@@ -858,6 +901,26 @@ def registry_integrity(ns: Path, records: dict[str, Record]) -> list[str]:
             if rid not in records:
                 errs.append(
                     f"REGISTRY CORRUPTED: manifest.json names {rel} but record {rid!r} did not load")
+    # ⚠ D1/D2 — A DANGLING PARENT EDGE IS THE FIFTH DOORWAY, AND THE WORST-SHAPED OF THE SIX.
+    # `--parent` is validated at HARVEST, but a parent registered and DELETED afterwards leaves an
+    # edge pointing at nothing, and `ancestor_closure` skips ids it does not know — silently.
+    #
+    # MEASURED 2026-08-07: a record C whose parent B had been deleted swept **EXIT 0 CLEAN**, said
+    # nothing, and printed the header `swept: C + ancestors: C`. It does not merely under-search —
+    # **IT PRINTS A CLAIM THAT IT DID NOT.** Every other doorway is silent; this one asserts.
+    #
+    # ⚠ HERE, NOT IN `ancestor_closure`, AND THAT PLACEMENT IS THE RULING (D2). THE DEFAULT SWEEP
+    # NEVER CALLS CLOSURE — it takes `list(records)` — so a check at the drop site would miss the
+    # common path entirely and be tested green through the rare one. The condition is evaluated for
+    # EVERY LOADED RECORD, independent of `selected`, because the corruption is a property of the
+    # registry rather than of the caller's selection.
+    for rid in sorted(records):
+        parent = records[rid].parent
+        if parent and parent not in records:
+            errs.append(
+                f"REGISTRY CORRUPTED: record {rid!r} names parent {parent!r}, which is NOT "
+                f"REGISTERED. ancestor_closure would drop it silently while the run header still "
+                f"claimed ancestors were swept. Restore the parent record, or clear the link.")
     return errs
 
 
@@ -1805,7 +1868,17 @@ def main(argv: list[str] | None = None) -> int:
                          "block is. Tombstones outside the named scope are PRESERVED")
     rt.set_defaults(fn=retombstone)
     a = ap.parse_args(argv)
-    return a.fn(a)
+    # ⚠ D3/D4 — ONE HANDLER FOR EVERY COMMAND. `sweep`, `harvest` and `retombstone` all call
+    # `load_records` BEFORE `instrument_gate`, so a broken registry cannot be caught by the gate.
+    # Handling it here, once, is the same argument `instrument_gate` itself carries: three copies
+    # are correct on the day they are written and diverge on the day one is edited.
+    try:
+        return int(a.fn(a))
+    except RegistryUnreadable as exc:
+        print(f"⚠ INSTRUMENT FAILURE — {exc}")
+        print("  This is NOT an empty registry, which is clean. The registry EXISTS and cannot be")
+        print("  read, so the selected set is UNKNOWABLE and no run may report on it.")
+        return EXIT_INSTRUMENT
 
 
 if __name__ == "__main__":

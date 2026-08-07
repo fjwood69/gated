@@ -1594,7 +1594,6 @@ class _SweepHarness(unittest.TestCase):
              "parent": None, "created": ""}
         d.update(kw)
         return d
-
     def _ns(self, records=None, manifest=None, make_records_dir=True):
         import tempfile
         ns = Path(tempfile.mkdtemp())
@@ -1858,6 +1857,195 @@ class ParentIsValidated(unittest.TestCase):
         rc, _, rec = self._harvest(None)
         self.assertEqual(rc, S.EXIT_DEBT)
         self.assertIsNone(rec["parent"])
+
+
+class DanglingParent(_SweepHarness):
+    """R19 DOORWAY 5 — ⚠ A PARENT REGISTERED AND THEN **DELETED**.
+
+    MEASURED 2026-08-07 before the fix: record C whose parent B had been deleted swept **EXIT 0
+    CLEAN**, said nothing, and printed the header ``swept: C + ancestors: C``. Every other doorway
+    is silent; **this one prints a claim it did not honour.** `--parent` validation fires at harvest
+    and cannot reach a deletion that happens afterwards.
+    """
+
+    def _ns_dangling(self, parent="B-DELETED"):
+        return self._ns(records=[self._rec(id="C", parent=parent)], manifest=["records/C.json"])
+
+    def test_the_DEFAULT_sweep_REFUSES_a_dangling_parent(self):
+        """⚠ THE BUILD REQUIREMENT, NOT A PREFERENCE (D2). The check lives in `registry_integrity`
+        rather than in `ancestor_closure` because **THE DEFAULT SWEEP NEVER CALLS CLOSURE** — it
+        takes `list(records)`. A guard tested only through a closure-invoking path would prove
+        nothing about the common case and would FAKE GREEN."""
+        rc, out = self._sweep(self._ns_dangling())
+        self.assertEqual(rc, S.EXIT_INSTRUMENT, out)
+        self.assertIn("B-DELETED", out, "the ruling requires naming the unreachable parent")
+        self.assertIn("Restore the parent record", out, "and naming the remediation")
+
+    def test_the_default_path_DOES_NOT_INVOKE_ancestor_closure(self):
+        """⚠ THE CONTROL THAT MAKES THE TEST ABOVE MEAN ANYTHING. If closure were invoked on the
+        default path, the previous test would pass even with the check misplaced, and the whole
+        reason for D2's placement would evaporate. This asserts the premise directly."""
+        from unittest import mock
+        with mock.patch.object(S, "ancestor_closure",
+                               side_effect=AssertionError("closure WAS invoked")) as spy:
+            rc, _ = self._sweep(self._ns_dangling())
+        self.assertEqual(spy.call_count, 0,
+                         "the default sweep must not call ancestor_closure — D2 rests on this")
+        self.assertEqual(rc, S.EXIT_INSTRUMENT, "and it must still refuse without it")
+
+    def test_it_ALSO_refuses_when_the_record_is_NAMED(self):
+        """The rare path must not be a hole either — same corruption, same refusal."""
+        rc, out = self._sweep(self._ns_dangling(), ids=["C"])
+        self.assertEqual(rc, S.EXIT_INSTRUMENT, out)
+
+    def test_an_INTACT_parent_chain_is_untouched(self):
+        """⚠ THE CORRELATED NEGATIVE. Without it both tests above pass on a check that refuses any
+        record carrying a parent at all, which would red every supersession the tool exists for."""
+        ns = self._ns(records=[self._rec(id="B"), self._rec(id="C", parent="B")],
+                      manifest=["records/B.json", "records/C.json"])
+        rc, out = self._sweep(ns)
+        self.assertNotEqual(rc, S.EXIT_INSTRUMENT, out)
+
+    def test_a_record_with_NO_parent_is_untouched(self):
+        rc, out = self._sweep(self._ns(records=[self._rec()], manifest=["records/R.json"]))
+        self.assertNotEqual(rc, S.EXIT_INSTRUMENT, out)
+
+
+class MalformedRegistry(_SweepHarness):
+    """R19 DOORWAY 6 — ⚠ `load_records` RAN BEFORE ANY GATE AND CRASHED.
+
+    Every command calls it before `instrument_gate`, so a malformed record produced an unstratified
+    traceback where R4a requires a named code. **Skipping the bad file would be worse than
+    crashing**: the selected set becomes UNKNOWABLE, not merely smaller, and every downstream count,
+    pin and closure would then be computed over a population nobody can name.
+    """
+
+    def _ns_bad(self, body="{not json"):
+        ns = self._ns(records=[])
+        (ns / "records" / "BAD.json").write_text(body, encoding="utf-8")
+        (ns / "manifest.json").write_text(json.dumps(["records/BAD.json"]), encoding="utf-8")
+        return ns
+
+    def test_a_malformed_record_raises_the_TYPED_condition(self):
+        with self.assertRaises(S.RegistryUnreadable) as cm:
+            S.load_records(self._ns_bad())
+        self.assertIn("BAD.json", str(cm.exception), "the failing FILE must be named")
+        self.assertIn("UNKNOWABLE", str(cm.exception))
+
+    def test_a_record_that_is_not_an_object_is_also_refused(self):
+        """JSON that parses but is not a record. `Record(**d)` would raise TypeError far from here."""
+        with self.assertRaises(S.RegistryUnreadable):
+            S.load_records(self._ns_bad('["a", "list"]'))
+
+    def test_a_record_with_NO_id_is_refused(self):
+        with self.assertRaises(S.RegistryUnreadable):
+            S.load_records(self._ns_bad('{"seed": "s"}'))
+
+    def test_main_turns_it_into_ONE_stratified_exit(self):
+        """⚠ BEHAVIOUR AND WIRING ARE TWO CLAIMS. A typed exception nothing catches is a traceback
+        with extra steps, and the handler lives in `main` so all three commands share it."""
+        import contextlib
+        import io
+        from unittest import mock
+        out = io.StringIO()
+        with mock.patch.object(S, "load_config", return_value={"control_token": self.TOKEN,
+                                                               "surfaces": [],
+                                                               "expected_counts": {}}), \
+             mock.patch.object(S, "gather_surfaces", return_value=[]), \
+             mock.patch.object(S, "NAMESPACE", self._ns_bad()), \
+             contextlib.redirect_stdout(out):
+            rc = S.main(["sweep"])
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIn("INSTRUMENT FAILURE", out.getvalue())
+        self.assertIn("NOT an empty registry", out.getvalue(),
+                      "the message must separate UNREADABLE from EMPTY, which is clean")
+
+    def test_a_WELL_FORMED_registry_still_loads(self):
+        """Correlated positive: prove the refusals are the guard, not the loader broken."""
+        ns = self._ns(records=[self._rec()], manifest=["records/R.json"])
+        self.assertIn("R", S.load_records(ns))
+
+
+class ManifestAddRefuses(_SweepHarness):
+    """D4 — ⚠ `manifest_add` REFUSES THE WRITE; IT DOES NOT ARCHIVE-AND-CONTINUE.
+
+    The old comment argued that recovering "would rewrite the manifest with only the new entry and
+    destroy the record of everything else". **That reasoning was sound and justified a different
+    behaviour than the one shipped** — it argues against silent recovery, not for a traceback.
+    Archiving to `.broken` was refused too: it mutates the namespace during a command that is
+    already failing.
+    """
+
+    def test_it_raises_rather_than_crashing_or_rewriting(self):
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        (ns / "manifest.json").write_text("{not json", encoding="utf-8")
+        with self.assertRaises(S.RegistryUnreadable):
+            S.manifest_add(ns, "records/NEW.json")
+
+    def test_the_BROKEN_MANIFEST_IS_LEFT_EXACTLY_AS_IT_WAS(self):
+        """⚠ THE PROPERTY THAT MATTERS. Not the exception — that the file is untouched, and that no
+        `.broken` sibling appeared. The operator's next look must be at the tree they left."""
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        (ns / "manifest.json").write_text("{not json", encoding="utf-8")
+        before = (ns / "manifest.json").read_bytes()
+        with self.assertRaises(S.RegistryUnreadable):
+            S.manifest_add(ns, "records/NEW.json")
+        self.assertEqual((ns / "manifest.json").read_bytes(), before, "must NOT be rewritten")
+        self.assertEqual(sorted(p.name for p in ns.iterdir()), ["manifest.json"],
+                         "and must NOT archive to a .broken sibling mid-command")
+
+    def test_a_READABLE_manifest_still_gains_the_entry(self):
+        """Correlated positive: the refusal must be the guard, not manifest_add broken."""
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        S.manifest_add(ns, "records/NEW.json")
+        self.assertIn("records/NEW.json",
+                      json.loads((ns / "manifest.json").read_text(encoding="utf-8")))
+
+
+class RetirementConsumersFiveAndSix(_SweepHarness):
+    """⚠ THE TWO CONSUMERS THE FOUR CONTROLS DID NOT REACH.
+
+    `selected` feeds six: count pins, tombstone-loss checks, VARIANT SWEEPING, process debt, DRIFT
+    PRINTING, and R7 exclusion licensing. The existing four cover four. A future `retire` that
+    filtered `selected` before the hits loop but still included the record for the exit-code check
+    would pass every existing test while variant sweeping and drift printing silently ceased.
+    """
+
+    RETIRED = {"retired_at": "2026-08-06", "retired_reason": "loop artefact"}
+
+    def test_a_retired_records_VARIANTS_ARE_STILL_SEARCHED_hit_by_hit(self):
+        """⚠ NOT VIA THE EXIT CODE, WHICH IS THE HOLE. The per-pattern line proves the variant was
+        actually compiled and run, so a filter that skipped the hits loop is caught even if the
+        exit code were preserved by other means."""
+        ns = self._ns(records=[self._rec(variants=["a seed"], **self.RETIRED)],
+                      manifest=["records/R.json"])
+        rc, out = self._sweep(ns, items=[("docs/a.md", f"{self.TOKEN}\na seed is here\n")])
+        self.assertEqual(rc, S.EXIT_HITS, out)
+        self.assertIn("R:v0 [1]", out, "the retired record's variant must appear in per-pattern")
+
+    def test_a_retired_record_STILL_PRINTS_SURFACE_DRIFT(self):
+        """The sixth consumer. Drift is computed from surfaces_at_withdrawal minus the run's
+        surfaces, and was ruled to survive retirement — scoped, not dropped."""
+        ns = self._ns(records=[self._rec(surfaces_at_withdrawal=["docs", "board"], **self.RETIRED)],
+                      manifest=["records/R.json"])
+        _, out = self._sweep(ns)
+        self.assertIn("SURFACE DRIFT R", out)
+        self.assertIn("board", out, "and it must name the surface that vanished")
+
+    def test_the_UNRETIRED_twins_behave_identically(self):
+        """The control for both: the outcomes above must be retirement changing nothing, not the
+        fixtures producing them anyway."""
+        ns = self._ns(records=[self._rec(variants=["a seed"])], manifest=["records/R.json"])
+        rc, out = self._sweep(ns, items=[("docs/a.md", f"{self.TOKEN}\na seed is here\n")])
+        self.assertEqual(rc, S.EXIT_HITS)
+        self.assertIn("R:v0 [1]", out)
+        ns2 = self._ns(records=[self._rec(surfaces_at_withdrawal=["docs", "board"])],
+                       manifest=["records/R.json"])
+        _, out2 = self._sweep(ns2)
+        self.assertIn("SURFACE DRIFT R", out2)
 
 
 # ⚠ THIS ENTRY POINT MUST STAY AT THE END OF THE FILE, AND IT USED TO SIT IN THE MIDDLE.
