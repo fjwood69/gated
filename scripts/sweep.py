@@ -766,6 +766,27 @@ def ancestor_closure(rec_ids: Iterable[str], records: dict[str, Record]) -> list
     return seen
 
 
+def _read_manifest(ns: Path) -> tuple[set[str], str | None]:
+    """The manifest, read ONCE, in ONE place. Returns (entries, error).
+
+    ⚠ THIS EXISTS BECAUSE `manifest_check` PARSED IT WITH NO GUARD AND CRASHED. An unreadable
+    `manifest.json` raised `JSONDecodeError` straight out of `instrument_gate` — an unstratified
+    traceback where R4a requires a stratified refusal naming the failing check. Found by a test
+    written for R-A, not by review, and not by any of the four earlier passes over this file.
+
+    ⚠ ONE READER, TWO CALLERS, FOR THE REASON THIS FILE ALREADY GIVES ABOUT `instrument_gate`: two
+    implementations that must agree is the dual-site shape that is correct the day it is written and
+    silently diverges the day only one side is edited.
+    """
+    mf = ns / "manifest.json"
+    if not mf.exists():
+        return set(), None
+    try:
+        return set(json.loads(mf.read_text(encoding="utf-8"))), None
+    except (OSError, ValueError, TypeError) as exc:
+        return set(), f"manifest.json is present but unreadable: {type(exc).__name__}: {exc}"
+
+
 def manifest_check(ns: Path) -> list[str]:
     """R13 — every file the tool writes is manifested; anything else in the namespace is an
     INSTRUMENT FAILURE naming the stray file.
@@ -774,10 +795,16 @@ def manifest_check(ns: Path) -> list[str]:
     parked here containing a live carrier would be found, counted and suppressed permanently, with the
     run header remaining literally true.
     """
-    mf = ns / "manifest.json"
     if not ns.exists():
         return []
-    known = set(json.loads(mf.read_text(encoding="utf-8"))) if mf.exists() else set()
+    known, err = _read_manifest(ns)
+    if err is not None:
+        # ⚠ AN UNREADABLE MANIFEST YIELDS NO STRAY CLAIMS, AND THAT IS THE FAIL-SAFE DIRECTION.
+        # Treating it as an EMPTY manifest would make every file in the namespace a stray and bury
+        # the real diagnosis under a list of the tool's own artefacts. `registry_integrity` reports
+        # the parse failure precisely; this function declines to guess.
+        return []
+    known = set(known)
     known.add("manifest.json")
     stray = []
     for p in sorted(ns.rglob("*")):
@@ -794,6 +821,44 @@ def manifest_add(ns: Path, rel: str) -> None:
     known.add(rel)
     mf.parent.mkdir(parents=True, exist_ok=True)
     mf.write_text(json.dumps(sorted(known), indent=2), encoding="utf-8")
+
+
+def registry_integrity(ns: Path, records: dict[str, Record]) -> list[str]:
+    """R-A — AN EMPTY REGISTRY IS CLEAN; A **BROKEN** ONE IS NOT.
+
+    ⚠ THE DISCRIMINATOR IS EVIDENCE OF PRIOR TOOL AUTHORSHIP, NOT WHETHER A DIRECTORY EXISTS, AND
+    THAT DISTINCTION IS THE WHOLE RULING. `records/` missing and `records/` empty are the SAME
+    reading — "all registered" found none, and no named claim was falsified. Failing on bare absence
+    would red every run before the first harvest, because **harvest is what creates the directory**.
+
+    What is NOT clean is the registry contradicting ITSELF: `manifest.json` names a record file that
+    does not load. Both artefacts were written by this tool, so their disagreement is an observable
+    about the instrument rather than about the corpus — R10's posture applied to a CORRUPTED
+    registry rather than to a fresh one.
+
+    ⚠ THE SECOND HALF OF THE DRAFTED RULE IS DELIBERATELY NOT BUILT, AND THIS COMMENT IS WHY.
+    It read: "other manifested artefacts exist while `records/` is gone". MEASURED 2026-08-07 by
+    execution, not by reading: a sweep on a VIRGIN namespace exits `EXIT_CLEAN`, never creates
+    `records/`, and writes `manifest.json` holding `reports/<stamp>.txt`. That is precisely the state
+    the clause describes — so it would have RED-FLAGGED THE PRE-FIRST-HARVEST CASE THIS RULING EXISTS
+    TO KEEP CLEAN, inverting it. A guard that fires on the state its own ruling protects is worse
+    than no guard, because it trains the operator to route around the code that means something.
+
+    An absent or unreadable manifest earns nothing: with no prior authorship recorded there is
+    nothing for the registry to contradict.
+    """
+    manifested, err = _read_manifest(ns)
+    if err is not None:
+        # The manifest is itself a tool-written artefact. Unreadable is not empty.
+        return [err]
+    errs = []
+    for rel in sorted(manifested):
+        if rel.startswith("records/") and rel.endswith(".json"):
+            rid = Path(rel).stem
+            if rid not in records:
+                errs.append(
+                    f"REGISTRY CORRUPTED: manifest.json names {rel} but record {rid!r} did not load")
+    return errs
 
 
 # ── quote blocks + tombstones (R7, R8) ────────────────────────────────────────────────────────────
@@ -932,6 +997,11 @@ def instrument_gate(surfaces: list[SurfaceResult], cfg: dict, records: dict[str,
             errors.append(f"control {name}: {why}")
     for f in manifest_check(ns):
         errors.append(f"UNMANIFESTED FILE in control namespace: {f}")
+    # R-A — and the registry must not contradict ITSELF. Placed in the SHARED gate rather than in
+    # `sweep` alone, for the reason this function exists: `harvest` once ran a strictly weaker gate
+    # and pinned counts from an enumeration `sweep` would have refused. A harvest or a re-bind
+    # against a corrupted registry has the same defect one door along.
+    errors.extend(registry_integrity(ns, records))
     return errors, controls
 
 
@@ -987,15 +1057,30 @@ def sweep(args) -> int:
     hits: list[Hit] = []
     per_pattern: dict[str, int] = {}
     ns_str = str(ns)
+    # ── R-B — A RECORD THAT CANNOT BE SEARCHED MUST NEVER REPORT AS SEARCHED.
+    # ⚠ THIS IS THE THIRD SITE OF ONE RULE, NOT A THIRD RULE. An unknown record id (C1), an
+    # uncompilable seed at harvest (R16) and a selected record whose patterns ALL fail to compile
+    # are the same shape: SELECTED, NEVER SEARCHED, REPORTS CLEAN — a dead tripwire registered as a
+    # live one. Only the door differs. The design states the rule once; these are its doorways.
+    #
+    # ⚠ REACHABLE ONLY BY HAND-EDIT — WHICH IS EXACTLY WHY IT IS IN SCOPE. `harvest` refuses an
+    # uncompilable seed (R16) and never mints an empty variant, so the tool cannot produce this
+    # state. R18's ruled procedure for retirement is EDITING THE RECORD JSON BY HAND, so C2 opens
+    # the very door this closes. The two are one increment.
+    unsearchable: list[tuple[str, list[str]]] = []
     for rid in selected:
         rec = records[rid]
         pats = [(f"{rid}:v{i}", v) for i, v in enumerate(rec.variants)] + \
                [(f"{rid}:anchor:{a}", a) for a in rec.anchors]
+        compiled_here, failed_here = 0, []
         for label, text in pats:
             try:
                 pat = compile_pattern(text)
             except ValueError:
+                # Counted and NAMED, never silently skipped. The ruling requires the ids.
+                failed_here.append(label)
                 continue
+            compiled_here += 1
             per_pattern.setdefault(label, 0)
             for s in surfaces:
                 if s.error:
@@ -1009,6 +1094,30 @@ def sweep(args) -> int:
                                       in_namespace=loc.startswith(ns_str))
                     hits.extend(found)
                     per_pattern[label] += len(found)
+        if compiled_here == 0:
+            # ⚠ ZERO COMPILED PATTERNS FOR A SELECTED RECORD. Not "found nothing" — NEVER LOOKED.
+            # A record with no patterns at all is the same condition as one whose patterns all
+            # failed: either way this id contributed no search, and reporting the run as clean
+            # would certify a corpus against a net that was never cast.
+            unsearchable.append((rid, failed_here))
+    # ⚠ APPENDED TO ``instrument_errors`` RATHER THAN GIVEN ITS OWN RETURN, DELIBERATELY. That list
+    # is checked below, BEFORE the report is written and BEFORE the exit cascade, and it withholds
+    # the hit list with the diagnosis printed. A parallel refusal path here would be a second
+    # implementation of a decision this file already makes in one place — the dual-site shape that
+    # has bitten this project repeatedly.
+    for rid, failed in unsearchable:
+        rec_u = records[rid]
+        total = len(rec_u.variants) + len(rec_u.anchors)
+        if total == 0:
+            instrument_errors.append(
+                f"UNSEARCHABLE RECORD {rid}: it carries NO variants and NO anchors, so selecting "
+                f"it searched nothing. A record that cannot be searched must never report as "
+                f"searched.")
+        else:
+            instrument_errors.append(
+                f"UNSEARCHABLE RECORD {rid}: all {total} pattern(s) failed to compile — "
+                f"{', '.join(failed)}. A record that cannot be searched must never report as "
+                f"searched.")
 
     open_records = [r for r in selected if records[r].is_open]
 
@@ -1030,20 +1139,34 @@ def sweep(args) -> int:
             L.append(f"⚠ SURFACE DRIFT {rid}: recorded but not swept now: {sorted(drift)}")
     if open_records:
         L.append(f"OPEN RECORDS  {', '.join(open_records)}   <-- process debt (exit {EXIT_DEBT})")
-    # ── R18 — THE ALWAYS-PRINT CONTROL, SHIPPED BEFORE THE LEVER IT GUARDS.
-    # ⚠ RETIREMENT EXCLUDES NOTHING TODAY. This prints what a record CLAIMS about itself and changes
-    # no behaviour whatsoever: a retired record is still swept, still contributes count pins, still
-    # has its tombstones checked, still licenses R7 exclusions, still fires process debt. The header
-    # says so explicitly, because a reader who saw "RETIRED" and assumed "not searched" would have
-    # the exclusion's danger without the exclusion existing.
+    # ── R18 — THE ALWAYS-PRINT LINE. ⚠ IT IS A WARNING, NOT A DISCHARGED SAFEGUARD (R-C, ruled
+    # 2026-08-07). RETIREMENT EXCLUDES NOTHING TODAY: a retired record is still swept, still
+    # contributes count pins, still has its tombstones checked, still licenses R7 exclusions, still
+    # fires process debt.
+    #
+    # ⚠ THE SENTENCE THIS BLOCK USED TO CARRY WAS THE DEFECT, NOT THE LINE ITSELF. It presented the
+    # print as a safeguard shipped ahead of its lever — which reads as a hazard DISCHARGED. Nothing
+    # can enter an excluded state, so nothing has been guarded against; what the line does is warn
+    # the next reader NOT TO ASSUME exclusion exists. Keeping the constant is right — unlike
+    # `span_sha256` it is auditable by reading — but claiming it demonstrates a control fired is the
+    # `normalise()` docstring failure again: THE MECHANISM WAS RIGHT AND THE SENTENCE ABOUT IT WAS
+    # NOT.
+    #
+    # ⚠ WHEN `retire` LANDS, DERIVE THIS LINE FROM BEHAVIOUR — excluded versus still-in-`selected`.
+    # A constant string cannot disagree with the code; a derived one can, and on the day the lever
+    # changes what is swept, this text goes false with nothing announcing it.
+    #
     # ⚠ AND THE DRIFT LINE FOR A RETIRED RECORD BELONGS HERE, NOT DROPPED (ruled): the information
     # survives, scoped, rather than polluting the live section or vanishing.
     retired = [rid for rid in selected if records[rid].retired_at]
     for rid in retired:
         rec_r = records[rid]
-        L.append(f"RETIRED {rid} @ {rec_r.retired_at}: {rec_r.retired_reason or '(no reason given)'}")
-        L.append(f"        {len(rec_r.variants)} variants — ⚠ STILL SWEPT. Retirement carries no "
-                 f"exclusion yet; the `retire` command is not built.")
+        L.append(f"RETIRED {rid} @ {rec_r.retired_at} — ⚠ STILL SWEPT: "
+                 f"{rec_r.retired_reason or '(no reason given)'}")
+        L.append(f"        {len(rec_r.variants)} variants, ALL STILL SEARCHED. Retirement fields "
+                 f"are CARRIED AND PRINTED; EXCLUSION IS NOT BUILT.")
+        L.append( "        ⚠ THIS LINE IS A WARNING AGAINST ASSUMING EXCLUSION. It is NOT proof "
+                  "that a safeguard fired — nothing can enter an excluded state yet.")
     # ⚠ THE ZERO-SEED OBSERVABLE WAS REMOVED 2026-08-06, AND ITS ABSENCE IS THE RULING.
     # It printed "seed matched nothing at harvest — tripwire, or typo?" for a record whose census
     # measured zero. With ``--carrier`` REQUIRED and a zero inside a named carrier REFUSED, a new
@@ -1154,6 +1277,26 @@ def harvest(args) -> int:
         print("  NOTHING WAS WRITTEN. A record written now would pin these counts as authoritative.")
         for e in errs:
             print("   ", e)
+        return EXIT_INSTRUMENT
+
+    # ── ⚠ AN UNKNOWN `--parent` IS A REFUSAL. THE SAME DEFECT AS C1, ONE EDGE IN.
+    # `--parent` is the ONLY input to `ancestor_closure`, and that function skips ids it does not
+    # know (`rid not in records: continue`). So a typo'd parent was accepted, written to the record,
+    # and then SILENTLY DROPPED at every later sweep: `sweep B` searched B alone and exited CLEAN
+    # while B's own correction prose reasserted A. That is verbatim the green-washing
+    # `ancestor_closure`'s docstring forbids — "caller-selected B must never green-wash A" — and the
+    # NESTED withdrawal is half the founding failure.
+    #
+    # ⚠ IT REFUSES AT HARVEST, NOT AT SWEEP, BECAUSE HARVEST IS WHERE THE CLAIM IS MADE. The operator
+    # asserts a parent once, when writing the record; every sweep afterwards merely reads it. Failing
+    # at read time would red a registry the operator can no longer easily correct, and would fire
+    # long after the person who typed it has gone.
+    if args.parent is not None and args.parent not in records:
+        print(f"⚠ INSTRUMENT FAILURE — unknown --parent {args.parent!r}. NOTHING WAS WRITTEN.")
+        print(f"    known: {', '.join(sorted(records)) or 'none'}")
+        print("  `--parent` is the only input to ancestor_closure, which SKIPS ids it does not")
+        print("  know — so this record would have carried a dangling edge, and every later sweep")
+        print("  of a child would have exited CLEAN without ever searching the parent's variants.")
         return EXIT_INSTRUMENT
 
     # ── THE UNIT INDEX. Built ONCE, from a single snapshot, and the fixpoint is defined on it.
@@ -1432,7 +1575,14 @@ def harvest(args) -> int:
     # silent cutoff it exists to expose.
     seeded_set = set(census["adjudication"]["seeded"])
     out_set = set(census["adjudication"]["adjudicated_out"])
-    named = census["adjudication"]["carriers_named"]
+    # ⚠ ``adj_named``, NOT A REBIND OF ``named``. This USED to shadow the local `named` AFTER it had
+    # already been consumed at record construction (``carriers=named``), so one fact had TWO SOURCES:
+    # `Record.carriers` from the local, and everything below from the census's copy. Inert while
+    # ``census_adjudication`` returns ``list(carriers_named)`` of that same list — but that function
+    # exists SPECIFICALLY so it can be handed inputs that DISAGREE (see its docstring), so the two
+    # are equal by today's construction and not by any rule. The defect was never the value; it was
+    # that a divergence would have been silent.
+    adj_named = census["adjudication"]["carriers_named"]
     # ⚠ ORDERED BY LOCATION, NOT BY FREQUENCY, AND THE FILE ALREADY RULED THIS ABOUT ITSELF. ``sweep``
     # sorts unknown-disposition FIRST because "leading with a suspected-live class primes confirmation
     # over reading" — and an occurrence-ranked census primes by FREQUENCY, which on the founding
@@ -1464,7 +1614,7 @@ def harvest(args) -> int:
               f"{len(census['units_holding'])} of {census['unit_total']} carrier units, "
               f"on {len(census['surfaces'])} surface(s): {', '.join(census['surfaces']) or 'NONE'}")
         print(f"    seeded {len(seeded_set)}  ·  adjudicated out {len(out_set)}  ·  "
-              f"carriers named: {', '.join(named)}")
+              f"carriers named: {', '.join(adj_named)}")
         print(f"    {census['adjudication']['basis']}")
         # ⚠ WHICH OF THE TWO THIS IS, IS DECIDED BY THE CODE AND NOT BY WHOEVER EDITS IT NEXT.
         # A non-empty ``adjudicated_out`` means one of two OPPOSITE things, and the earlier version
@@ -1474,7 +1624,7 @@ def harvest(args) -> int:
         # distinction structural, which is this project's standing preference — mechanism over
         # intent, because prose describing a behaviour the code has outgrown is the dangerous
         # direction and this tool exists to find exactly that.
-        if out_set and not named:
+        if out_set and not adj_named:
             print( "    ⚠ INSTRUMENT DISAGREEMENT — the census found the seed in units round 1 did")
             print( "      not reach, and NO CARRIER WAS NAMED, so nothing narrowed the population.")
             print( "      The two instruments disagree; this is NOT a recorded adjudication:")
@@ -1493,7 +1643,7 @@ def harvest(args) -> int:
         print( "      withdrawn claim or merely uses the same words is a JUDGEMENT this tool does not")
         print( "      make (R5). MEASURED on the founding incident: 7 of 8 were homonyms.")
     # ── R15 — WHAT SEEDED, AND WHAT IT REACHED. Both, because they are different questions.
-    print(f"  carriers named  : {', '.join(named)}")
+    print(f"  carriers named  : {', '.join(adj_named)}")
     print(f"  seeding units   : {len(seeding_units)}")
     print(f"  boundary rule   : {BOUNDARY_RULE}")
     for uid, d in sorted(seeding_units.items())[:8]:

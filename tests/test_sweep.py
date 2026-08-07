@@ -48,9 +48,36 @@ class MatchingSemantics(unittest.TestCase):
 
     def test_nbsp_is_handled_by_the_whitespace_rule_not_by_normalisation(self):
         """The correlated control for the test above: NBSP is NOT the case that motivates NFKC.
-        Recorded so the wrong justification cannot be re-derived from a passing test."""
+        Recorded so the wrong justification cannot be re-derived from a passing test.
+
+        \u26a0 THIS TEST USED TO ASSERT ``re.match(r"\\s", "\\u00a0")`` AND NOTHING ELSE \u2014 a fact about
+        the REGEX ENGINE, not about this tool. It proved Python's ``\\s`` matches NBSP; it did NOT
+        prove that ``compile_pattern`` relies on that rather than on NFKC, which is the claim its
+        name makes. Its stated reason was stronger than its mechanism, and it would have stayed
+        green if the matcher had stopped using ``\\s+`` altogether. It now drives the tool, and
+        pins the discriminating case: the match must survive under NFC, where NFKC cannot be doing
+        the work.
+        """
         import re as _re
-        self.assertTrue(_re.match(r"\s", "\u00a0"), "Python's \\s matches NBSP natively")
+        import unicodedata as _ud
+        # \u00a0 IS WRITTEN AS AN ESCAPE, NEVER AS A LITERAL CHARACTER. A literal NBSP is
+        # indistinguishable from a space when read, and an edit that silently substitutes one
+        # turns every assertion below VACUOUS while leaving them GREEN. That happened to this
+        # very test on 2026-08-07, and was caught only by COUNTING THE CODEPOINTS in the file --
+        # a fix that reproduced the defect it was fixing.
+        NBSP = "\u00a0"
+        self.assertEqual(ord(NBSP), 0xA0, "the fixture must be a REAL NBSP, not a space")
+        self.assertTrue(_re.match(r"\s", NBSP), "Python's \\s matches NBSP natively")
+        # THE TOOL, not the engine: an NBSP-joined occurrence must match.
+        joined = f"no{NBSP}egress"
+        self.assertIsNotNone(S.compile_pattern("no egress").search(S.normalise(joined)),
+                             "compile_pattern must match across a non-breaking space")
+        # THE DISCRIMINATOR: under NFC the NBSP SURVIVES, so a match there is the whitespace
+        # rule doing the work rather than the folding.
+        nfc = _ud.normalize("NFC", joined)
+        self.assertIn(NBSP, nfc, "NFC must leave the NBSP in place, or this proves nothing")
+        self.assertIsNotNone(S.compile_pattern("no egress").search(nfc),
+                             "so the \\s+ rule -- not NFKC -- is what crosses the NBSP axis")
 
     def test_indent_and_reflow_survive(self):
         pat = S.compile_pattern("count is stable")
@@ -299,25 +326,68 @@ class UndisposedDiff(unittest.TestCase):
 
 class ExpectedCountPins(unittest.TestCase):
     """R10 — harvest wrote pins onto the record and sweep enforced only config, so the record's pin
-    was INERT: the same half-built shape R14 had, found in the same dissent round."""
+    was INERT: the same half-built shape R14 had, found in the same dissent round.
 
-    def test_strictest_pin_wins(self):
-        cfg = {"expected_counts": {"docs": 400}}
-        rec = S.Record(id="R", seed="", variants=[], anchors=[], nets_run=[], tombstones=[],
-                       surfaces_at_withdrawal=[], expected_counts={"docs": 412},
-                       parent=None, created="")
-        pins = [cfg["expected_counts"].get("docs"), rec.expected_counts.get("docs")]
-        self.assertEqual(max(p for p in pins if isinstance(p, int)), 412,
-                         "a record pin must be able to TIGHTEN the floor")
+    ⚠⚠ AND THESE TESTS WERE THEMSELVES THE DEFECT UNTIL 2026-08-07. They computed ``max()`` IN THE
+    TEST BODY and asserted on the result, touching no production code but the ``Record``
+    constructor. **Deleting every line of pin-merging logic from sweep.py left them green** — so the
+    fix for an inert record pin was pinned by an inert test, and no mutation of the module could
+    ever have implicated them. Third instance of the shape this file's own header condemns, found by
+    a dissent that read the suite rather than ran it.
 
-    def test_a_record_pin_can_never_loosen_a_config_floor(self):
-        cfg = {"expected_counts": {"docs": 400}}
-        rec_low = S.Record(id="R", seed="", variants=[], anchors=[], nets_run=[], tombstones=[],
-                           surfaces_at_withdrawal=[], expected_counts={"docs": 10},
-                           parent=None, created="")
-        pins = [cfg["expected_counts"].get("docs"), rec_low.expected_counts.get("docs")]
-        self.assertEqual(max(p for p in pins if isinstance(p, int)), 400,
-                         "registering a record must not be a way to lower an existing floor")
+    They now drive ``instrument_gate``.
+    """
+
+    TOKEN = "ZZ-SWEEP-CONTROL-TOKEN"
+
+    def _gate(self, count, cfg_floor=None, record_pin=None):
+        import tempfile
+        cfg = {"control_token": self.TOKEN, "surfaces": [],
+               "expected_counts": {"docs": cfg_floor} if cfg_floor is not None else {}}
+        items = [(f"docs/f{i}.md", f"body {self.TOKEN}") for i in range(count)]
+        surf = S.SurfaceResult("docs", "filesystem", f"{count} files", count, items)
+        records, selected = {}, []
+        if record_pin is not None:
+            records = {"OLD": S.Record(id="OLD", seed="", variants=[], anchors=[], nets_run=[],
+                                       tombstones=[], surfaces_at_withdrawal=[],
+                                       expected_counts={"docs": record_pin}, parent=None,
+                                       created="")}
+            selected = ["OLD"]
+        errs, _ = S.instrument_gate([surf], cfg, records, selected, Path(tempfile.mkdtemp()))
+        return errs
+
+    def test_a_record_pin_TIGHTENS_a_config_floor(self):
+        """cfg says >=400, the record says >=412, the corpus has 405. The strictest pin is the
+        record's, so this must FAIL — and it can only fail if production merged them."""
+        errs = self._gate(count=405, cfg_floor=400, record_pin=412)
+        self.assertTrue(any("COUNT DROPPED" in e for e in errs),
+                        f"a record pin must be able to TIGHTEN the floor, got {errs}")
+        self.assertTrue(any("record pin" in e for e in errs),
+                        "and the message must name WHICH pin bound, or the operator cannot act")
+
+    def test_a_record_pin_can_never_LOOSEN_a_config_floor(self):
+        """cfg says >=400, the record says >=10, the corpus has 350. Registering a record must not
+        be a route to lowering a floor already in force."""
+        errs = self._gate(count=350, cfg_floor=400, record_pin=10)
+        self.assertTrue(any("COUNT DROPPED" in e for e in errs), f"got {errs}")
+        self.assertTrue(any("config" in e for e in errs), "the CONFIG floor is the one that bound")
+
+    def test_the_CONFIG_floor_is_enforced_with_NO_record_present(self):
+        """⚠ THE COVERAGE HOLE THE DISSENT NAMED. Every other pin test drives a RECORD pin with an
+        empty cfg, so a mutant reading only record pins and ignoring config pins was killed by
+        nothing at all."""
+        errs = self._gate(count=350, cfg_floor=400)
+        self.assertTrue(any("COUNT DROPPED" in e for e in errs), f"got {errs}")
+
+    def test_a_corpus_AT_the_floor_PASSES(self):
+        """⚠ THE CORRELATED POSITIVE. Without it every test above passes on a gate that rejects
+        every enumeration, which certifies nothing. The comparison is `<`, not `<=`."""
+        self.assertEqual(self._gate(count=400, cfg_floor=400, record_pin=400), [])
+
+    def test_NO_pins_anywhere_PASSES(self):
+        """Second correlated negative: an unpinned surface must not be red merely for being
+        unpinned, or the first run of any new surface is a failure."""
+        self.assertEqual(self._gate(count=3), [])
 
 
 class SharedInstrumentGate(unittest.TestCase):
@@ -906,38 +976,6 @@ class SeedCensus(unittest.TestCase):
         self.assertEqual(len(set(codes)), 6, "a shared code sends the reader to the wrong place")
         self.assertNotEqual(S.EXIT_SEED, S.EXIT_INSTRUMENT)
 
-
-
-
-
-    def _sweep_lines(self, census=None, **census_kw):
-        """Drive the real ``sweep`` and return its printed lines."""
-        import contextlib
-        import io
-        import tempfile
-        from types import SimpleNamespace
-        from unittest import mock
-        token = "ZZ-SWEEP-CONTROL-TOKEN"
-        cfg = {"control_token": token, "surfaces": [], "expected_counts": {}}
-        surf = S.SurfaceResult("docs", "filesystem", "1 files", 1,
-                               [("docs/a.md", f"body {token}")])
-        ns = Path(tempfile.mkdtemp())
-        sc = census if census is not None else {"seed": "s", "unit_total": 1, "units_holding": [],
-                                                "surfaces": [], **census_kw}
-        (ns / "records").mkdir()
-        (ns / "records" / "R.json").write_text(json.dumps({
-            "id": "R", "seed": "a seed", "variants": ["a seed"], "anchors": [], "nets_run": [],
-            "tombstones": [{"location": "docs/a.md", "block_sha256": "x"}],
-            "surfaces_at_withdrawal": [], "expected_counts": {}, "parent": None, "created": "",
-            "seed_census": sc}), encoding="utf-8")
-        (ns / "manifest.json").write_text(json.dumps(["records/R.json"]), encoding="utf-8")
-        out = io.StringIO()
-        with mock.patch.object(S, "load_config", return_value=cfg), \
-             mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
-             mock.patch.object(S, "NAMESPACE", ns), contextlib.redirect_stdout(out):
-            S.sweep(SimpleNamespace(records=[], show=40))
-        return out.getvalue().splitlines()
-
     def test_a_record_written_before_the_census_existed_STILL_LOADS(self):
         """The added field carries a default for the same reason every other R3 field does: a tool
         that cannot read its own history has no history."""
@@ -1161,6 +1199,16 @@ class ClaimSpanSeeding(unittest.TestCase):
         surf = S.SurfaceResult("docs", "filesystem", "1 files", 1,
                                [("docs/a.md", f"no egress\n{self.TOKEN}\n")])
         ns = Path(tempfile.mkdtemp())
+        # ⚠ THE ANCESTOR MUST NOW EXIST. Before 2026-08-07 this fixture named a parent that was
+        # never registered and harvest accepted it — which is precisely the dangling edge
+        # `ParentIsValidated` closes. The test passed while demonstrating the defect.
+        (ns / "records").mkdir()
+        (ns / "records" / "ANCESTOR.json").write_text(json.dumps({
+            "id": "ANCESTOR", "seed": "s", "variants": ["s"], "anchors": [], "nets_run": [],
+            "tombstones": [{"location": "docs/a.md", "block_sha256": "x"}],
+            "surfaces_at_withdrawal": [], "expected_counts": {}, "parent": None,
+            "created": ""}), encoding="utf-8")
+        (ns / "manifest.json").write_text(json.dumps(["records/ANCESTOR.json"]), encoding="utf-8")
         args = SimpleNamespace(id="NEW", seed="no egress", parent="ANCESTOR",
                                carrier=["docs/a.md"])
         with mock.patch.object(S, "load_config", return_value=cfg), \
@@ -1464,16 +1512,35 @@ class RetirementShapeOnly(unittest.TestCase):
         self.assertEqual(r.retired_reason, "loop artefact")
 
     def test_sweep_PRINTS_a_retired_record_with_its_reason(self):
-        """⚠ THE ALWAYS-PRINT CONTROL. An exclusion that is invisible is the R7 defect reinvented,
-        so the visibility ships first — before anything can be excluded at all."""
+        """⚠ THE ALWAYS-PRINT LINE. Retirement that is invisible is the R7 defect reinvented, so the
+        visibility exists before anything can be excluded at all."""
         rc, out = self._sweep_with(retired_at="2026-08-06", retired_reason="loop artefact")
-        self.assertIn("RETIRED R @ 2026-08-06: loop artefact", out)
+        self.assertIn("RETIRED R @ 2026-08-06", out)
+        self.assertIn("loop artefact", out, "the reason is the only thing distinguishing a record "
+                                            "retired as noise from one retired as inconvenient")
 
-    def test_the_header_says_a_retired_record_is_STILL_SWEPT(self):
-        """⚠ A reader who saw RETIRED and assumed "not searched" would have the exclusion's danger
-        without the exclusion existing. The line must say what is true TODAY."""
+    def test_the_QUALIFIER_IS_ON_THE_LEAD_LINE_not_a_continuation(self):
+        """⚠ RULED 2026-08-07 (R-C). A reader who saw RETIRED and assumed "not searched" would have
+        the exclusion's danger without the exclusion existing — and BOTH review passes flagged that
+        a skim catches the lead line and stops. So the qualifier moved ONTO it. Asserting merely
+        that "STILL SWEPT" appears somewhere in the output passes on the version that buried it."""
         _, out = self._sweep_with(retired_at="2026-08-06", retired_reason="noise")
-        self.assertIn("STILL SWEPT", out)
+        lead = [ln for ln in out.splitlines() if ln.startswith("RETIRED R @")]
+        self.assertEqual(len(lead), 1, f"expected one lead line, got {lead}")
+        self.assertIn("STILL SWEPT", lead[0],
+                      "the qualifier must be on the line a skimmer actually reads")
+
+    def test_the_line_claims_to_WARN_and_NOT_to_have_discharged_anything(self):
+        """⚠ R-C's ACTUAL SUBJECT: the defect was never the constant string, it was THE CLAIM ABOUT
+        WHAT ITS PRESENCE DEMONSTRATES. The block used to present itself as a safeguard shipped
+        ahead of its lever, which reads as a hazard DISCHARGED. Nothing can enter an excluded state,
+        so nothing has been guarded — the line warns against ASSUMING exclusion. Same class as the
+        normalise() docstring: the mechanism was right and the sentence about it was not."""
+        _, out = self._sweep_with(retired_at="2026-08-06", retired_reason="noise")
+        self.assertIn("EXCLUSION IS NOT BUILT", out)
+        self.assertIn("WARNING AGAINST ASSUMING EXCLUSION", out)
+        self.assertNotIn("SHIPPED BEFORE THE LEVER", out,
+                         "the printed report must not claim a safeguard fired")
 
     def test_retirement_changes_NOTHING_about_the_run(self):
         """⚠ THE WHOLE POINT OF SHAPE-ONLY. Retirement must be inert until the consumer table is
@@ -1508,6 +1575,289 @@ class RetirementShapeOnly(unittest.TestCase):
              mock.patch.object(S, "NAMESPACE", ns), contextlib.redirect_stdout(out):
             rc = S.sweep(SimpleNamespace(records=[], show=10))
         return rc, out.getvalue()
+
+
+class _SweepHarness(unittest.TestCase):
+    """Shared rig: drive the REAL ``sweep`` over a controlled namespace and corpus.
+
+    ⚠ EVERY ASSERTION BELOW GOES THROUGH PRODUCTION CODE. The lesson is ``ExpectedCountPins``, which
+    reimplemented ``max()`` in its own body and therefore could not have failed for any mutation of
+    the module it claimed to pin — a test that discharges nothing, in the file whose header condemns
+    exactly that.
+    """
+
+    TOKEN = "ZZ-SWEEP-CONTROL-TOKEN"
+
+    def _rec(self, **kw):
+        d = {"id": "R", "seed": "a seed", "variants": ["a seed"], "anchors": [], "nets_run": [],
+             "tombstones": [], "surfaces_at_withdrawal": [], "expected_counts": {},
+             "parent": None, "created": ""}
+        d.update(kw)
+        return d
+
+    def _ns(self, records=None, manifest=None, make_records_dir=True):
+        import tempfile
+        ns = Path(tempfile.mkdtemp())
+        if make_records_dir:
+            (ns / "records").mkdir()
+            for r in (records or []):
+                (ns / "records" / f"{r['id']}.json").write_text(json.dumps(r), encoding="utf-8")
+        if manifest is not None:
+            (ns / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return ns
+
+    def _sweep(self, ns, items=None, ids=None, cfg_counts=None):
+        import contextlib
+        import io
+        from types import SimpleNamespace
+        from unittest import mock
+        items = items if items is not None else [("docs/a.md", self.TOKEN)]
+        cfg = {"control_token": self.TOKEN, "surfaces": [],
+               "expected_counts": cfg_counts or {}}
+        surf = S.SurfaceResult("docs", "filesystem", f"{len(items)} files", len(items), items)
+        out = io.StringIO()
+        with mock.patch.object(S, "load_config", return_value=cfg), \
+             mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
+             mock.patch.object(S, "NAMESPACE", ns), contextlib.redirect_stdout(out):
+            rc = S.sweep(SimpleNamespace(records=ids or [], show=40))
+        return rc, out.getvalue()
+
+
+class RegistryIntegrity(_SweepHarness):
+    """R-A — ⚠ AN EMPTY REGISTRY IS CLEAN; A **BROKEN** ONE IS NOT.
+
+    The discriminator is EVIDENCE OF PRIOR TOOL AUTHORSHIP, not whether a directory exists. That
+    distinction is the ruling: `records/` missing and `records/` empty are the same reading — "all
+    registered" found none, and no named claim was falsified.
+    """
+
+    def test_a_manifest_naming_a_record_that_does_not_load_is_INSTRUMENT(self):
+        """⚠ TWO TOOL-WRITTEN ARTEFACTS CONTRADICTING EACH OTHER. The manifest is the tool's own
+        record of what it wrote; a record it names and cannot load is the registry disagreeing with
+        itself, which is an observable about the INSTRUMENT rather than about the corpus."""
+        ns = self._ns(records=[], manifest=["records/GONE.json"])
+        rc, out = self._sweep(ns)
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIn("REGISTRY CORRUPTED", out)
+        self.assertIn("GONE", out, "the ruling requires naming what is missing")
+
+    def test_an_ABSENT_records_dir_is_CLEAN(self):
+        """⚠ HARVEST IS WHAT CREATES THE DIRECTORY, so failing on bare absence would red every run
+        before the first harvest — the exact case the ruling protects."""
+        rc, _ = self._sweep(self._ns(make_records_dir=False))
+        self.assertEqual(rc, S.EXIT_CLEAN)
+
+    def test_an_EMPTY_records_dir_is_CLEAN(self):
+        """The correlated half: present-but-empty reads identically to absent. ABSENT-vs-EMPTY was
+        the wrong axis; INTACT-vs-CORRUPTED is the right one."""
+        rc, _ = self._sweep(self._ns(records=[]))
+        self.assertEqual(rc, S.EXIT_CLEAN)
+
+    def test_a_VIRGIN_namespace_that_has_ONLY_EVER_BEEN_SWEPT_stays_CLEAN(self):
+        """⚠ THE REGRESSION PIN FOR A CLAUSE DELIBERATELY NOT BUILT. The drafted rule also said
+        "other manifested artefacts exist while records/ is gone". MEASURED by execution: a sweep on
+        a virgin namespace exits CLEAN, never creates records/, and writes manifest.json holding
+        reports/<stamp>.txt — precisely that state. Building the clause would have RED-FLAGGED THE
+        PRE-FIRST-HARVEST CASE THE RULING EXISTS TO KEEP CLEAN. This test fails the day someone
+        re-derives it from the draft."""
+        ns = self._ns(make_records_dir=False)
+        rc1, _ = self._sweep(ns)
+        self.assertEqual(rc1, S.EXIT_CLEAN, "first sweep on a virgin namespace")
+        self.assertTrue((ns / "manifest.json").exists(), "which manifests a report")
+        self.assertFalse((ns / "records").exists(), "and still has no records/")
+        rc2, out = self._sweep(ns)
+        self.assertEqual(rc2, S.EXIT_CLEAN,
+                         f"a SECOND sweep must still be clean, not corrupted: {out}")
+
+    def test_an_UNREADABLE_manifest_is_INSTRUMENT(self):
+        """The manifest is itself a tool-written artefact. Unreadable is not empty."""
+        ns = self._ns(records=[])
+        (ns / "manifest.json").write_text("{not json", encoding="utf-8")
+        rc, out = self._sweep(ns)
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIn("unreadable", out)
+
+    def test_a_manifest_naming_only_NON_record_artefacts_earns_nothing(self):
+        """Correlated negative: reports and spills are not records, and their presence is not
+        evidence of a missing record. Without this the corruption check could fire on any
+        manifested file and the tests above would pass on a gate that rejects everything."""
+        ns = self._ns(records=[], manifest=["reports/20260101T000000+0000.txt", "census/X.tsv"])
+        rc, _ = self._sweep(ns)
+        self.assertEqual(rc, S.EXIT_CLEAN)
+
+
+class UnsearchableRecord(_SweepHarness):
+    """R-B — ⚠ A RECORD THAT CANNOT BE SEARCHED MUST NEVER REPORT AS SEARCHED.
+
+    Third site of ONE rule, not a third rule: an unknown record id (C1), an uncompilable seed at
+    harvest (R16), and a selected record whose patterns all fail to compile are the same shape —
+    SELECTED, NEVER SEARCHED, REPORTS CLEAN. Only the door differs.
+
+    ⚠ REACHABLE ONLY BY HAND-EDIT, WHICH IS WHY IT IS IN SCOPE: R18's ruled retirement procedure is
+    editing the record JSON by hand, so C2 opens the very door this closes.
+    """
+
+    def test_a_record_whose_variants_ALL_fail_to_compile_REFUSES(self):
+        ns = self._ns(records=[self._rec(variants=["   ", ""])], manifest=["records/R.json"])
+        rc, out = self._sweep(ns)
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIn("UNSEARCHABLE RECORD R", out)
+
+    def test_the_refusal_NAMES_THE_FAILING_VARIANT_IDS(self):
+        """⚠ RULED: print the failing ids. 'Something did not compile' sends the operator to read
+        1,600 lines; 'R:v0, R:v1' sends them to the record."""
+        ns = self._ns(records=[self._rec(variants=["   ", ""])], manifest=["records/R.json"])
+        _, out = self._sweep(ns)
+        self.assertIn("R:v0", out)
+        self.assertIn("R:v1", out)
+
+    def test_a_record_with_NO_variants_at_all_also_REFUSES(self):
+        """Same condition by a different route: nothing to compile and nothing compiled. Either way
+        this id contributed no search, and a clean exit would certify a corpus against a net that
+        was never cast."""
+        ns = self._ns(records=[self._rec(variants=[])], manifest=["records/R.json"])
+        rc, out = self._sweep(ns)
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIn("NO variants and NO anchors", out)
+
+    def test_ONE_compilable_variant_among_broken_ones_is_ENOUGH(self):
+        """⚠ THE CORRELATED NEGATIVE, AND IT IS LOAD-BEARING. Without it these tests pass on a
+        version that refuses whenever ANY variant fails — which would red every record carrying a
+        zero-hit tripwire, and tripwires are the mechanism `expand` exists to create."""
+        ns = self._ns(records=[self._rec(variants=["   ", "a seed"])], manifest=["records/R.json"])
+        rc, out = self._sweep(ns)
+        self.assertNotEqual(rc, S.EXIT_INSTRUMENT, out)
+
+    def test_a_HEALTHY_record_still_sweeps(self):
+        """Second correlated positive: prove the refusals are the guard and not sweep broken."""
+        ns = self._ns(records=[self._rec()], manifest=["records/R.json"])
+        rc, out = self._sweep(ns, items=[("docs/a.md", f"{self.TOKEN}\na seed lives here\n")])
+        self.assertEqual(rc, S.EXIT_HITS, out)
+
+
+class RetirementIsInertACROSSEveryConsumer(_SweepHarness):
+    """⚠ THE FOUR CORRELATED NEGATIVE CONTROLS THE DISSENT FOUND MISSING.
+
+    Inertness was pinned ONLY as exit-code equality, by a fixture whose record was open,
+    tombstone-free, pin-free, and whose variants never occurred in the corpus — so it observed at
+    most ONE of the six consumers `selected` feeds. A future change excluding retired records from
+    count pins, tombstone-loss checks, or R7 licensing would not have been caught.
+    """
+
+    RETIRED = {"retired_at": "2026-08-06", "retired_reason": "loop artefact"}
+
+    def test_a_retired_record_STILL_ENFORCES_ITS_COUNT_PIN(self):
+        ns = self._ns(records=[self._rec(expected_counts={"docs": 10}, **self.RETIRED)],
+                      manifest=["records/R.json"])
+        rc, out = self._sweep(ns, items=[("docs/a.md", self.TOKEN)])
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIn("COUNT DROPPED", out, "retirement must not be a way to drop a floor")
+
+    def test_a_retired_record_STILL_REPORTS_A_LOST_TOMBSTONE(self):
+        ns = self._ns(records=[self._rec(
+            tombstones=[{"location": "docs/a.md", "block_sha256": "STALE"}], **self.RETIRED)],
+            manifest=["records/R.json"])
+        rc, out = self._sweep(ns, items=[("docs/a.md", self.TOKEN)])
+        self.assertEqual(rc, S.EXIT_TOMBSTONE)
+        self.assertIn("TOMBSTONE LOST", out)
+
+    def test_a_retired_record_STILL_PRODUCES_LIVE_HITS(self):
+        ns = self._ns(records=[self._rec(**self.RETIRED)], manifest=["records/R.json"])
+        rc, out = self._sweep(ns, items=[("docs/a.md", f"{self.TOKEN}\na seed is live here\n")])
+        self.assertEqual(rc, S.EXIT_HITS, out)
+        self.assertIn("STILL SWEPT", out, "and the line must say so on the same run")
+
+    def test_a_retired_records_TOMBSTONE_STILL_LICENSES_THE_R7_EXCLUSION(self):
+        """⚠ THE SUBTLEST OF THE FOUR. If retirement ever removed a record from `selected`, its
+        hash-pinned exclusions would stop being licensed and the quoted withdrawn text would return
+        as LIVE HITS — the tool loudly reporting the correction it was told about."""
+        doc = (f"⚠ CORRECTED. It read:\n{S.BLOCK_OPEN}R -->\na seed\n{S.BLOCK_CLOSE}\n"
+               f"and why it was wrong.\n{self.TOKEN}\n")
+        sha = S.block_sha(S.extract_blocks(doc)["R"])
+        ns = self._ns(records=[self._rec(
+            tombstones=[{"location": "docs/a.md", "block_sha256": sha}], **self.RETIRED)],
+            manifest=["records/R.json"])
+        rc, out = self._sweep(ns, items=[("docs/a.md", doc)])
+        self.assertEqual(rc, S.EXIT_CLEAN, out)
+        self.assertIn("in-tombstoned-block", out, "the exclusion must still be licensed")
+
+    def test_the_UNRETIRED_twin_behaves_IDENTICALLY(self):
+        """⚠ THE CONTROL FOR ALL FOUR. Each test above must fail because RETIREMENT CHANGED NOTHING,
+        not because the fixture happens to produce that code anyway. Same fixtures, retirement
+        stripped, same outcomes."""
+        plain = {}
+        for kw, items, expect in (
+            ({"expected_counts": {"docs": 10}}, [("docs/a.md", self.TOKEN)], S.EXIT_INSTRUMENT),
+            ({"tombstones": [{"location": "docs/a.md", "block_sha256": "STALE"}]},
+             [("docs/a.md", self.TOKEN)], S.EXIT_TOMBSTONE),
+            (plain, [("docs/a.md", f"{self.TOKEN}\na seed is live here\n")], S.EXIT_HITS),
+        ):
+            ns = self._ns(records=[self._rec(**kw)], manifest=["records/R.json"])
+            rc, out = self._sweep(ns, items=items)
+            self.assertEqual(rc, expect, f"unretired twin diverged for {kw}: {out}")
+
+
+class ParentIsValidated(unittest.TestCase):
+    """⚠ THE SIBLING OF C1, FOUND BY THE DISSENT AND VERIFIED AT SOURCE.
+
+    `--parent` appeared exactly twice — the argparse definition and the assignment into `Record` —
+    with NOTHING between them. `ancestor_closure` skips ids it does not know, so a typo'd parent was
+    accepted, written, and silently dropped at every later sweep: `sweep B` searched B alone and
+    exited CLEAN while B's own correction prose reasserted A. Verbatim the green-washing
+    `ancestor_closure`'s docstring forbids, and the NESTED withdrawal is half the founding failure.
+    """
+
+    TOKEN = "ZZ-SWEEP-CONTROL-TOKEN"
+
+    def _harvest(self, parent, with_parent_record=False):
+        import contextlib
+        import io
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+        ns = Path(tempfile.mkdtemp())
+        if with_parent_record:
+            (ns / "records").mkdir()
+            (ns / "records" / "ANCESTOR.json").write_text(json.dumps({
+                "id": "ANCESTOR", "seed": "s", "variants": ["s"], "anchors": [], "nets_run": [],
+                "tombstones": [{"location": "docs/a.md", "block_sha256": "x"}],
+                "surfaces_at_withdrawal": [], "expected_counts": {}, "parent": None,
+                "created": ""}), encoding="utf-8")
+            (ns / "manifest.json").write_text(json.dumps(["records/ANCESTOR.json"]),
+                                              encoding="utf-8")
+        cfg = {"control_token": self.TOKEN, "surfaces": [], "expected_counts": {}}
+        surf = S.SurfaceResult("docs", "filesystem", "1 files", 1,
+                               [("docs/a.md", f"no egress\n{self.TOKEN}\n")])
+        args = SimpleNamespace(id="NEW", seed="no egress", parent=parent, carrier=["docs/a.md"])
+        out = io.StringIO()
+        with mock.patch.object(S, "load_config", return_value=cfg), \
+             mock.patch.object(S, "gather_surfaces", return_value=[surf]), \
+             mock.patch.object(S, "NAMESPACE", ns), contextlib.redirect_stdout(out):
+            rc = S.harvest(args)
+        rec = None
+        if (ns / "records" / "NEW.json").exists():
+            rec = json.loads((ns / "records" / "NEW.json").read_text(encoding="utf-8"))
+        return rc, out.getvalue(), rec
+
+    def test_an_UNKNOWN_parent_REFUSES_and_WRITES_NOTHING(self):
+        rc, out, rec = self._harvest("A-TYPO")
+        self.assertEqual(rc, S.EXIT_INSTRUMENT)
+        self.assertIsNone(rec, "a record carrying a dangling parent edge must not be written")
+        self.assertIn("unknown --parent", out)
+        self.assertIn("A-TYPO", out)
+
+    def test_a_KNOWN_parent_still_harvests(self):
+        """Correlated positive: prove the refusal is the check and not --parent broken outright."""
+        rc, out, rec = self._harvest("ANCESTOR", with_parent_record=True)
+        self.assertEqual(rc, S.EXIT_DEBT, out)
+        self.assertEqual(rec["parent"], "ANCESTOR")
+
+    def test_NO_parent_is_still_permitted(self):
+        """Second correlated negative: a root record has no parent, and refusing None would make
+        the ordinary case impossible."""
+        rc, _, rec = self._harvest(None)
+        self.assertEqual(rc, S.EXIT_DEBT)
+        self.assertIsNone(rec["parent"])
 
 
 # ⚠ THIS ENTRY POINT MUST STAY AT THE END OF THE FILE, AND IT USED TO SIT IN THE MIDDLE.
