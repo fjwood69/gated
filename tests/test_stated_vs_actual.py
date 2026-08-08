@@ -365,6 +365,20 @@ class LayoutListIsAClaimAboutTheTree(unittest.TestCase):
         listed = set(re.findall(r"^- `([a-z_.]+)/`", section, re.MULTILINE))
         self.assertEqual(gate_coverage.layout_errors(listed), [])
 
+    def test_the_layout_check_is_BIDIRECTIONAL(self):
+        """⚠ ADDED IN RE-DISSENT. The first repair caught tracked-but-not-listed and accepted
+        listed-but-not-tracked, so a README naming a directory that does not exist redded nothing.
+        An omission leaves a list INCOMPLETE; a phantom entry makes it FALSE. And the one-way check
+        was written in the same increment that ruled bidirectionality "the whole point" for the
+        README-versus-CI pin — the rule stated on one axiom and not carried to the next."""
+        real = gate_coverage.top_level_dirs() - set(gate_coverage.load().get("layout_excluded", {}))
+        self.assertEqual(gate_coverage.layout_errors(real), [], "stimulus control: starts clean")
+        self.assertTrue(any("ghost" in e for e in gate_coverage.layout_errors(real | {"ghost"})),
+                        "a phantom layout entry must red")
+        victim = sorted(real)[0]
+        self.assertTrue(any(victim in e for e in gate_coverage.layout_errors(real - {victim})),
+                        "an omitted directory must red")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

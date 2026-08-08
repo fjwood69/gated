@@ -100,6 +100,18 @@ def layout_errors(listed: set[str]) -> list[str]:
             errs.append(
                 f"{d}/ is a tracked top-level directory, is NOT in the README layout list, and is "
                 f"NOT excluded with a reason. A list is a claim about its contents.")
+    # ⚠ THE OTHER DIRECTION, ADDED IN RE-DISSENT. The first repair caught TRACKED-BUT-NOT-LISTED
+    # and accepted LISTED-BUT-NOT-TRACKED — a README naming a directory that does not exist redded
+    # nothing. The two are not the same defect: an omission makes the list INCOMPLETE, while a
+    # phantom entry makes it FALSE, and a false claim is the worse of the two.
+    # ⚠ AND THE ONE-WAY CHECK WAS BUILT IN THE SAME INCREMENT THAT RULED BIDIRECTIONALITY "THE
+    # WHOLE POINT" for the README-versus-CI pin. The rule was stated on one axiom and not carried
+    # to the next — which is this increment's subject arriving through its own door.
+    for d in sorted(listed):
+        if d not in top_level_dirs():
+            errs.append(
+                f"the README layout list names {d}/, which is NOT a tracked top-level directory. "
+                f"An omission leaves the list incomplete; a phantom entry makes it FALSE.")
     return errs
 
 
