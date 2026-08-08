@@ -21,6 +21,7 @@ excluded WITH A REASON AND AN EXPIRY, turning a silent omission into a forced ad
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -60,6 +61,48 @@ def markdown() -> tuple[str, ...]:
     return tuple(load()["markdown"])
 
 
+def top_level_dirs() -> set[str]:
+    """EVERY tracked top-level directory — the source of truth for the README's layout list.
+
+    ⚠ WIDER THAN ``_tracked_python_dirs``, AND THE WIDENING IS THE FIX. The layout check first
+    walked python-bearing directories only, while the design claimed its source of truth was THE
+    GIT TREE. So `docs/` could be added to the README's layout list and NOTHING PINNED IT —
+    deleting the line redded nothing. The stated source was wider than the actual source, which is
+    this increment's own defect committed one level in. Found in dissent on PR #49.
+
+    Directories that legitimately do not belong in a reader-facing layout list are excluded AS
+    DATA, with a reason and an expiry, exactly like the package roster.
+    """
+    out = subprocess.run(["git", "ls-files"], capture_output=True, text=True,
+                         check=True, cwd=_ROOT).stdout
+    return {line.split("/", 1)[0] for line in out.splitlines() if "/" in line}
+
+
+def layout_errors(listed: set[str]) -> list[str]:
+    """Every tracked top-level directory is listed in the README, or excluded with a reason + expiry.
+
+    ⚠ A PUBLIC HELPER, BECAUSE THE TEST USED TO REACH ACROSS THE MODULE BOUNDARY INTO A PRIVATE ONE.
+    A checker calling `_private` is coupled to an implementation detail it does not own.
+    """
+    data = load()
+    excluded = data.get("layout_excluded", {})
+    errs: list[str] = []
+    for name, entry in sorted(excluded.items()):
+        for field in ("reason", "remove_when"):
+            if not str(entry.get(field, "")).strip():
+                errs.append(f"layout_excluded {name!r} has no {field}")
+        if name not in top_level_dirs():
+            errs.append(
+                f"layout_excluded names {name!r}, which is NOT a tracked top-level directory — "
+                f"a stale exclusion for something that no longer exists, inert and invisible")
+    for d in sorted(top_level_dirs()):
+        if d not in listed and d not in excluded:
+            errs.append(
+                f"{d}/ is a tracked top-level directory, is NOT in the README layout list, and is "
+                f"NOT excluded with a reason. A list is a claim about its contents.")
+    return errs
+
+
 def _tracked_python_dirs() -> set[str]:
     """Top-level directories holding tracked ``.py`` files.
 
@@ -76,6 +119,92 @@ def _tracked_python_dirs() -> set[str]:
         if "/" in line:
             dirs.add(line.split("/", 1)[0])
     return dirs
+
+
+def ci_job_names(ci_path: Path | None = None) -> list[str]:
+    """The job KEYS declared in the workflow, read from the workflow itself.
+
+    ⚠ NO PyYAML — the repo is stdlib-only across a 3.9-3.13 matrix. Job keys are the two-space
+    entries under a top-level ``jobs:``, which is a shape this file already relies on for the run
+    lines. The narrowness is deliberate and stated: it reads THIS workflow, not YAML in general.
+    """
+    text = (ci_path or (_ROOT / ".github" / "workflows" / "ci.yml")).read_text(encoding="utf-8")
+    out, in_jobs = [], False
+    for line in text.splitlines():
+        if re.match(r"^jobs:\s*$", line):
+            in_jobs = True
+            continue
+        if in_jobs:
+            if line.strip() and not line.startswith(" "):
+                break
+            m = re.match(r"^  ([A-Za-z][\w-]*):\s*$", line)
+            if m:
+                out.append(m.group(1))
+    return out
+
+
+def ci_jobs_with_commands(ci_path: Path | None = None) -> dict[str, list[str]]:
+    """Each job mapped to its SINGLE-LINE ``run:`` commands — the ones a README could mirror.
+
+    ⚠ A BLOCK SCALAR (``run: |``) IS DELIBERATELY NOT A MIRRORABLE COMMAND. The hygiene job is two
+    multi-line shell assertions embedded in the workflow; there is no command a reader could type,
+    which is precisely why it needs an exemption rather than a README line. Distinguishing the two
+    shapes here is what makes "has no local twin" a MEASURED property rather than an assertion.
+    """
+    text = (ci_path or (_ROOT / ".github" / "workflows" / "ci.yml")).read_text(encoding="utf-8")
+    jobs: dict[str, list[str]] = {}
+    current: str | None = None
+    in_jobs = False
+    for line in text.splitlines():
+        if re.match(r"^jobs:\s*$", line):
+            in_jobs = True
+            continue
+        if not in_jobs:
+            continue
+        if line.strip() and not line.startswith(" "):
+            break
+        m = re.match(r"^  ([A-Za-z][\w-]*):\s*$", line)
+        if m:
+            current = m.group(1)
+            jobs[current] = []
+            continue
+        r = re.match(r"^\s*(?:- )?run:\s*(\S.*)$", line)
+        if r and current and not r.group(1).startswith("|"):
+            jobs[current].append(r.group(1).strip())
+    return jobs
+
+
+def ci_exemption_errors() -> list[str]:
+    """Every CI job is checked or exempted, and every exemption names a job that EXISTS.
+
+    ⚠ THIS IS THE ROSTER CONSTRUCTOR APPLIED TO THE EXEMPTION TABLE, AND WITHOUT IT THE FIX FOR
+    PR #49's D1 WOULD HAVE BEEN THE SAME DEFECT ONE FIELD OVER. Keying exemptions on CI job names
+    makes the table a CLAIM ABOUT ci.yml's JOB SET — a second enumeration. An exemption for a job
+    that has been renamed or deleted is then inert for exactly the reason the original filename-
+    keyed entry was inert: an unconsulted entry never fails, so it lapses silently and its mere
+    presence still reads as evidence the boundary was considered.
+
+    So the table is partitioned in BOTH directions: no job may be silently unchecked, and no
+    exemption may name a job that does not exist. That is what makes the day-one claim honest —
+    hygiene is exempt from a check that WOULD otherwise fire, and if the job is renamed the
+    exemption REDS rather than quietly lapsing.
+    """
+    data = load()
+    exempt = data.get("ci_claim_exemptions", {})
+    jobs = set(ci_job_names())
+    errs: list[str] = []
+    if not jobs:
+        return ["no CI jobs parsed from ci.yml — refusing to check the exemption table vacuously"]
+    for name, entry in sorted(exempt.items()):
+        if name not in jobs:
+            errs.append(
+                f"ci_claim_exemptions names job {name!r}, which does not exist in ci.yml "
+                f"(jobs: {sorted(jobs)}). A stale exemption is inert and invisible — it never "
+                f"fails, so it lapses silently while still reading as a considered decision.")
+        for field in ("reason", "remove_when"):
+            if not str(entry.get(field, "")).strip():
+                errs.append(f"ci_claim_exemptions {name!r} has no {field}")
+    return errs
 
 
 def partition_errors() -> list[str]:

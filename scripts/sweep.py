@@ -1917,7 +1917,26 @@ def retombstone(args) -> int:
     return EXIT_CLEAN
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """THE PARSER, BUILT ONCE, SO THE CLI AND ANY CHECKER READ THE SAME OBJECT.
+
+    ⚠ THIS EXISTS BECAUSE THE FIRST VERSION OF THE SUBCOMMAND CHECK CLAIMED THE PARSER AS ITS
+    SOURCE OF TRUTH AND WAS A REGEX OVER THIS FILE'S TEXT. It matched ``sub.add_parser("...")``
+    literals — which is not derivation from the parser, it is a SECOND ENUMERATION of what the
+    parser is expected to contain: the exact defect class that check exists to close, committed
+    inside it. A subcommand registered by a loop, from a constant, or with a name the pattern did
+    not anticipate was invisible, and the check would have reported clean over a parser it never
+    read. Found in dissent on PR #49, not by the red-proof — the armed mutants tested VALUES, and
+    this was a defect of MECHANISM.
+
+    ⚠ AND THE OLD VERSION LOOKED LIKE INTROSPECTION. It imported this module, constructed an
+    ``ArgumentParser``, added subparsers, then ``del``'d them and fell through to the regex. A
+    reader saw the parser being built and believed it was being read. Prose-vs-mechanism drift
+    inside the harness built to detect prose-vs-mechanism drift.
+
+    Registered names are now available as ``build_parser()._subparsers`` choices — read from the
+    object the CLI actually dispatches on, so the two cannot disagree.
+    """
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sw = sub.add_parser("sweep", help="sweep records (default: ALL registered)")
@@ -1950,6 +1969,23 @@ def main(argv: list[str] | None = None) -> int:
                     help="restrict to these locations; REPEATABLE. Omit to bind wherever the "
                          "block is. Tombstones outside the named scope are PRESERVED")
     rt.set_defaults(fn=retombstone)
+    return ap
+
+
+def registered_subcommands() -> set[str]:
+    """The subcommand names, READ FROM THE PARSER OBJECT the CLI dispatches on.
+
+    ⚠ FROM ``choices``, NOT FROM SOURCE TEXT. That is the whole correction: a checker asking this
+    function cannot disagree with the parser, because it is asking the parser.
+    """
+    for act in build_parser()._actions:
+        if isinstance(act, argparse._SubParsersAction):
+            return set(act.choices)
+    return set()
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
     a = ap.parse_args(argv)
     # ⚠ D3/D4 — ONE HANDLER FOR EVERY COMMAND. `sweep`, `harvest` and `retombstone` all call
     # `load_records` BEFORE `instrument_gate`, so a broken registry cannot be caught by the gate.

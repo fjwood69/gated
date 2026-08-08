@@ -67,10 +67,30 @@
     "a docstring to data, so the claim is checkable rather than merely written down."
   ],
 
+  "layout_excluded": {
+    ".github": {
+      "reason": "CI configuration, not part of the reader-facing repository layout the README describes",
+      "remove_when": "the README's layout section is repurposed to describe infrastructure as well as source"
+    }
+  },
+
   "ci_claim_exemptions": {
     "hygiene": {
-      "reason": "the Repo hygiene job is two shell assertions embedded in the workflow YAML; there is no locally invocable command for the README's 'Run the static gates' block to mirror",
+      "reason": "the Repo hygiene job is two multi-line shell assertions embedded in the workflow YAML; it has NO single-line runnable command, so there is nothing for the README's 'Run the static gates' block to mirror",
       "remove_when": "a local equivalent command exists (e.g. scripts/check-hygiene.py) and the README documents it"
     }
-  }
+  },
+
+  "_exemptions_note": [
+    "⚠ KEYED ON CI JOB NAMES, AND THE KEYS ARE THEMSELVES PARTITIONED — which is the correction, not",
+    "a detail. Keying an exemption table on job names makes the table a CLAIM ABOUT ci.yml's JOB SET,",
+    "i.e. a second enumeration. An exemption naming a job that has since been renamed or deleted",
+    "would then be inert for exactly the reason the first version of this table was inert: an entry",
+    "nothing consults never fails, so it lapses SILENTLY while its presence still reads as evidence",
+    "that the boundary was considered.",
+    "",
+    "So ci_exemption_errors partitions both ways: no job may be silently unchecked, and no exemption",
+    "may name a job that does not exist. That is what makes the claim honest - hygiene is exempt from",
+    "a check that WOULD otherwise fire, and renaming the job REDS rather than quietly lapsing."
+  ]
 }

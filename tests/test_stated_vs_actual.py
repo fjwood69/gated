@@ -69,6 +69,7 @@ class PackageRosterIsDerived(unittest.TestCase):
         the tombstone's discipline — a suppression that carries its own expiry, not a standing one."""
         data = gate_coverage.load()
         tables = {"packages_excluded": data.get("packages_excluded", {}),
+                  "layout_excluded": data.get("layout_excluded", {}),
                   "ci_claim_exemptions": data.get("ci_claim_exemptions", {})}
         for table, entries in tables.items():
             self.assertTrue(entries, f"{table} is empty — this test would pass vacuously")
@@ -149,13 +150,16 @@ class SubcommandClaimsAreDerivedFromTheParser(unittest.TestCase):
 
     @staticmethod
     def _registered() -> set[str]:
+        """⚠ FROM THE PARSER OBJECT THE CLI DISPATCHES ON, NOT FROM SOURCE TEXT.
+
+        The first version of this was a regex over ``sub.add_parser("...")`` literals — which is
+        not derivation from the parser but a SECOND ENUMERATION of what the parser is expected to
+        contain: the exact defect class this axiom exists to close, committed inside it. It also
+        built an ``ArgumentParser`` and discarded it, so it LOOKED like introspection. Found in
+        dissent on PR #49; the armed mutants tested values, and this was a defect of mechanism.
+        """
         import sweep as S
-        ap_actions = []
-        parser = S.argparse.ArgumentParser()
-        sub = parser.add_subparsers(dest="cmd")
-        del ap_actions, sub
-        src = (_ROOT / "scripts" / "sweep.py").read_text(encoding="utf-8")
-        return set(re.findall(r'sub\.add_parser\(\s*"([a-z]+)"', src))
+        return S.registered_subcommands()
 
     def test_no_operator_facing_string_names_an_UNREGISTERED_subcommand(self):
         known = self._registered()
@@ -272,15 +276,44 @@ class ReadmeCiClaimsArePinnedBOTHWays(unittest.TestCase):
                     out.add(ln.strip())
         return out
 
-    def test_every_gate_script_CI_runs_is_MENTIONED_in_the_readme(self):
+    def test_EVERY_CI_JOB_is_checked_or_exempted_and_no_exemption_is_STALE(self):
+        """⚠ THE EXEMPTION TABLE IS ITSELF PARTITIONED, WHICH IS THE CORRECTION AND NOT A DETAIL.
+
+        The first version keyed exemptions on gate-script FILENAMES and compared them against
+        `scripts/*.py` run lines — so the key `hygiene` could never match anything, the entry was
+        INERT, and the claim that the hygiene job "would have redded on day one" was FALSE AS
+        BUILT: the check never inspected that job at all. A clearance predicate with no caller,
+        committed while closing the family that names it.
+
+        Keying on JOB NAMES fixes that and introduces the same defect one field over — the table
+        becomes a claim about ci.yml's job set. So it partitions BOTH ways: no job silently
+        unchecked, and no exemption naming a job that does not exist.
+        """
+        self.assertEqual(gate_coverage.ci_exemption_errors(), [])
+
+    def test_every_job_with_a_RUNNABLE_command_has_it_mentioned_in_the_readme(self):
+        """⚠ JOB-LEVEL, NOT SCRIPT-LEVEL. A job whose commands cannot be mirrored locally must be
+        EXEMPTED; a job whose commands can be must have them in the README. That makes "has no
+        local twin" a measured property of the workflow rather than an assertion about it."""
         readme = _README.read_text(encoding="utf-8")
         exempt = set(gate_coverage.load().get("ci_claim_exemptions", {}))
-        for cmd in self._ci_commands():
-            m = re.search(r"scripts/([a-z-]+\.py)", cmd)
-            if m and m.group(1) not in exempt:
-                self.assertIn(m.group(1), readme,
-                              f"CI runs scripts/{m.group(1)} and the README never mentions it — "
-                              f"an incomplete list is still a claim about contents")
+        jobs = gate_coverage.ci_jobs_with_commands()
+        self.assertTrue(jobs, "no jobs parsed — this check would pass vacuously")
+        for job, cmds in sorted(jobs.items()):
+            runnable = [c for c in cmds
+                        if re.match(r"^(python|mypy|ruff)\b", c) and "pip install" not in c]
+            with self.subTest(job=job):
+                if not runnable:
+                    self.assertIn(job, exempt,
+                                  f"job {job!r} has no locally runnable command and is not "
+                                  f"exempted — it can never be mirrored, so silence about it is "
+                                  f"an unrecorded decision")
+                    continue
+                for cmd in runnable:
+                    tok = re.search(r"(scripts/[a-z-]+\.py|mypy|ruff|unittest)", cmd)
+                    self.assertTrue(tok and tok.group(1) in readme,
+                                    f"CI job {job!r} runs {cmd!r} and the README never mentions "
+                                    f"it — an incomplete list is still a claim about contents")
 
     def test_the_readme_unittest_flags_MATCH_ci(self):
         """The actual defect, at FLAG granularity: `-W error` in one surface only."""
@@ -317,16 +350,20 @@ class ReadmeCiClaimsArePinnedBOTHWays(unittest.TestCase):
 # AXIOM 5 — layout. Source of truth: the git tree
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 class LayoutListIsAClaimAboutTheTree(unittest.TestCase):
-    """The eighth carrier — the layout section omitted `demo/`, the one package the README says to run."""
+    """The eighth carrier — the layout section omitted `demo/`, the one package the README says to run.
 
-    def test_every_top_level_python_directory_APPEARS_in_the_layout_section(self):
+    ⚠ WIDENED TO EVERY TRACKED TOP-LEVEL DIRECTORY, VIA A PUBLIC HELPER. The first version walked
+    python-bearing directories only, while the design claimed the source of truth was THE GIT TREE
+    — so `docs/` could be added to the list and NOTHING PINNED IT. The stated source was wider than
+    the actual source: this increment's own defect, one level in, found in dissent on PR #49. It
+    also reached across a module boundary into a private helper.
+    """
+
+    def test_every_tracked_top_level_directory_APPEARS_or_is_EXCLUDED(self):
         text = _README.read_text(encoding="utf-8")
         section = text.split("## Repository layout", 1)[1].split("\n## ", 1)[0]
-        listed = set(re.findall(r"^- `([a-z_]+)/`", section, re.MULTILINE))
-        missing = sorted(d for d in gate_coverage._tracked_python_dirs() if d not in listed)
-        self.assertEqual(missing, [],
-                         f"the layout list omits {missing} — a list is a claim about its contents, "
-                         f"and this is the same shape as the `scripts/` omission it already fixed")
+        listed = set(re.findall(r"^- `([a-z_.]+)/`", section, re.MULTILINE))
+        self.assertEqual(gate_coverage.layout_errors(listed), [])
 
 
 if __name__ == "__main__":
