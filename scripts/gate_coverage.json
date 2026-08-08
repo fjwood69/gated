@@ -1,0 +1,76 @@
+{
+  "_": [
+    "THE SOURCE OF TRUTH FOR WHAT THE REPOSITORY GATES COVER. Every consumer DERIVES from",
+    "this file; none restates it. Reconciling two lists is not the fix - reconciled lists agree",
+    "today, derived lists cannot disagree.",
+    "",
+    "JSON AND NOT TOML, ON A MEASURED CONSTRAINT RATHER THAN A PREFERENCE: the suite is",
+    "stdlib-only across a 3.9-3.13 CI matrix (check-overclaim.py states this in its own",
+    "docstring), and `tomllib` does not exist below 3.11. TOML would break the two oldest legs.",
+    "",
+    "EVERY EXCLUSION CARRIES BOTH `reason` AND `remove_when`. An exclusion with only a reason is",
+    "a PERMANENT GRANT and the table becomes where claims go to stop being checked; with an",
+    "expiry condition the table is AUDITABLE, because an entry whose condition has since been",
+    "met is a stale exclusion findable by machine. Same discipline as a tombstone: a suppression",
+    "that carries its own expiry rather than a standing one."
+  ],
+
+  "packages": ["core", "sandbox", "engine", "observe", "gate", "cli", "demo"],
+
+  "packages_excluded": {
+    "scripts": {
+      "reason": "ruff-checked only; the mypy --strict typing sweep over sweep.py (~1,900 lines) plus three gate scripts is an unknown-sized job and is a separate boarded increment",
+      "remove_when": "scripts/ passes mypy --strict and that increment merges"
+    },
+    "tests": {
+      "reason": "not strict-typed; test modules use unittest.mock and SimpleNamespace fixtures throughout",
+      "remove_when": "tests/ is brought under mypy --strict"
+    }
+  },
+
+  "markdown": ["README.md", "ARCHITECTURE.md"],
+
+  "gates": {
+    "mypy": {
+      "mode": "enumerated",
+      "derives": "packages",
+      "invoked_as": "mypy --strict $(python scripts/print_gate_argv.py)"
+    },
+    "check-overclaim.py": {
+      "mode": "enumerated",
+      "derives": "packages + markdown",
+      "invoked_as": "python scripts/check-overclaim.py"
+    },
+    "check-sterility.py": {
+      "mode": "wildcard",
+      "wildcard": "git ls-files (every tracked file)",
+      "invoked_as": "python scripts/check-sterility.py"
+    },
+    "check-voice.py": {
+      "mode": "wildcard",
+      "wildcard": "git ls-files *.md (published markdown only)",
+      "invoked_as": "python scripts/check-voice.py"
+    },
+    "ruff": {
+      "mode": "wildcard",
+      "wildcard": "ruff check . (the whole tree)",
+      "invoked_as": "ruff check ."
+    }
+  },
+
+  "_gates_note": [
+    "A WILDCARD GATE CANNOT DRIFT IN THE ROSTER DIRECTION AT ALL - its coverage follows from its",
+    "mechanism, so every tracked file is scanned by construction. Its honest failure mode is the",
+    "OPPOSITE one: a reader over-reading a green build. check-voice.py already states this in",
+    "prose ('a boundary the script states rather than implies, so a green build is never read as",
+    "\"no first-person-plural anywhere\"'). Recording the mode here promotes that convention from",
+    "a docstring to data, so the claim is checkable rather than merely written down."
+  ],
+
+  "ci_claim_exemptions": {
+    "hygiene": {
+      "reason": "the Repo hygiene job is two shell assertions embedded in the workflow YAML; there is no locally invocable command for the README's 'Run the static gates' block to mirror",
+      "remove_when": "a local equivalent command exists (e.g. scripts/check-hygiene.py) and the README documents it"
+    }
+  }
+}

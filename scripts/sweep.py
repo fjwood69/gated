@@ -45,6 +45,16 @@ EXIT_HITS = 3         # live hits, read them
 EXIT_DEBT = 4         # a record is open (zero tombstones)
 EXIT_SEED = 5         # the SEED the caller supplied cannot be searched with (R16)
 EXIT_BIND = 6         # `retombstone` found nothing to bind (R4/R7)
+EXIT_CONFIG = 7       # no config file — the CALLER'S ENVIRONMENT is unbuilt (2026-08-08)
+# ⚠ SEVEN, AND THE SEVENTH WAS THE ONE AN OPERATOR HITS **FIRST**. Until 2026-08-08 the no-config
+# refusal was `sys.exit(<str>)`, which exits **1** — so it landed on EXIT_INSTRUMENT by COINCIDENCE
+# rather than by construction, and the whole enumeration above was an unpartitioned roster: six
+# causes each carrying a rationale, and the commonest cause of all declared NOWHERE.
+# ⚠ THE COLLISION WAS NOT COSMETIC. By R16's own reasoning, config-absent is a CALLER-ENVIRONMENT
+# failure, not a failure of the corpus or the channel — so exit 1 sent the reader to check globs,
+# roots and the board endpoint when the thing actually wrong was that they had never made a config.
+# Different cause, different remediation, different code: the law this file already states, applied
+# to the door every first-time operator walks through. Found by consult 1a37f46e.
 # ⚠ SIX, DELIBERATELY NOT TWO. `EXIT_TOMBSTONE` (2) means "a registered control BROKE"; this means
 # "there was nothing to register in the first place". Opposite ends of the same loop — one is a
 # correction that drifted, the other is a correction that was never written — and an operator shown
@@ -992,9 +1002,51 @@ def _previous_hits(ns: Path) -> tuple[set[str], str | None]:
     return keys, stamp
 
 
+class ConfigMissing(Exception):
+    """No config file. A typed condition so every command returns the SAME stratified code.
+
+    ⚠ IT REPLACES A `sys.exit(<str>)`, WHICH IS WHY THIS IS A CLASS AND NOT A TIDIER STRING. That
+    call exited **1** and therefore agreed with EXIT_INSTRUMENT by accident; nothing in the code
+    said so, and nothing would have noticed if the stdlib's default had differed. A named exception
+    turned into a named code by ONE handler is the same argument `RegistryUnreadable` already makes.
+    """
+
+
 def load_config() -> dict:
+    """⚠ THE REFUSAL NAMES A TRACKED FILE AND **ZERO SUBCOMMANDS**, AND THAT IS THE RULING.
+
+    It used to tell the operator to run an "init" subcommand. **THERE HAS NEVER BEEN ONE** — the
+    parser carries exactly `sweep`, `harvest` and `retombstone` — so the one part of a refusal an
+    operator actually acts on could not be performed. A refusal whose remediation does not exist is
+    strictly worse than one with no remediation at all: it sends the reader somewhere before they
+    conclude the tool is wrong.
+
+    ⚠ AND THE PHANTOM IS NAMED IN PROSE HERE RATHER THAN IN THE PINNED FORM, WHICH IS A REAL COST OF
+    THE GUARD AND IS RECORDED RATHER THAN WORKED AROUND. The check scopes to BACKTICKED
+    ``sweep <word>`` spans, so it cannot distinguish a refusal offering a phantom command from a
+    docstring explaining that the phantom was removed. Writing the dead name in backticks here would
+    red the build. That is the correct trade — the alternative is prose-wide tokenisation, which
+    false-positives on the parser's own help text ("sweep records (default: ALL registered)") — but
+    it means this file describes the removed command WITHOUT quoting it, deliberately.
+
+    ⚠ AND NAMING `harvest` INSTEAD WOULD HAVE BEEN A PLAUSIBLE CLAIM REPLACING A FALSE ONE, WHICH IS
+    NOT A FIX. `load_config()` is the FIRST STATEMENT of all three command bodies, so every
+    subcommand hits this identical refusal — `harvest` is refuted, not merely unverified. The
+    drafted repair reasoned about `sweep-registry/` (which harvest does create); the failing
+    precondition is the CONFIG, a different artefact.
+
+    So the remediation is a MANUAL ACT OF AUTHORSHIP NO SUBCOMMAND COULD PERFORM: the real config
+    names a private board endpoint and private planning roots that the tool cannot invent, and a
+    hypothetical `init` could only ever scaffold the template — which is what
+    `sweep.config.example.json` already is. The message therefore names a **tracked file**, and a
+    path claim is checkable in a way a command claim was not.
+    """
     if not CONFIG_PATH.exists():
-        sys.exit(f"no config at {CONFIG_PATH} — run `sweep init` first")
+        raise ConfigMissing(
+            f"no config at {CONFIG_PATH} — copy {CONFIG_PATH.parent.name}/"
+            f"sweep.config.example.json and edit in your values. The config is deliberately "
+            f"uncommitted: it names a private board endpoint and a private planning-doc root "
+            f"(README §Development).")
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
@@ -1910,6 +1962,15 @@ def main(argv: list[str] | None = None) -> int:
         print("  This is NOT an empty registry, which is clean. The registry EXISTS and cannot be")
         print("  read, so the selected set is UNKNOWABLE and no run may report on it.")
         return EXIT_INSTRUMENT
+    except ConfigMissing as exc:
+        # ⚠ ONE HANDLER, LIKE THE ONE ABOVE, AND FOR THE SAME REASON — all three commands call
+        # `load_config` as their first statement, so three catches that must agree is the dual-site
+        # shape this file has met repeatedly.
+        print(f"⚠ NO CONFIG — {exc}")
+        print("  This is exit 7, NOT the instrument code: the corpus and the channel are fine —")
+        print("  the tool has never been configured on this machine. Different cause, different")
+        print("  remediation, so different code (R4a).")
+        return EXIT_CONFIG
 
 
 if __name__ == "__main__":

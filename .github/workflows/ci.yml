@@ -101,7 +101,13 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install "mypy==2.1.0"
-      - run: mypy --strict core sandbox engine observe gate cli demo
+      # ⚠ THE PACKAGE ARGV IS DERIVED FROM scripts/gate_coverage.json, NEVER RESTATED HERE. A
+      # literal argv on this line is a second enumeration of the roster: correct the day it is
+      # written, silently divergent the day only the other side is edited. That is exactly how
+      # `demo` came to be type-checked here while check-overclaim.py never scanned it. GitHub
+      # Actions does not parse the roster — the shell does, and print_gate_argv refuses to emit
+      # anything if the roster fails its own partition check.
+      - run: mypy --strict $(python scripts/print_gate_argv.py)
 
   test:
     name: Unit tests (py ${{ matrix.python-version }})
