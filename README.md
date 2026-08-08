@@ -265,8 +265,10 @@ not carry across to another.
 - `engine/` — trials, aggregation and runtime assertions
 - `gate/` — calibration, governance, admission, GitHub App and durable stores
 - `cli/` — command-line package
+- `demo/` — the runnable demonstration corpus and its runner
 - `scripts/` — the repository gates CI runs, and the supersession sweep
 - `tests/` — unit, adversarial and real-Podman tests
+- `docs/` — assets referenced by this README
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for trust boundaries, invariants and
 known deployment limits, and [COMPLETENESS.md](COMPLETENESS.md) for the
@@ -289,18 +291,22 @@ python -m pip install -e .
 Run the test suite:
 
 ```bash
-python -W error -m unittest discover -s tests
+python -m unittest discover -s tests
 ```
 
 Run the static gates:
 
 ```bash
-mypy --strict core sandbox engine observe gate cli demo
+mypy --strict $(python scripts/print_gate_argv.py)
 ruff check .
 python scripts/check-overclaim.py
 python scripts/check-sterility.py
 python scripts/check-voice.py
 ```
+
+Which packages those gates cover is declared once, in
+`scripts/gate_coverage.json`, and derived by every consumer — including the
+`mypy` line above and the CI workflow. Nothing restates it.
 
 Tests requiring an OCI runtime self-skip when Podman or the configured test
 image is unavailable; the boundary mechanism is exercised in full where one is

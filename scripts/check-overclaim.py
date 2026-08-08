@@ -29,8 +29,20 @@ import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-_PACKAGES = ("core", "sandbox", "engine", "observe", "gate", "cli")
-_MARKDOWN = ("README.md", "ARCHITECTURE.md")
+
+# ⚠ DERIVED FROM ``scripts/gate_coverage.json``, NEVER RESTATED HERE. These were two hand-maintained
+# literals, and the packages one HAD ALREADY DRIFTED from the argv in ci.yml — `demo` was
+# type-checked by mypy and invisible to this gate, so overclaim language in the one package the
+# README tells every new reader to RUN was never scanned. Reconciling the two lists would have
+# fixed the values and left the class open; deriving them makes disagreement unrepresentable.
+#
+# ⚠ THE MARKDOWN SET IS DERIVED, NOT WIDENED. Same two files as before. Widening to every planning
+# document is a boarded cost decision; sourcing the same members is the opposite act, and leaving
+# this one literal would keep a second hand-maintained list inside the file whose de-duplication is
+# the whole increment.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gate_coverage import markdown as _roster_markdown  # noqa: E402
+from gate_coverage import packages as _roster_packages  # noqa: E402
 _VOCAB_FILE = _ROOT / "scripts" / "claims_vocabulary.txt"
 _SUPPRESS_FILE = _ROOT / "scripts" / "overclaim_suppressions.txt"
 
@@ -76,7 +88,7 @@ def main() -> int:
     suppressions = _load_suppressions(_SUPPRESS_FILE)
     violations: list[str] = []
 
-    for pkg in _PACKAGES:
+    for pkg in _roster_packages():
         for py in sorted((_ROOT / pkg).rglob("*.py")):
             rel = py.relative_to(_ROOT).as_posix()
             blob = "\n".join(_string_literals(py.read_text(encoding="utf-8"))).lower()
@@ -84,7 +96,7 @@ def main() -> int:
                 if phrase in blob and (rel, phrase) not in suppressions:
                     violations.append(f"{rel}: overclaim phrase {phrase!r} in a string literal")
 
-    for md in _MARKDOWN:
+    for md in _roster_markdown():
         path = _ROOT / md
         if not path.exists():
             continue

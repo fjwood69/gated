@@ -594,7 +594,25 @@ class CompletedRun:
 
         ⚠ NO KEY DERIVATION and NO SOFT SKIP. The key is carried on the row and checked against the
         pin as a PAIR at construction, so nothing here transforms a string, and the exact-cardinality
-        and exact-pair checks make an unkeyed or uncompared row unconstructible rather than skipped.
+        and exact-pair checks REFUSE an unkeyed or uncompared row rather than skipping it.
+
+        ⚠ REFUSED, NOT UNREPRESENTABLE — a narrowing made 2026-08-08, and the distinction is one this
+        tree rules on rather than a wording preference. This sentence used to claim the checks made
+        such a row impossible to build at all. They do not: a runtime cardinality-and-pair check is a
+        GATE, and a gate refuses a bad value that WAS built. Only a type-level constructor makes a
+        state unrepresentable. The mechanism here is right; the word for it was one class too strong.
+
+        ⚠ THE WITHDRAWN WORD IS DESCRIBED HERE AND NOT QUOTED, WHICH IS A COST OF THE GATE WORTH
+        RECORDING. The overclaim lint scans string literals for banned phrases and has no notion of a
+        quoted-and-withdrawn span, so a correction that QUOTES the phrase it is retiring reds the
+        build exactly as the original claim did. `sweep.py`'s R7 solves this for the supersession
+        sweep with hash-pinned withdrawal blocks; this gate has no equivalent, so a correction must
+        paraphrase. Second surface today where a withdrawal could not quote its own subject.
+
+        ⚠ AND IT SURVIVED THIS LONG BECAUSE NOTHING SCANNED IT. `demo` was in mypy's argv and absent
+        from the overclaim gate's package list — the drift this increment closes — so the one package
+        the README tells every new reader to RUN was never checked for overclaim language at all.
+        Deriving both consumers from one roster surfaced it on the first run.
         """
         expected = self.binding.expectations()
         out: list[tuple[str, int, int]] = []
