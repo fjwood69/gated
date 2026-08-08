@@ -186,8 +186,31 @@ def ci_jobs_with_commands(ci_path: Path | None = None) -> dict[str, list[str]]:
     return jobs
 
 
+def runnable_commands(cmds: list[str]) -> list[str]:
+    """The commands in a job a README could mirror — defined ONCE, here.
+
+    ⚠ THIS PREDICATE USED TO LIVE IN THE TEST while the function that named the property lived
+    here, so the two halves of one rule sat on opposite sides of the module boundary. That is the
+    dual-site shape by another route: the day someone widens one, the other does not follow.
+    """
+    return [c for c in cmds
+            if re.match(r"^(python|mypy|ruff)\b", c) and "pip install" not in c]
+
+
 def ci_exemption_errors() -> list[str]:
     """Every CI job is checked or exempted, and every exemption names a job that EXISTS.
+
+    ⚠ THIS FUNCTION USED TO CLAIM BOTH DIRECTIONS AND IMPLEMENT ONE. It checked only
+    exemptions-subset-of-jobs; the other half — a job with no runnable command must be exempted —
+    was implemented in a TEST. The coverage existed, so nothing was unchecked; what was false was
+    THIS DOCSTRING AND THIS FUNCTION'S NAME. A caller reaching for the named constructor and
+    expecting both directions got one, which is the same defect as ``_registered()`` claiming the
+    parser and reading source text: prose-vs-mechanism, committed inside the repair for
+    prose-vs-mechanism. Both halves now live here.
+
+    ⚠ AND IT IS THE FOURTH TIME BIDIRECTIONALITY HAS BEEN RULED AND HALF-CARRIED IN THIS
+    INCREMENT — after the README-versus-CI pin that ruled it, the layout check that omitted it
+    (RD1), and this. The rule keeps being stated on one axiom and not carried to the next.
 
     ⚠ THIS IS THE ROSTER CONSTRUCTOR APPLIED TO THE EXEMPTION TABLE, AND WITHOUT IT THE FIX FOR
     PR #49's D1 WOULD HAVE BEEN THE SAME DEFECT ONE FIELD OVER. Keying exemptions on CI job names
@@ -216,6 +239,15 @@ def ci_exemption_errors() -> list[str]:
         for field in ("reason", "remove_when"):
             if not str(entry.get(field, "")).strip():
                 errs.append(f"ci_claim_exemptions {name!r} has no {field}")
+    # THE SECOND DIRECTION, FOLDED IN — a job the README cannot mirror must be an explicit
+    # decision, never a silence. Without this half the function's own name was a claim it did
+    # not honour.
+    for job, cmds in sorted(ci_jobs_with_commands().items()):
+        if not runnable_commands(cmds) and job not in exempt:
+            errs.append(
+                f"CI job {job!r} has no locally runnable command and is NOT exempted. It can "
+                f"never be mirrored in the README, so saying nothing about it is an unrecorded "
+                f"decision rather than an absent one.")
     return errs
 
 

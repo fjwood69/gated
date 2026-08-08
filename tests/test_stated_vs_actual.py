@@ -148,21 +148,9 @@ class SubcommandClaimsAreDerivedFromTheParser(unittest.TestCase):
     lives there too — this is NOT full-prose coverage and must not be read as it.
     """
 
-    @staticmethod
-    def _registered() -> set[str]:
-        """⚠ FROM THE PARSER OBJECT THE CLI DISPATCHES ON, NOT FROM SOURCE TEXT.
-
-        The first version of this was a regex over ``sub.add_parser("...")`` literals — which is
-        not derivation from the parser but a SECOND ENUMERATION of what the parser is expected to
-        contain: the exact defect class this axiom exists to close, committed inside it. It also
-        built an ``ArgumentParser`` and discarded it, so it LOOKED like introspection. Found in
-        dissent on PR #49; the armed mutants tested values, and this was a defect of mechanism.
-        """
-        import sweep as S
-        return S.registered_subcommands()
-
     def test_no_operator_facing_string_names_an_UNREGISTERED_subcommand(self):
-        known = self._registered()
+        import sweep as S
+        known = S.registered_subcommands()
         self.assertTrue(known, "no subcommands discovered — the check would pass vacuously")
         src = (_ROOT / "scripts" / "sweep.py").read_text(encoding="utf-8")
         named = set(_BACKTICKED_SWEEP.findall(src))
@@ -176,9 +164,70 @@ class SubcommandClaimsAreDerivedFromTheParser(unittest.TestCase):
         subcommand stays green" has no production string left to stand on. The property under test
         is the CHECK's behaviour, so a synthetic pair is the honest instrument — without it this
         would silently pin "messages contain no subcommand names", which is not the property."""
-        known = self._registered()
+        import sweep as S
+        known = S.registered_subcommands()
         self.assertEqual(set(_BACKTICKED_SWEEP.findall("run `sweep harvest` first")) - known, set())
         self.assertEqual(set(_BACKTICKED_SWEEP.findall("run `sweep init` first")) - known, {"init"})
+
+    def test_subcommands_come_from_the_PARSER_OBJECT_not_the_SOURCE_TEXT(self):
+        """⚠ THE CONTROL THAT DISTINGUISHES D2's FIX FROM D2's DEFECT, AND IT WAS MEASURED ONCE IN A
+        BOARD ENTRY AND NEVER COMMITTED. Reverting the derivation to the old regex over
+        ``sub.add_parser("...")`` literals would leave every other test in this file GREEN, because
+        production registers with lowercase string literals that the regex happens to match. So the
+        mechanism closing D2 could regress in silence.
+
+        A stimulus that proves a mechanism works is not a control until it is IN THE SUITE — the
+        disarmed-bomb rule applied to a control rather than to a test.
+
+        The discriminator: register a subcommand whose name arrives via a VARIABLE. A regex over
+        source literals cannot see it; a read of the parser's own ``choices`` must. Asserting BOTH
+        halves is what makes this a discriminator rather than a restatement — it pins that the two
+        mechanisms genuinely disagree, and that ours is the one telling the truth.
+
+        ⚠ AND THE HARNESS HAS NO WRAPPER ROUND IT, WHICH IS THE OTHER HALF OF THE FIX. The first
+        attempt pinned production and left a `_registered()` helper in this file free to go back to
+        a regex — a red-proof mutant reverted exactly that and SURVIVED, because nothing here called
+        the pinned function through it. A wrapper is a second site, and a second site is the defect
+        this whole increment is about. So the wrapper is deleted rather than checked: every caller
+        asks `sweep.registered_subcommands()` directly, and there is no intermediate left to drift.
+
+        ⚠ RESIDUAL, MEASURED AND NOT CLOSED. Deleting the wrapper removes the second site that
+        EXISTS; it does not make second sites UNREPRESENTABLE. Measured 2026-08-08: reintroducing a
+        `_registered()` helper that reads the source with a VERIFIED-WORKING regex, and repointing
+        the two callers at it, leaves this whole file GREEN. So a future contributor can reopen D2
+        by hand and nothing here will say so.
+        ⚠ AND THE FIRST ATTEMPT TO MEASURE THAT PRODUCED A FALSE KILL: an escaping error made the
+        mutant's regex match nothing, the tests redded, and it read as "the wrapper is forbidden".
+        It was a BAD MUTANT — killed for a reason unrelated to its target. The real answer only
+        appeared after asserting the mutant's own regex found the three subcommands first. A mutant
+        must be proven ARMED before its death means anything.
+        Closing this properly needs a pin on THIS FILE's own mechanism, which is a step deeper than
+        the increment was scoped for. Stated here rather than left for the next reader to find.
+        """
+        import sweep as S
+        real = S.build_parser
+
+        def patched():
+            ap = real()
+            for act in ap._actions:
+                if isinstance(act, S.argparse._SubParsersAction):
+                    name = "audit"      # via a variable — invisible to a literal-matching regex
+                    act.add_parser(name, help="probe")
+            return ap
+
+        try:
+            S.build_parser = patched                 # type: ignore[assignment]
+            seen = S.registered_subcommands()
+        finally:
+            S.build_parser = real                    # type: ignore[assignment]
+
+        self.assertIn("audit", seen,
+                      "registered_subcommands must read the parser OBJECT — a variable-named "
+                      "registration is exactly what a source-text regex cannot see")
+        src = (_ROOT / "scripts" / "sweep.py").read_text(encoding="utf-8")
+        by_regex = set(re.findall(r'sub\.add_parser\(\s*"([a-z]+)"', src))
+        self.assertNotIn("audit", by_regex,
+                         "stimulus control: if the regex COULD see it, this test proves nothing")
 
     def test_the_no_config_refusal_points_at_a_TRACKED_FILE(self):
         """The remediation is a manual act of authorship: a path claim, which is checkable."""
@@ -300,8 +349,7 @@ class ReadmeCiClaimsArePinnedBOTHWays(unittest.TestCase):
         jobs = gate_coverage.ci_jobs_with_commands()
         self.assertTrue(jobs, "no jobs parsed — this check would pass vacuously")
         for job, cmds in sorted(jobs.items()):
-            runnable = [c for c in cmds
-                        if re.match(r"^(python|mypy|ruff)\b", c) and "pip install" not in c]
+            runnable = gate_coverage.runnable_commands(cmds)
             with self.subTest(job=job):
                 if not runnable:
                     self.assertIn(job, exempt,
