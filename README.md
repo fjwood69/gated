@@ -329,6 +329,28 @@ the corpus it reads is private and its run reports store every matched span in
 full. It will refuse to run without a config; `scripts/sweep.config.example.json`
 carries the shape.
 
+### How a change reaches `main`
+
+The rule here is that every change is reviewed as a diff before it is
+committed, and merged only on a ruling. I broke that order four times — most recently on #49, where the commit
+came before the review — so it is now a check rather than an intention.
+
+**What is enforced is promotion, not process.** I cannot stop myself committing
+in the wrong order in a repository I control: a local hook is advisory and
+bypassable by exactly the person it constrains. What `.github/workflows/dissent-gate.yml`
+enforces is that nothing merges into `main` unless the pull request carries a
+`Dissent-Ref:` line naming a review record, and that record is a dissent on
+**the exact head being merged**. One more commit after the review, and the
+check goes red until the review covers it.
+
+**What it does not prove.** I write both the reference and the record. The
+check turns *forgetting* into *having to state something false*; it closes
+omission, not deception. It verifies that a dissent-typed record names this
+head, not that the review behind it was any good. It runs from the base branch,
+so a pull request cannot edit the check that judges it; a pull request that
+changes anything under `.github/` is red by design and needs an admin ruling.
+Admin bypass remains, and is the honest residual.
+
 ## Deployment
 
 The live adapter is in `gate/live_app.py`. A deployment requires:

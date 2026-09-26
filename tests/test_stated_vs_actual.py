@@ -435,16 +435,21 @@ class ReadmeCiClaimsArePinnedBOTHWays(unittest.TestCase):
     # ── every workflow file, not just ci.yml (board, 2026-09-26) ──────────────────────────────
     def test_an_UNLISTED_workflow_file_reds(self):
         """A second workflow is CI the claims check never sees. It must be partitioned or exempted."""
-        self.assertEqual(gate_coverage.workflow_errors(["ci.yml"]), [], "control: ci.yml alone is clean")
-        self._assert_reds(gate_coverage.workflow_errors(["ci.yml", "dissent-gate.yml"]),
+        # ⚠ AGAINST THE REAL ENUMERATION PLUS A NAME NO WORKFLOW HAS. The first version used
+        # dissent-gate.yml as its unlisted example and ci.yml-alone as its control — both true at
+        # P10a, both false the moment P10b exempted that file. A test coupled to the tree's state
+        # rather than to the rule breaks on correct work.
+        real = gate_coverage.workflow_files()
+        self.assertEqual(gate_coverage.workflow_errors(real), [], "control: the real tree is clean")
+        self._assert_reds(gate_coverage.workflow_errors(real + ["unlisted-probe.yml"]),
                           "neither checked against the README nor exempted")
         self._assert_reds(gate_coverage.readme_ci_claim_errors(workflows=["ci.yml", "extra.yaml"]),
                           "'extra.yaml'")
 
     def test_an_EXEMPTED_workflow_file_is_green_and_a_STALE_one_reds(self):
         entry = {"reason": "r", "remove_when": "w"}
-        with _Roster(lambda d: d.update({"workflows_excluded": {"dissent-gate.yml": entry}})):
-            self.assertEqual(gate_coverage.workflow_errors(["ci.yml", "dissent-gate.yml"]), [],
+        with _Roster(lambda d: d.update({"workflows_excluded": {"extra.yml": entry}})):
+            self.assertEqual(gate_coverage.workflow_errors(["ci.yml", "extra.yml"]), [],
                              "correlated positive: an exempted workflow file is not red")
             self._assert_reds(gate_coverage.workflow_errors(["ci.yml"]), "not a tracked workflow file")
         with _Roster(lambda d: d.update({"workflows_excluded": {"ci.yml": entry}})):
@@ -465,7 +470,8 @@ class ReadmeCiClaimsArePinnedBOTHWays(unittest.TestCase):
                                                  ".github/workflows/other.yaml"]):
                 subprocess.run(argv, cwd=root, check=True, capture_output=True)
             self.assertEqual(gate_coverage.workflow_files(root), ["ci.yml", "other.yaml"])
-        self.assertEqual(gate_coverage.workflow_files(), ["ci.yml"], "the real tree has one workflow today")
+        self.assertEqual(gate_coverage.workflow_files(), ["ci.yml", "dissent-gate.yml"],
+                         "the real tree: ci.yml, and the process gate's workflow (exempted by name)")
 
     # ── the CI side, partitioned (mutant E, split into its two stimuli) ───────────────────────
     _LINT_ANCHOR = "      - run: ruff check .\n"
@@ -634,11 +640,12 @@ class ReadmeCiClaimsArePinnedBOTHWays(unittest.TestCase):
 class ExemptionTablesAreDerivedAndPartitioned(unittest.TestCase):
     """Every top-level roster key is an exemption table or declared not to be — and both directions red."""
 
-    def test_the_real_roster_is_clean_and_finds_ALL_FOUR_tables(self):
+    def test_the_real_roster_is_clean_and_finds_ALL_FIVE_tables(self):
         tables, errs = gate_coverage.exemption_tables()
         self.assertEqual(errs, [])
         self.assertEqual(set(tables), {"packages_excluded", "layout_excluded",
-                                       "ci_claim_exemptions", "display_only_flags"},
+                                       "ci_claim_exemptions", "display_only_flags",
+                                       "workflows_excluded"},
                          "control: the derivation must find every table, or its checks are vacuous")
 
     def test_a_MALFORMED_table_is_RED_not_excluded(self):

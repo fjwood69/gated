@@ -98,12 +98,19 @@
     "file's diff and nowhere else."
   ],
 
+  "workflows_excluded": {
+    "dissent-gate.yml": {
+      "reason": "the process gate: a pull_request_target job that judges a PR's Dissent-Ref line against the board. It has no command a reader runs locally (it needs a PR event and the board), so there is nothing for the README claims region to mirror. Its rules are tested offline by tests/test_dissent_gate.py and its workflow invariants (no head checkout, no cache, no interpolated run line, read-only permissions) are pinned there",
+      "remove_when": "the README claims check partitions workflow files other than ci.yml, or the gate gains a locally runnable form that the README claims"
+    }
+  },
+
   "_workflows_note": [
     "EVERY FILE UNDER .github/workflows/ IS EITHER PARTITIONED BY THE README CLAIMS CHECK (today only",
-    "ci.yml) OR LISTED IN A `workflows_excluded` TABLE with a reason and a remove_when. An unlisted",
-    "workflow file is RED, and an entry naming a file that no longer exists is RED as stale. The table",
-    "is ABSENT while ci.yml is the only workflow: an empty table would satisfy every entry check",
-    "vacuously, so exemption_tables() reds one. It appears with its first entry."
+    "ci.yml) OR LISTED IN workflows_excluded with a reason and a remove_when. An unlisted workflow file",
+    "is RED, and an entry naming a file that no longer exists is RED as stale. The table was absent at",
+    "P10a (an empty table satisfies every entry check vacuously, so exemption_tables() reds one); P10b",
+    "added it with its first entry, the process gate's own workflow."
   ],
 
   "_non_exemption_keys": [

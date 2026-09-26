@@ -1,0 +1,52 @@
+name: Dissent gate
+
+# ⚠ pull_request_target, AND THAT IS THE WHOLE POINT. This event runs the workflow and the script FROM
+# THE BASE BRANCH, so a PR that edits this file or scripts/dissent_gate.py changes code this run never
+# executes. The PR's code is NEVER checked out: the gate needs only the PR body and head SHA, both in
+# the event payload. Do not add `ref: ${{ github.event.pull_request.head.sha }}` to the checkout below —
+# that single line would let every PR rewrite the gate that judges it.
+#
+# INVARIANTS, each of which a future edit could silently break:
+#   - no checkout of the PR head, ever;
+#   - no cache, ever (a cache scope shared with PR-side runs is a poisoning path into a base-side job);
+#   - attacker-controlled fields (body, title, branch names) reach the script ONLY through `env:`,
+#     never `${{ }}`-interpolated into a `run:` line;
+#   - the board secret is read only by the script, which never prints it, the URL, or an entry's content;
+#   - fork PRs never query the board (FORK_UNVERIFIED), so the secret is only ever used for branches of
+#     this repository.
+#
+# WHAT THIS DOES NOT PROMISE: "tamper-proof". It cannot be modified BY THE PR IT GATES. Floating action
+# tags are base-side supply-chain exposure, the same as ci.yml's; a same-named job added by a PR is the
+# spoof path WORKFLOW_TOUCHED exists to route through an admin ruling.
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  dissent-gate:
+    name: Dissent gate
+    runs-on: ubuntu-latest
+    steps:
+      # Base ref — the default for pull_request_target. NOT the PR head.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Evaluate the Dissent-Ref line against the board
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+          GITHUB_TOKEN: ${{ github.token }}
+          BOARD_BASE: ${{ secrets.BOARD_BASE }}
+        run: python scripts/dissent_gate.py
