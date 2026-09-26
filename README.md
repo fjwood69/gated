@@ -288,6 +288,7 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
+<!-- ci-claims:begin -->
 Run the test suite:
 
 ```bash
@@ -303,6 +304,15 @@ python scripts/check-overclaim.py
 python scripts/check-sterility.py
 python scripts/check-voice.py
 ```
+<!-- ci-claims:end -->
+
+The commands between the `ci-claims` markers in this file are checked against
+CI in both directions: each one must be a command CI runs, and each test or
+gate command CI runs must be one of them. Every workflow file under
+`.github/workflows/` is either checked this way or exempted by name, and an
+unlisted one fails the check. Install steps are not claims; a CI step or a
+workflow file with no local form is exempted by name, with a reason and an
+expiry, in `scripts/gate_coverage.json`.
 
 Which packages those gates cover is declared once, in
 `scripts/gate_coverage.json`, and derived by every consumer — including the
