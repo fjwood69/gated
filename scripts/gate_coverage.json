@@ -76,10 +76,48 @@
 
   "ci_claim_exemptions": {
     "hygiene": {
+      "side": "ci",
       "reason": "the Repo hygiene job is two multi-line shell assertions embedded in the workflow YAML; it has NO single-line runnable command, so there is nothing for the README's 'Run the static gates' block to mirror",
       "remove_when": "a local equivalent command exists (e.g. scripts/check-hygiene.py) and the README documents it"
     }
   },
+
+  "display_only_flags": {
+    "-v": {
+      "reason": "unittest verbosity: changes what the runner prints, never what it executes or asserts. CI wants per-test output; the README shows the plain command. Removed from BOTH sides before comparison, never one",
+      "remove_when": "neither the README claims region nor any CI command uses -v (the check reds on that state as stale)"
+    }
+  },
+
+  "_display_only_note": [
+    "A FLAG LISTED HERE IS DELETED FROM BOTH SIDES BEFORE THE README AND CI ARE COMPARED, so this table",
+    "is a TRUST BOUNDARY the check does not close. Its mechanical staleness catches only an entry that",
+    "appears on NEITHER side. Adding a behavioural flag here (e.g. -W, which changes whether a warning",
+    "fails the run) while it sits on one side would normalise the #46 defect away and turn it green.",
+    "Only flags that change what is PRINTED belong here, and an edit to this table is visible in this",
+    "file's diff and nowhere else."
+  ],
+
+  "_workflows_note": [
+    "EVERY FILE UNDER .github/workflows/ IS EITHER PARTITIONED BY THE README CLAIMS CHECK (today only",
+    "ci.yml) OR LISTED IN A `workflows_excluded` TABLE with a reason and a remove_when. An unlisted",
+    "workflow file is RED, and an entry naming a file that no longer exists is RED as stale. The table",
+    "is ABSENT while ci.yml is the only workflow: an empty table would satisfy every entry check",
+    "vacuously, so exemption_tables() reds one. It appears with its first entry."
+  ],
+
+  "_non_exemption_keys": [
+    "_", "_gates_note", "_exemptions_note", "_display_only_note", "_non_exemption_keys_note",
+    "_workflows_note",
+    "packages", "markdown", "gates", "_non_exemption_keys"
+  ],
+
+  "_non_exemption_keys_note": [
+    "EVERY TOP-LEVEL KEY IS EITHER AN EXEMPTION TABLE OR LISTED HERE, and both directions red. A table",
+    "derived by shape alone would silently drop a MALFORMED table (an entry missing `reason`) instead",
+    "of failing it - the validator excluding the input it exists to validate. And a key listed here",
+    "that no longer exists is a stale entry, redded like any other."
+  ],
 
   "_exemptions_note": [
     "⚠ KEYED ON CI JOB NAMES, AND THE KEYS ARE THEMSELVES PARTITIONED — which is the correction, not",
@@ -91,6 +129,16 @@
     "",
     "So ci_exemption_errors partitions both ways: no job may be silently unchecked, and no exemption",
     "may name a job that does not exist. That is what makes the claim honest - hygiene is exempt from",
-    "a check that WOULD otherwise fire, and renaming the job REDS rather than quietly lapsing."
+    "a check that WOULD otherwise fire, and renaming the job REDS rather than quietly lapsing.",
+    "",
+    "EVERY ENTRY CARRIES `side`, WITH NO DEFAULT. side=ci keys a CI JOB and exempts that job's BLOCK",
+    "steps (or its absence of any run step) - nothing else; a runnable command in the same job must",
+    "still be claimed. It is stale when the job no longer exists or no longer has anything to exempt.",
+    "side=readme keys a README CLAIM with no CI counterpart; it is stale when the claim leaves the",
+    "region or CI starts running it. Any other side value is an entry no predicate reads: RED.",
+    "",
+    "RESIDUAL, STATED: a side=ci exemption is BLANKET TRUST over whatever that job's block scalars run.",
+    "The checker does not look inside a block and must not be read as if it did. Bounded, not closed:",
+    "changing a block edits .github/, which the process gate routes through an admin ruling."
   ]
 }

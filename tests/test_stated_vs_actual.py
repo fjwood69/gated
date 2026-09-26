@@ -28,9 +28,11 @@ all, and why its limit is written here instead of being left for the next reader
 from __future__ import annotations
 
 import ast
+import json
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -67,10 +69,11 @@ class PackageRosterIsDerived(unittest.TestCase):
         carrying only a justification is a PERMANENT GRANT: the table only accumulates, and nobody
         revisits a reason. An expiry condition makes a STALE exclusion mechanically findable. It is
         the tombstone's discipline — a suppression that carries its own expiry, not a standing one."""
-        data = gate_coverage.load()
-        tables = {"packages_excluded": data.get("packages_excluded", {}),
-                  "layout_excluded": data.get("layout_excluded", {}),
-                  "ci_claim_exemptions": data.get("ci_claim_exemptions", {})}
+        # ⚠ DERIVED, NOT HAND-LISTED. This dict used to name three tables, so a fourth
+        # (display_only_flags) would have been silently skipped — the per-surface shape in the test
+        # that polices it. `exemption_tables()` derives the set and reds anything it cannot classify.
+        tables, errs = gate_coverage.exemption_tables()
+        self.assertEqual(errs, [])
         for table, entries in tables.items():
             self.assertTrue(entries, f"{table} is empty — this test would pass vacuously")
             for name, entry in entries.items():
@@ -293,105 +296,368 @@ class ExitCodesArePartitioned(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 # AXIOM 4 — CI. Source of truth: .github/workflows/ci.yml   (BIDIRECTIONAL)
 # ══════════════════════════════════════════════════════════════════════════════════════════════
+class _Roster:
+    """Patch the roster for one test, restoring it however the test exits."""
+
+    def __init__(self, mutate):
+        self.mutate = mutate
+
+    def __enter__(self):
+        self.orig = gate_coverage.load
+        data = json.loads(json.dumps(self.orig()))
+        self.mutate(data)
+        gate_coverage.load = lambda: data                     # type: ignore[assignment]
+        return data
+
+    def __exit__(self, *exc):
+        gate_coverage.load = self.orig                        # type: ignore[assignment]
+        return False
+
+
 class ReadmeCiClaimsArePinnedBOTHWays(unittest.TestCase):
-    """#46 — README documented `-W error`; CI never ran it.
+    """#46 and #50 — README documented `-W error`; CI never ran it. Nothing stopped it coming back.
 
-    ⚠ BIDIRECTIONALITY IS THE WHOLE POINT. A one-way check (everything the README claims is in CI)
-    would have PASSED on the development snippet's `check-voice.py` omission, because omitting a
-    gate is not a false claim — it is an incomplete one. A list is a claim about its contents.
+    ⚠ ONE FUNCTION, BOTH DIRECTIONS: ``gate_coverage.readme_ci_claim_errors``. README → CI (every
+    claim in the delimited region is a command CI runs) and CI → README (every runnable CI command is
+    claimed there). The class name claims both directions because the function implements both —
+    the F2 rule from #49, where a function's name claimed a direction its body did not implement.
 
-    ⚠ THE BOUNDARY, STATED SO IT STAYS STABLE: this pins command names, their flags, and the Python
-    floor. Prose about CI's character is out of scope and stays a human matter. Anything that
-    mentions CI and is neither must be hedged prose or a reviewed exemption CARRYING ITS OWN
-    `remove_when` — otherwise the exemption table becomes where claims go to stop being checked.
+    ⚠ WHAT THE OLD VERSION OF THIS CLASS ACTUALLY CHECKED, MEASURED 2026-09-26. The CI → README
+    "direction" searched the WHOLE README for a token: deleting the `mypy` line from the gates block
+    left everything green, because "mypy" also appears in prose. The README → CI direction did not
+    exist. And a CI command outside the runnable allowlist — `pytest -W error tests` — was dropped by
+    every check. Each of those is now a test below, and each mutant is PROVEN ARMED before its red
+    is counted: a mutant that dies for an unrelated reason manufactures evidence of safety.
+
+    ⚠ THE BOUNDARY, STATED SO IT STAYS STABLE: command names and flags, inside the marked region.
+    Prose about CI's character is out of scope and stays a human matter.
     """
 
     @staticmethod
-    def _ci_commands() -> set[str]:
-        out = set()
-        for ln in _CI.read_text(encoding="utf-8").splitlines():
-            m = re.match(r"\s*(?:- )?run:\s*(.+)$", ln)
-            if m and not m.group(1).startswith("|"):
-                out.add(m.group(1).strip())
-        return out
+    def _readme() -> str:
+        return _README.read_text(encoding="utf-8")
 
-    @staticmethod
-    def _readme_commands() -> set[str]:
-        text = _README.read_text(encoding="utf-8")
-        out = set()
-        for block in re.findall(r"```bash\n(.*?)```", text, re.DOTALL):
-            for ln in block.splitlines():
-                if ln.strip():
-                    out.add(ln.strip())
-        return out
+    def _errs(self, readme: str | None = None, ci: str | None = None) -> list[str]:
+        if ci is None:
+            return gate_coverage.readme_ci_claim_errors(readme_text=readme)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ci.yml"
+            p.write_text(ci, encoding="utf-8")
+            return gate_coverage.readme_ci_claim_errors(readme_text=readme, ci_path=p)
 
-    def test_EVERY_CI_JOB_is_checked_or_exempted_and_no_exemption_is_STALE(self):
-        """⚠ THE EXEMPTION TABLE IS ITSELF PARTITIONED, WHICH IS THE CORRECTION AND NOT A DETAIL.
+    def _assert_reds(self, errs: list[str], fragment: str) -> None:
+        self.assertTrue(any(fragment in e for e in errs),
+                        f"expected a red containing {fragment!r}; got {errs}")
 
-        The first version keyed exemptions on gate-script FILENAMES and compared them against
-        `scripts/*.py` run lines — so the key `hygiene` could never match anything, the entry was
-        INERT, and the claim that the hygiene job "would have redded on day one" was FALSE AS
-        BUILT: the check never inspected that job at all. A clearance predicate with no caller,
-        committed while closing the family that names it.
+    # ── the correlated positive ───────────────────────────────────────────────────────────────
+    def test_the_real_tree_is_CLEAN_in_both_directions(self):
+        """⚠ THE CORRELATED POSITIVE: without it, a check that rejected everything would pass every
+        red test below. Six real claims, six real commands, zero errors."""
+        claims, errs = gate_coverage.readme_claims(self._readme())
+        self.assertEqual(errs, [])
+        self.assertEqual(len(claims), 6, f"expected the six real claims, got {claims}")
+        self.assertEqual(gate_coverage.readme_ci_claim_errors(), [])
 
-        Keying on JOB NAMES fixes that and introduces the same defect one field over — the table
-        becomes a claim about ci.yml's job set. So it partitions BOTH ways: no job silently
-        unchecked, and no exemption naming a job that does not exist.
-        """
-        self.assertEqual(gate_coverage.ci_exemption_errors(), [])
+    # ── README → CI (#50) ─────────────────────────────────────────────────────────────────────
+    def test_a_PHANTOM_claim_reds(self):
+        """#50 itself: a README claiming a gate CI never runs. VALUE mutant."""
+        text = self._readme().replace("python scripts/check-voice.py\n",
+                                      "python scripts/check-voice.py\npython scripts/check-phantom.py\n", 1)
+        self.assertIn("python scripts/check-phantom.py", gate_coverage.readme_claims(text)[0],
+                      "stimulus control: the phantom must be parsed as a claim, or this proves nothing")
+        self._assert_reds(self._errs(text), "CI never runs it")
 
-    def test_every_job_with_a_RUNNABLE_command_has_it_mentioned_in_the_readme(self):
-        """⚠ JOB-LEVEL, NOT SCRIPT-LEVEL. A job whose commands cannot be mirrored locally must be
-        EXEMPTED; a job whose commands can be must have them in the README. That makes "has no
-        local twin" a measured property of the workflow rather than an assertion about it."""
-        readme = _README.read_text(encoding="utf-8")
-        exempt = set(gate_coverage.load().get("ci_claim_exemptions", {}))
-        jobs = gate_coverage.ci_jobs_with_commands()
-        self.assertTrue(jobs, "no jobs parsed — this check would pass vacuously")
-        for job, cmds in sorted(jobs.items()):
-            runnable = gate_coverage.runnable_commands(cmds)
-            with self.subTest(job=job):
-                if not runnable:
-                    self.assertIn(job, exempt,
-                                  f"job {job!r} has no locally runnable command and is not "
-                                  f"exempted — it can never be mirrored, so silence about it is "
-                                  f"an unrecorded decision")
-                    continue
-                for cmd in runnable:
-                    tok = re.search(r"(scripts/[a-z-]+\.py|mypy|ruff|unittest)", cmd)
-                    self.assertTrue(tok and tok.group(1) in readme,
-                                    f"CI job {job!r} runs {cmd!r} and the README never mentions "
-                                    f"it — an incomplete list is still a claim about contents")
+    def test_the_46_defect_reds(self):
+        """The original defect, kept as a committed control: `-W error` on the README side only."""
+        text = self._readme().replace("python -m unittest discover -s tests\n",
+                                      "python -m unittest discover -s tests -W error\n", 1)
+        self.assertIn("-W error", text, "stimulus control")
+        errs = self._errs(text)
+        self._assert_reds(errs, "CI never runs it")
+        self._assert_reds(errs, "omits it")
 
-    def test_the_readme_unittest_flags_MATCH_ci(self):
-        """The actual defect, at FLAG granularity: `-W error` in one surface only."""
-        ci = [c for c in self._ci_commands() if "unittest discover" in c]
-        rd = [c for c in self._readme_commands() if "unittest discover" in c]
-        self.assertTrue(ci and rd)
-        # ⚠ `-v` IS EXCLUDED FROM BOTH SIDES, AND ONLY `-v`. It is a VERBOSITY flag: it changes what
-        # the runner prints, never what is executed or asserted, so CI wanting per-test output while
-        # the README shows the plain command is not a disagreement about behaviour. `-W error` is
-        # the opposite kind — it changes whether a warning fails the run — which is why the actual
-        # defect this test exists for still reds. Excluding the set symmetrically matters: an
-        # asymmetric exclusion would have hidden the defect on whichever side it was applied to.
-        display_only = {"-v"}
-        self.assertEqual(set(re.findall(r"-\w+", ci[0])) - display_only,
-                         set(re.findall(r"-\w+", rd[0])) - display_only,
-                         f"README and CI disagree on unittest flags: {rd[0]!r} vs {ci[0]!r}")
+    # ── CI → README ───────────────────────────────────────────────────────────────────────────
+    def test_an_OMITTED_claim_reds_EVEN_THOUGH_THE_TOKEN_SURVIVES_IN_PROSE(self):
+        """Mutant A — the one the old whole-README token search could not see."""
+        line = "mypy --strict $(python scripts/print_gate_argv.py)\n"
+        text = self._readme()
+        self.assertIn(line, text)
+        text = text.replace(line, "", 1)
+        self.assertIn("mypy", text, "stimulus control: the TOKEN must survive in prose, or this "
+                                    "does not reproduce the blind spot")
+        self._assert_reds(self._errs(text), "omits it")
+
+    def test_a_command_OUTSIDE_the_region_is_not_a_claim(self):
+        """MECHANISM mutant (i): the check must read the REGION, never the whole README. The mypy line
+        is moved out of the region into its own bash fence after the end marker."""
+        line = "mypy --strict $(python scripts/print_gate_argv.py)\n"
+        text = self._readme().replace(line, "", 1)
+        text = text.replace("<!-- ci-claims:end -->\n",
+                            "<!-- ci-claims:end -->\n\n```bash\n" + line + "```\n", 1)
+        self.assertIn("```bash\n" + line, text, "stimulus control")
+        self._assert_reds(self._errs(text), "omits it")
+
+    # ── the region's structure (R3) ───────────────────────────────────────────────────────────
+    def test_every_STRUCTURAL_failure_reds_with_its_OWN_message(self):
+        """An empty or missing region is a failure, never a pass — and each malformation says which."""
+        base = self._readme()
+        b, e = "<!-- ci-claims:begin -->\n", "<!-- ci-claims:end -->\n"
+        region = base[base.index(b):base.index(e) + len(e)]
+        cases = {
+            "no begin": (base.replace(b, "", 1), "NO ci-claims:begin"),
+            "no end": (base.replace(e, "", 1), "NO ci-claims:end"),
+            "two regions": (base + "\n" + region, "exactly one region"),
+            "end before begin": (base.replace(b, "@@B@@", 1).replace(e, b, 1).replace("@@B@@", e, 1),
+                                 "no open region"),
+            "empty region": (base.replace(region, b + "Nothing here.\n" + e, 1), "ZERO claims"),
+            "marker inside a fence": (base.replace("```bash\npython -m unittest",
+                                                   "```bash\n<!-- ci-claims:end -->\npython -m unittest", 1),
+                                      "INSIDE the fence"),
+            "unterminated fence": (base + "\n```bash\nleft open\n", "never closed"),
+            "non-bash fence": (base.replace("```bash\npython -m unittest", "```sh\npython -m unittest", 1),
+                               "only ```bash"),
+            "indented fence": (base.replace("```bash\npython -m unittest", "  ```bash\npython -m unittest", 1),
+                               "INDENTED"),
+            "comment in a claims fence": (base.replace("ruff check .\n", "ruff check .\n# lint\n", 1),
+                                          "comment line"),
+            "duplicate claim": (base.replace("ruff check .\n", "ruff check .\nruff check .\n", 1),
+                                "duplicate claim"),
+        }
+        messages = set()
+        for label, (text, fragment) in cases.items():
+            with self.subTest(case=label):
+                self.assertNotEqual(text, base, "stimulus control: the mutation must change the text")
+                errs = self._errs(text)
+                self._assert_reds(errs, fragment)
+                messages.add(fragment)
+        self.assertEqual(len(messages), len(cases), "each structural failure has its own message")
+
+    # ── every workflow file, not just ci.yml (board, 2026-09-26) ──────────────────────────────
+    def test_an_UNLISTED_workflow_file_reds(self):
+        """A second workflow is CI the claims check never sees. It must be partitioned or exempted."""
+        self.assertEqual(gate_coverage.workflow_errors(["ci.yml"]), [], "control: ci.yml alone is clean")
+        self._assert_reds(gate_coverage.workflow_errors(["ci.yml", "dissent-gate.yml"]),
+                          "neither checked against the README nor exempted")
+        self._assert_reds(gate_coverage.readme_ci_claim_errors(workflows=["ci.yml", "extra.yaml"]),
+                          "'extra.yaml'")
+
+    def test_an_EXEMPTED_workflow_file_is_green_and_a_STALE_one_reds(self):
+        entry = {"reason": "r", "remove_when": "w"}
+        with _Roster(lambda d: d.update({"workflows_excluded": {"dissent-gate.yml": entry}})):
+            self.assertEqual(gate_coverage.workflow_errors(["ci.yml", "dissent-gate.yml"]), [],
+                             "correlated positive: an exempted workflow file is not red")
+            self._assert_reds(gate_coverage.workflow_errors(["ci.yml"]), "not a tracked workflow file")
+        with _Roster(lambda d: d.update({"workflows_excluded": {"ci.yml": entry}})):
+            self._assert_reds(gate_coverage.workflow_errors(["ci.yml"]), "BOTH checked and exempted")
+
+    def test_the_ENUMERATION_reads_the_tracked_directory_not_a_list(self):
+        """MECHANISM: the check is only as good as the enumeration. A throwaway repository holding a
+        second workflow, with a .yaml extension, must be seen — a hard-coded list or a *.yml glob
+        would miss it."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            wf = root / ".github" / "workflows"
+            wf.mkdir(parents=True)
+            (wf / "ci.yml").write_text("name: CI\n", encoding="utf-8")
+            (wf / "other.yaml").write_text("name: Other\n", encoding="utf-8")
+            (wf / "untracked.yml").write_text("name: U\n", encoding="utf-8")
+            for argv in (["git", "init", "-q"], ["git", "add", ".github/workflows/ci.yml",
+                                                 ".github/workflows/other.yaml"]):
+                subprocess.run(argv, cwd=root, check=True, capture_output=True)
+            self.assertEqual(gate_coverage.workflow_files(root), ["ci.yml", "other.yaml"])
+        self.assertEqual(gate_coverage.workflow_files(), ["ci.yml"], "the real tree has one workflow today")
+
+    # ── the CI side, partitioned (mutant E, split into its two stimuli) ───────────────────────
+    _LINT_ANCHOR = "      - run: ruff check .\n"
+
+    def _ci(self) -> str:
+        return _CI.read_text(encoding="utf-8")
+
+    def test_an_UNCLASSIFIED_ci_command_reds(self):
+        """E1 — `pytest -W error tests` in a job that also runs ruff. Before P10a: dropped silently."""
+        ci = self._ci().replace(self._LINT_ANCHOR, self._LINT_ANCHOR + "      - run: pytest -W error tests\n", 1)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ci.yml"
+            p.write_text(ci, encoding="utf-8")
+            self.assertIn(("run", "pytest -W error tests"), gate_coverage._ci_jobs(p)["lint"],
+                          "stimulus control: the step must be parsed into the lint job")
+        self._assert_reds(self._errs(ci=ci), "classify it")
+
+    def test_a_BLOCK_in_an_UNEXEMPTED_job_reds(self):
+        """E2 — a block scalar added to a job that has no side=ci exemption."""
+        ci = self._ci().replace(self._LINT_ANCHOR,
+                                self._LINT_ANCHOR + "      - run: |\n          bash scripts/unlisted.sh\n", 1)
+        self.assertIn("unlisted.sh", ci, "stimulus control")
+        self._assert_reds(self._errs(ci=ci), "block-scalar step")
+
+    def test_a_block_BODY_is_consumed_not_scanned(self):
+        """A line inside a `run: |` body that begins `run:` is shell text, not a step. The reader
+        before P10a matched every line and would have taken it for a command."""
+        ci = self._ci().replace("          set -uo pipefail\n          missing=\"\"\n",
+                                "          set -uo pipefail\n          run: pytest -W error tests\n"
+                                "          missing=\"\"\n", 1)
+        self.assertIn("          run: pytest -W error tests\n", ci, "stimulus control")
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ci.yml"
+            p.write_text(ci, encoding="utf-8")
+            hygiene = gate_coverage._ci_jobs(p)["hygiene"]
+        self.assertEqual([k for k, _ in hygiene], ["uses", "block", "block"],
+                         f"the body line was read as a step: {hygiene}")
+
+    def test_a_COMPOUND_install_is_NOT_setup(self):
+        """Mutant (v) — the consult's P1. `contains pip install` would have classified this as setup."""
+        self.assertEqual(gate_coverage.classify_ci_command('pip install "ruff==0.15.15"'), "setup")
+        self.assertEqual(gate_coverage.classify_ci_command("python -m pip install x"), "setup")
+        for cmd in ("pip install x && pytest -W error tests", "pip install x; pytest",
+                    "pip install $(cat reqs)", "python3 -m unittest"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(gate_coverage.classify_ci_command(cmd), "unclassified")
+        ci = self._ci().replace(self._LINT_ANCHOR, self._LINT_ANCHOR
+                                + "      - run: pip install pytest && pytest -W error tests\n", 1)
+        self.assertIn("&& pytest -W error", ci, "stimulus control")
+        self._assert_reds(self._errs(ci=ci), "classify it")
+
+    def test_a_job_with_NO_run_step_reds_unless_exempted(self):
+        """The zero-command direction the old function had, carried over rather than lost in the fold."""
+        ci = self._ci() + "\n  empty:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v5\n"
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ci.yml"
+            p.write_text(ci, encoding="utf-8")
+            self.assertIn("empty", gate_coverage._ci_jobs(p), "stimulus control: the job must parse")
+        self._assert_reds(self._errs(ci=ci), "no run step at all")
+
+    def test_a_MIXED_job_has_a_SATISFYING_assignment(self):
+        """Mutant (vi) — the consult's P1 against v1 of the design, where a job with a runnable command
+        AND a block could never be green: the block demanded the exemption and the staleness rule
+        redded it. Now the exemption covers the blocks and the command must still be claimed."""
+        cmd = "python scripts/check-hygiene.py"
+        ci = self._ci().replace("      - name: No generated or local-only artefact is TRACKED\n",
+                                f"      - run: {cmd}\n      - name: No generated or local-only artefact is TRACKED\n", 1)
+        self.assertIn(cmd, ci, "stimulus control")
+        claimed = self._readme().replace("python scripts/check-voice.py\n",
+                                         f"python scripts/check-voice.py\n{cmd}\n", 1)
+        self.assertEqual(self._errs(readme=claimed, ci=ci), [], "mixed job, command claimed → GREEN")
+        self._assert_reds(self._errs(ci=ci), "omits it")
+
+    # ── exemptions: one table, a required side, mechanical staleness ──────────────────────────
+    def test_exemption_staleness_is_MECHANICAL_per_side(self):
+        """Every case is a COMPOSITION mutant: the two directions disagree about one item."""
+        entry = {"reason": "r", "remove_when": "w"}
+        cases = {
+            "readme exemption for a command CI runs":
+                (lambda d: d["ci_claim_exemptions"].update({"ruff check .": {**entry, "side": "readme"}}),
+                 "CI now runs it"),
+            "readme exemption for a claim not in the region":
+                (lambda d: d["ci_claim_exemptions"].update({"python gone.py": {**entry, "side": "readme"}}),
+                 "no longer in the README region"),
+            "ci exemption on a job with nothing to exempt":
+                (lambda d: d["ci_claim_exemptions"].update({"lint": {**entry, "side": "ci"}}),
+                 "nothing left for it to exempt"),
+            "ci exemption naming no job":
+                (lambda d: d["ci_claim_exemptions"].update({"ghost": {**entry, "side": "ci"}}),
+                 "does not exist in ci.yml"),
+            "no side": (lambda d: d["ci_claim_exemptions"]["hygiene"].pop("side"), "has no `side`"),
+            "unknown side": (lambda d: d["ci_claim_exemptions"]["hygiene"].update({"side": "both"}),
+                             "only 'ci' and 'readme'"),
+            "hygiene exemption removed": (lambda d: d["ci_claim_exemptions"].pop("hygiene"),
+                                          "block-scalar step"),
+        }
+        for label, (mutate, fragment) in cases.items():
+            with self.subTest(case=label), _Roster(mutate):
+                self._assert_reds(gate_coverage.readme_ci_claim_errors(), fragment)
+
+    def test_a_LEGITIMATE_readme_exemption_stays_green(self):
+        """The correlated positive for side=readme — otherwise the side could only ever red."""
+        text = self._readme().replace("python scripts/check-voice.py\n",
+                                      "python scripts/check-voice.py\npython scripts/local-only.py\n", 1)
+        exempt = {"python scripts/local-only.py": {"side": "readme", "reason": "r", "remove_when": "w"}}
+        self._assert_reds(self._errs(text), "CI never runs it")
+        with _Roster(lambda d: d["ci_claim_exemptions"].update(exempt)):
+            self.assertEqual(gate_coverage.readme_ci_claim_errors(readme_text=text), [])
+
+    def test_the_hygiene_exemption_is_RECORDED_with_its_side_and_expiry(self):
+        ex = gate_coverage.load()["ci_claim_exemptions"]["hygiene"]
+        self.assertEqual(ex["side"], "ci")
+        self.assertTrue(ex["reason"].strip() and ex["remove_when"].strip())
+
+    # ── display-only flags ────────────────────────────────────────────────────────────────────
+    def test_a_display_only_flag_on_NEITHER_side_is_stale(self):
+        with _Roster(lambda d: d["display_only_flags"].update({"-q": {"reason": "r", "remove_when": "w"}})):
+            self._assert_reds(gate_coverage.readme_ci_claim_errors(), "'-q' is STALE")
+
+    def test_the_display_only_TRUST_BOUNDARY_is_real_and_stated(self):
+        """⚠ A PINNED RESIDUAL, NOT A PASSING SAFEGUARD. Listing a BEHAVIOURAL flag as display-only
+        hides it on both sides: `-f` (failfast) on the README side alone goes green once `-f` is in the
+        table. This test asserts the hole EXISTS, so closing it later reds here and forces the note in
+        gate_coverage.json to be updated rather than silently falsified."""
+        text = self._readme().replace("python -m unittest discover -s tests\n",
+                                      "python -m unittest discover -s tests -f\n", 1)
+        self._assert_reds(self._errs(text), "CI never runs it")
+        with _Roster(lambda d: d["display_only_flags"].update({"-f": {"reason": "r", "remove_when": "w"}})):
+            self.assertEqual(gate_coverage.readme_ci_claim_errors(readme_text=text), [],
+                             "if this now reds, the trust boundary was closed — update _display_only_note")
+        self.assertIn("TRUST BOUNDARY", " ".join(gate_coverage.load()["_display_only_note"]))
+
+    # ── mechanism pins ────────────────────────────────────────────────────────────────────────
+    def test_ONE_parse_of_the_jobs_block(self):
+        """Mutant (vii): a second reader of ci.yml's jobs block reintroduced. The literal that opens
+        the jobs block appears once in the module, the accessors call the one reader, and this file
+        no longer parses `run:` lines itself."""
+        src = (_ROOT / "scripts" / "gate_coverage.py").read_text(encoding="utf-8")
+        self.assertEqual(src.count('re.match(r"^jobs:'), 1, "a second jobs-block parse exists")
+        tree = ast.parse(src)
+        calls = {fn.name: {n.func.id for n in ast.walk(fn)
+                           if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+                 for fn in tree.body if isinstance(fn, ast.FunctionDef)}
+        for name in ("ci_job_names", "ci_jobs_with_commands", "readme_ci_claim_errors"):
+            self.assertIn("_ci_jobs", calls[name], f"{name} must read through _ci_jobs")
+        # ⚠ BY AST, NOT BY SUBSTRING: the first version searched this file's text for the old helper
+        # names and found them — in its own assertion. A pin that reds on the line documenting it is
+        # the #49 comment-line trap again.
+        own = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        defined = {n.name for n in ast.walk(own) if isinstance(n, ast.FunctionDef)}
+        self.assertFalse(defined & {"_ci_commands", "_readme_commands"},
+                         "this file parses ci.yml or the README itself again")
 
     def test_the_python_floor_matches_the_matrix(self):
-        """A between-case the drafted boundary missed: mechanical floor, unbounded 'or later'."""
+        """A between-case the drafted boundary missed: mechanical floor, unbounded 'or later'.
+
+        ⚠ RESIDUAL, STATED: this is a whole-README substring pin, the shape P10a removed from the
+        commands axis — a contradictory floor stated elsewhere in the README reds nothing. And it is
+        a second read of ci.yml (the matrix, not the jobs block). Named, not widened into P10a."""
         matrix = re.findall(r'"(3\.\d+)"', _CI.read_text(encoding="utf-8"))
         self.assertTrue(matrix)
         floor = min(matrix, key=lambda v: [int(x) for x in v.split(".")])
         self.assertIn(f"Python {floor} or later", _README.read_text(encoding="utf-8"))
 
-    def test_the_hygiene_exemption_is_RECORDED_with_its_expiry(self):
-        """⚠ EXEMPTION #1, AND IT WOULD HAVE REDDED ON DAY ONE. The hygiene job is shell embedded in
-        YAML with no locally invocable twin, so the README cannot mirror it. That is not a false
-        claim — it is an unclassifiable one, and the honest form is data, not silence."""
-        ex = gate_coverage.load()["ci_claim_exemptions"]["hygiene"]
-        self.assertTrue(ex["reason"].strip() and ex["remove_when"].strip())
+
+class ExemptionTablesAreDerivedAndPartitioned(unittest.TestCase):
+    """Every top-level roster key is an exemption table or declared not to be — and both directions red."""
+
+    def test_the_real_roster_is_clean_and_finds_ALL_FOUR_tables(self):
+        tables, errs = gate_coverage.exemption_tables()
+        self.assertEqual(errs, [])
+        self.assertEqual(set(tables), {"packages_excluded", "layout_excluded",
+                                       "ci_claim_exemptions", "display_only_flags"},
+                         "control: the derivation must find every table, or its checks are vacuous")
+
+    def test_a_MALFORMED_table_is_RED_not_excluded(self):
+        """⚠ THE BOARD'S FINDING: deriving by 'entries carry reason' dropped the malformed table it
+        exists to validate. A table whose entry lacks `reason` must still be a table, and red."""
+        with _Roster(lambda d: d["display_only_flags"]["-v"].pop("reason")):
+            tables, errs = gate_coverage.exemption_tables()
+        self.assertIn("display_only_flags", tables)
+        self.assertTrue(any("display_only_flags.-v has no reason" in e for e in errs), errs)
+
+    def test_an_UNDECLARED_non_table_key_reds(self):
+        with _Roster(lambda d: d.update({"stray": ["a", "b"]})):
+            _, errs = gate_coverage.exemption_tables()
+        self.assertTrue(any("'stray'" in e for e in errs), errs)
+
+    def test_a_DECLARED_key_that_no_longer_exists_reds(self):
+        with _Roster(lambda d: d.pop("gates")):
+            _, errs = gate_coverage.exemption_tables()
+        self.assertTrue(any("lists 'gates'" in e for e in errs), errs)
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
