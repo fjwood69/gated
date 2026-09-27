@@ -40,6 +40,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from workflow_steps import parse_jobs
+
 _ROOT = Path(__file__).resolve().parent.parent
 ROSTER_PATH = _ROOT / "scripts" / "gate_coverage.json"
 
@@ -242,68 +244,15 @@ _CI_PATH = _ROOT / ".github" / "workflows" / "ci.yml"
 _PARTITIONED_WORKFLOWS = ("ci.yml",)     # the workflow files `_ci_jobs` reads; everything else is exempted
 README_PATH = _ROOT / "README.md"
 
-# A block scalar header: `|` or `>`, optionally with a chomping indicator and/or an indentation digit,
-# in either order (`|-`, `>+`, `|2`, `>2-`, `|-2`).
-_BLOCK_SCALAR = re.compile(r"^[|>](?:[+-]?\d?|\d[+-]?)$")
-
-
 def _ci_jobs(ci_path: Path | None = None) -> dict[str, list[tuple[str, str]]]:
-    """THE ONLY READER OF ``ci.yml``'s JOBS BLOCK. Every job, in file order, mapped to its steps.
+    """``ci.yml``'s jobs — the ONE parse, which lives in ``workflow_steps.parse_jobs`` (P10d PR-1). This is the caller's
+    policy only: which workflow the README <-> CI claims read.
 
-    Each step is ``(kind, text)`` where kind is ``run`` (a single-line command — the text is the
-    command), ``block`` (a ``run:`` whose value is a block scalar — the text is the header, e.g.
-    ``|``), or ``uses`` (an action reference).
-
-    ⚠ ONE PARSE, AND THE SENTENCE THAT SAYS SO IS TRUE BECAUSE OF THIS FUNCTION. Before P10a,
-    ``ci_job_names`` and ``ci_jobs_with_commands`` each walked the jobs block with the SAME TWO REGEX
-    LITERALS — a second enumeration inside the module whose docstring says two enumerations of one
-    set is the shape this tree has never survived. The design said "the one parse" about that code
-    and was wrong; the consult found it. Both accessors are now projections of this.
-
-    ⚠ BLOCK BODIES ARE CONSUMED, NOT SCANNED. A line inside a ``run: |`` body that happens to begin
-    ``run:`` is shell text, not a step. The previous reader matched every line and would have read it
-    as a command.
-
-    ⚠ NO PyYAML — the repo is stdlib-only across a 3.9-3.13 matrix. This reads THIS workflow's shape
-    (two-space job keys under a top-level ``jobs:``), not YAML in general, and says so.
+    ⚠ ONE PARSE, AND THE SENTENCE THAT SAYS SO IS TRUE BECAUSE OF THAT FUNCTION. Before P10a, ``ci_job_names`` and
+    ``ci_jobs_with_commands`` each walked the jobs block with the SAME TWO REGEX LITERALS; since P10d the grammar is in one
+    module that the dissent gate will share, rather than a second copy inside the gate.
     """
-    text = (ci_path or _CI_PATH).read_text(encoding="utf-8")
-    jobs: dict[str, list[tuple[str, str]]] = {}
-    current: str | None = None
-    in_jobs = False
-    body_indent: int | None = None     # set while consuming a block scalar's body
-    for line in text.splitlines():
-        if body_indent is not None:
-            if not line.strip() or (len(line) - len(line.lstrip())) > body_indent:
-                continue
-            body_indent = None
-        if re.match(r"^jobs:\s*$", line):
-            in_jobs = True
-            continue
-        if not in_jobs:
-            continue
-        if line.strip() and not line.startswith(" "):
-            break
-        m = re.match(r"^  ([A-Za-z][\w-]*):\s*$", line)
-        if m:
-            current = m.group(1)
-            jobs[current] = []
-            continue
-        if current is None:
-            continue
-        r = re.match(r"^(\s*(?:- )?)run:\s*(\S.*)$", line)
-        if r:
-            value = r.group(2).strip()
-            if _BLOCK_SCALAR.match(value):
-                jobs[current].append(("block", value))
-                body_indent = len(r.group(1))
-            else:
-                jobs[current].append(("run", value))
-            continue
-        u = re.match(r"^\s*(?:- )?uses:\s*(\S.*)$", line)
-        if u:
-            jobs[current].append(("uses", u.group(1).strip()))
-    return jobs
+    return parse_jobs(ci_path or _CI_PATH)
 
 
 def ci_job_names(ci_path: Path | None = None) -> list[str]:
