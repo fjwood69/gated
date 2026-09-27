@@ -17,16 +17,107 @@ roster still requires a human to add a new package to it, and nothing fails if t
 enumeration is authoritative about members it happens to name and silent about the rest. So
 ``partition_errors`` asserts every top-level Python-bearing directory is EITHER covered OR
 excluded WITH A REASON AND AN EXPIRY, turning a silent omission into a forced adjudication.
+
+A NOTE ON WILDCARD GATES — PROSE, NOT A CHECKED CLAIM. (This used to be a table in the roster recording each
+gate's mode and invocation. Nothing read it, and the invocation strings were a third enumeration of the gate
+commands after ``ci.yml`` and the README, checked by nothing — so it was deleted in P10c, #52, rather than
+documented.) The substance survives here as prose: a WILDCARD gate
+(``check-sterility.py`` over every tracked file, ``check-voice.py`` over every tracked ``*.md``,
+``ruff check .``) cannot drift in the roster direction, because its coverage follows from its mechanism. Its
+honest failure mode is the opposite one: a reader over-reading a green build. An ENUMERATED gate (``mypy``,
+``check-overclaim.py``) covers what the roster names, and ``partition_errors`` is what keeps that honest.
+
+EVERY TABLE HAS A CONSUMER, AND EVERY ENTRY CAN GO STALE (P10c). Each exemption table is looked up through a
+named ``Table`` constant below; the set of constants is DERIVED from this module, and ``exemption_tables()``
+reds a table no constant names (a misspelt table) and a constant whose table is absent (unless it is declared
+``absent_means_none``). Suppression tables go stale by CONSULTATION during a full scan (``unconsumed``).
 """
 from __future__ import annotations
 
 import json
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 ROSTER_PATH = _ROOT / "scripts" / "gate_coverage.json"
+
+
+@dataclass(frozen=True)
+class Table:
+    """A named exemption table in the roster. Every consumer looks its table up through one of these."""
+    name: str
+    absent_means_none: bool = False
+
+
+# ⚠ THE CONSUMER CONSTANTS. Derived by `table_constants()` from this module — never listed. A table in the
+# roster that no constant names has no consumer (a misspelt `voice_suppression` would pass on shape and be
+# read by nothing); a constant whose table is absent is RED unless absence is DECLARED to mean "none".
+PACKAGES_EXCLUDED = Table("packages_excluded")
+LAYOUT_EXCLUDED = Table("layout_excluded")
+CI_CLAIM_EXEMPTIONS = Table("ci_claim_exemptions")
+DISPLAY_ONLY_FLAGS = Table("display_only_flags")
+WORKFLOWS_EXCLUDED = Table("workflows_excluded")
+OVERCLAIM_SUPPRESSIONS = Table("overclaim_suppressions")
+VOICE_SUPPRESSIONS = Table("voice_suppressions", absent_means_none=True)
+
+
+def table_constants() -> dict[str, Table]:
+    """Every ``Table`` constant in this module, by table name — derived, like the ``EXIT_*`` set in sweep."""
+    return {v.name: v for v in globals().values() if isinstance(v, Table)}
+
+
+def table(t: Table, data: dict | None = None) -> dict:
+    """The entries of one exemption table. An absent table reads as empty; whether absence is ALLOWED is
+    ``exemption_tables()``'s question, not this lookup's."""
+    value = (data if data is not None else load()).get(t.name, {})
+    return value if isinstance(value, dict) else {}
+
+
+def fold(text: str) -> str:
+    """The comparison form every scanner consults in: lowercase, curly apostrophes folded to straight."""
+    return text.lower().replace("\u2019", "'").replace("\u2018", "'")
+
+
+def normal_form(entry: str) -> str:
+    """THE normal form, defined once (board, 2026-09-27, amendment 4): ``fold`` plus surrounding whitespace
+    stripped. Suppression keys and guard-list entries must EQUAL their normal form — an entry the matcher
+    can never match (a capital in a list matched after lowercasing, a curly apostrophe) is an inert entry
+    in a live list, the same defect as an inert table, and is RED rather than silently normalised."""
+    return fold(entry).strip()
+
+
+def nested_entry_errors(name: str, entries: list[str] | tuple[str, ...]) -> list[str]:
+    """For a list matched by SUBSTRING, no entry may contain another (board, 2026-09-27, item 5).
+
+    Text holding the longer phrase fires BOTH entries, so a suppression keyed on the longer phrase leaves the
+    shorter hit red — a reviewer adding a reviewed suppression would find it does not work. Measured when this
+    was written: the real vocabulary had no nested pair; this keeps it that way.
+    """
+    return [f"{name}: {a!r} is contained in {b!r} — both fire on the longer phrase, so a suppression for "
+            f"{b!r} cannot silence the {a!r} hit" for a in entries for b in entries if a != b and a in b]
+
+
+def tracked_files(root: Path | None = None) -> set[str]:
+    """Every tracked path, from ``git ls-files``. Injected into the checks that need it, so tests can run
+    against a scratch repository instead of silently passing outside one."""
+    out = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True,
+                         cwd=root or _ROOT).stdout
+    return {line for line in out.splitlines() if line}
+
+
+def guard_list_errors(name: str, entries: list[str] | tuple[str, ...]) -> list[str]:
+    """A guard list (what a gate CATCHES — not an exemption) must be non-empty and every entry in normal form.
+
+    ⚠ "A GUARD THAT FINDS NOTHING IS WORKING" IS TRUE OF THE GUARD, NOT OF EACH ENTRY. An empty list passes
+    vacuously, and an entry the matcher can never match guards nothing while reading as coverage.
+    """
+    if not entries:
+        return [f"{name} is EMPTY — the gate would pass vacuously, guarding nothing"]
+    return [f"{name} entry {e!r} is not in normal form ({normal_form(e)!r}) — the matcher consults in "
+            f"normal form, so this entry can never match: an inert entry in a live list"
+            for e in entries if e != normal_form(e)]
 
 
 def load() -> dict:
@@ -61,6 +152,20 @@ def markdown() -> tuple[str, ...]:
     return tuple(load()["markdown"])
 
 
+def markdown_errors(tracked: set[str] | None = None) -> list[str]:
+    """Every markdown roster entry is a TRACKED file. The roster is a POSITIVE list (what IS scanned), not an
+    exemption, so it has its own predicate rather than the exemption machinery.
+
+    ⚠ ONE DIRECTION ONLY, DELIBERATELY: every listed file must exist; not every tracked markdown file must be
+    listed — the roster is narrow by ruling ("derived, not widened"). A listed-but-absent entry would be
+    reported as scanned while nothing was read — R19: a record that cannot be searched must not report as
+    searched.
+    """
+    have = tracked if tracked is not None else tracked_files()
+    return [f"markdown roster lists {md!r}, which is not a tracked file — it was NOT SCANNED"
+            for md in markdown() if md not in have]
+
+
 def top_level_dirs() -> set[str]:
     """EVERY tracked top-level directory — the source of truth for the README's layout list.
 
@@ -85,7 +190,7 @@ def layout_errors(listed: set[str]) -> list[str]:
     A checker calling `_private` is coupled to an implementation detail it does not own.
     """
     data = load()
-    excluded = data.get("layout_excluded", {})
+    excluded = table(LAYOUT_EXCLUDED, data)
     errs: list[str] = []
     for name, entry in sorted(excluded.items()):
         for field in ("reason", "remove_when"):
@@ -372,7 +477,7 @@ def workflow_errors(files: list[str] | None = None) -> list[str]:
     exists. A file both partitioned and exempted is red too — the partition is not a partition.
     """
     names = workflow_files() if files is None else files
-    exempt = load().get("workflows_excluded", {})
+    exempt = table(WORKFLOWS_EXCLUDED)
     errs: list[str] = []
     if not names:
         return ["no workflow files found under .github/workflows/ — refusing to report CI as checked"]
@@ -420,8 +525,8 @@ def readme_ci_claim_errors(readme_text: str | None = None,
     only an entry present on NEITHER side. A test pins the hole as existing, so closing it reds that test.
     """
     data = load()
-    exempt = data.get("ci_claim_exemptions", {})
-    display_only = set(data.get("display_only_flags", {}))
+    exempt = table(CI_CLAIM_EXEMPTIONS, data)
+    display_only = set(table(DISPLAY_ONLY_FLAGS, data))
     jobs = _ci_jobs(ci_path)
     if not jobs:
         return ["no CI jobs parsed from ci.yml — refusing to check the README claims vacuously"]
@@ -522,6 +627,11 @@ def exemption_tables() -> tuple[dict[str, dict], list[str]]:
     tables: dict[str, dict] = {}
     for key, value in data.items():
         if key in declared:
+            # ⚠ X10 (board, amendment 6): "table-shaped" is WIDE — a non-empty object of objects, `reason` or
+            # not. Otherwise a broken table declared out of the validator stays inert.
+            if isinstance(value, dict) and value and all(isinstance(e, dict) for e in value.values()):
+                errs.append(f"{key!r} is declared a non-exemption key but is TABLE-SHAPED — declaring a "
+                            f"table out of the validator would stop validating it")
             continue
         if not isinstance(value, dict) or not value:
             errs.append(f"top-level key {key!r} is not declared a non-exemption key and is not a "
@@ -535,7 +645,98 @@ def exemption_tables() -> tuple[dict[str, dict], list[str]]:
             for field in ("reason", "remove_when"):
                 if not str(entry.get(field, "")).strip():
                     errs.append(f"{key}.{name} has no {field}")
+    # ⚠ EVERY TABLE HAS A CONSUMER (board, amendment 7) — the constants are derived, never listed.
+    consts = table_constants()
+    for key in sorted(tables):
+        if key not in consts:
+            errs.append(f"exemption table {key!r} has NO CONSUMER — no Table constant names it (misspelt?), "
+                        f"so nothing ever reads it")
+    for name, const in sorted(consts.items()):
+        if name not in data and not const.absent_means_none:
+            errs.append(f"Table constant {name!r} has no table in the roster, and its absence is not declared "
+                        f"to mean 'none'")
     return tables, errs
+
+
+_SEP = " :: "
+
+
+def suppression_pairs(t: Table, data: dict | None = None) -> dict[tuple[str, str], str]:
+    """``(relpath, phrase) -> raw key`` for every WELL-FORMED key — the lookup a scanner consults.
+
+    A malformed key is simply absent from this map: it is never consulted, so it is never consumed, so
+    ``unconsumed`` reds it too — defence in depth beside ``suppression_key_errors``.
+    """
+    out: dict[tuple[str, str], str] = {}
+    for key in table(t, data):
+        parts = key.split(_SEP)
+        if len(parts) == 2 and parts[0] and parts[1]:
+            out[(parts[0], parts[1])] = key
+    return out
+
+
+def suppression_key_errors(t: Table, tracked: set[str] | None = None, data: dict | None = None) -> list[str]:
+    """Every suppression key is ``"<relpath> :: <phrase>"``: exactly one separator, a TRACKED posix relpath, and
+    a phrase in normal form — the form the scanners consult in.
+
+    ⚠ TRACKED IS DELIBERATELY STRICTER THAN THE OVERCLAIM SCAN SET, which walks the filesystem: a suppression
+    for an untracked file would work locally and be unconsultable in CI's clean checkout.
+    ⚠ THE KEY CONTAINS THE SUPPRESSED PHRASE, and ``check-sterility.py`` scans every tracked file — this one
+    included. A key containing a sterility marker would red sterility; that is the correct outcome, since a
+    marker must not reach the public tree even inside a key. No other gate scans this file.
+    """
+    have = tracked if tracked is not None else tracked_files()
+    errs: list[str] = []
+    for key in table(t, data):
+        parts = key.split(_SEP)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            errs.append(f"{t.name} key {key!r} is not '<relpath>{_SEP}<phrase>' with exactly one separator")
+            continue
+        rel, phrase = parts
+        if phrase != normal_form(phrase):
+            errs.append(f"{t.name} key {key!r}: the phrase is not in normal form ({normal_form(phrase)!r}) — "
+                        f"the scanner consults in normal form, so this key could never be consulted")
+        if rel != rel.strip() or "\\" in rel:
+            errs.append(f"{t.name} key {key!r}: the relpath is not a clean posix path")
+        elif rel not in have:
+            errs.append(f"{t.name} key {key!r}: {rel!r} is not a tracked file")
+    return errs
+
+
+def unconsumed(t: Table, consumed: set[str], not_scanned: set[str], data: dict | None = None,
+               scanned: set[str] | None = None) -> list[str]:
+    """Every suppression the scan never CONSULTED is RED — iterating the RAW keys, parseable or not.
+
+    ⚠ STALENESS IS CONSULTATION, NOT OCCURRENCE (board, amendment 1). A phrase in a ``.py`` COMMENT, or a
+    pronoun on a BLOCKQUOTED line, is in the file and is never consulted — its suppression is stale, and that
+    red is correct: it suppresses nothing. So nobody should "repair" staleness by scanning comments or
+    blockquotes; the message says why.
+    ⚠ A FILE THAT WAS NOT SCANNED DOES NOT MAKE ITS SUPPRESSIONS STALE (amendment 2). Its suppressions are
+    unconsulted because the file was not read; the fix is to restore the file, not to delete the suppression.
+    ⚠ ONLY MEANINGFUL ON A FULL SCAN (amendment 3). No linter takes arguments today, so every run is full; a
+    future subset option must refuse staleness on partial runs.
+    ⚠ THE GRAIN IS PER FILE PER PHRASE, not per occurrence: one suppression covers every use of its phrase in
+    its file, and stays consulted while any one survives. Deliberate — the match grain.
+    ⚠ THREE CAUSES, THREE MESSAGES (board, 2026-09-27): the file was NOT SCANNED (restore it); the file is
+    OUTSIDE THIS GATE'S SCAN SET (``scanned`` — a tracked file the gate never reads, e.g. under ``scripts/``: the
+    suppression can never be consulted); or the phrase is gone / sits only where the scan never looks.
+    """
+    errs: list[str] = []
+    for key in sorted(table(t, data)):
+        if key in consumed:
+            continue
+        rel = key.split(_SEP)[0] if _SEP in key else None
+        if rel is not None and rel in not_scanned:
+            errs.append(f"{t.name} {key!r}: its file was NOT SCANNED — restore the file; do not delete the "
+                        f"suppression")
+        elif rel is not None and scanned is not None and rel not in scanned:
+            errs.append(f"{t.name} {key!r}: its file is OUTSIDE this gate's scan set — it can never be "
+                        f"consulted; delete the suppression, or bring the file into the scan")
+        else:
+            errs.append(f"{t.name} {key!r} is STALE: never consulted during a full scan — its phrase is gone "
+                        f"from the scanned text, or sits only where the scan never looks (a comment, a "
+                        f"blockquote)")
+    return errs
 
 
 def partition_errors() -> list[str]:
@@ -552,7 +753,7 @@ def partition_errors() -> list[str]:
     """
     data = load()
     covered = set(data["packages"])
-    excluded = data.get("packages_excluded", {})
+    excluded = table(PACKAGES_EXCLUDED, data)
     errs: list[str] = []
 
     for name, entry in sorted(excluded.items()):
@@ -568,6 +769,11 @@ def partition_errors() -> list[str]:
                 f"exclusion {name!r} has no `remove_when` — an exclusion without an expiry "
                 f"condition is a PERMANENT GRANT, and a table of those cannot be audited for "
                 f"staleness. State what would make this entry unnecessary.")
+        # ⚠ C (P10c): the direction layout_excluded and ci_claim_exemptions already had, and this third
+        # table did not — an exclusion for a directory holding no tracked Python excludes nothing.
+        if name not in _tracked_python_dirs():
+            errs.append(f"exclusion {name!r} is STALE: it is not a top-level directory holding tracked "
+                        f"Python — an exclusion for something that is not there is inert")
 
     for d in sorted(_tracked_python_dirs()):
         if d not in covered and d not in excluded:

@@ -640,12 +640,12 @@ class ReadmeCiClaimsArePinnedBOTHWays(unittest.TestCase):
 class ExemptionTablesAreDerivedAndPartitioned(unittest.TestCase):
     """Every top-level roster key is an exemption table or declared not to be — and both directions red."""
 
-    def test_the_real_roster_is_clean_and_finds_ALL_FIVE_tables(self):
+    def test_the_real_roster_is_clean_and_finds_ALL_SIX_tables(self):
         tables, errs = gate_coverage.exemption_tables()
         self.assertEqual(errs, [])
         self.assertEqual(set(tables), {"packages_excluded", "layout_excluded",
                                        "ci_claim_exemptions", "display_only_flags",
-                                       "workflows_excluded"},
+                                       "workflows_excluded", "overclaim_suppressions"},
                          "control: the derivation must find every table, or its checks are vacuous")
 
     def test_a_MALFORMED_table_is_RED_not_excluded(self):
@@ -662,9 +662,10 @@ class ExemptionTablesAreDerivedAndPartitioned(unittest.TestCase):
         self.assertTrue(any("'stray'" in e for e in errs), errs)
 
     def test_a_DECLARED_key_that_no_longer_exists_reds(self):
-        with _Roster(lambda d: d.pop("gates")):
+        # (P10c: the stimulus was `gates`, which P10c deleted — a test coupled to a key's existence is a carrier.)
+        with _Roster(lambda d: d.pop("_workflows_note")):
             _, errs = gate_coverage.exemption_tables()
-        self.assertTrue(any("lists 'gates'" in e for e in errs), errs)
+        self.assertTrue(any("lists '_workflows_note'" in e for e in errs), errs)
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════

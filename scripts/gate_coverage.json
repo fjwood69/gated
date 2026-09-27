@@ -30,43 +30,6 @@
 
   "markdown": ["README.md", "ARCHITECTURE.md"],
 
-  "gates": {
-    "mypy": {
-      "mode": "enumerated",
-      "derives": "packages",
-      "invoked_as": "mypy --strict $(python scripts/print_gate_argv.py)"
-    },
-    "check-overclaim.py": {
-      "mode": "enumerated",
-      "derives": "packages + markdown",
-      "invoked_as": "python scripts/check-overclaim.py"
-    },
-    "check-sterility.py": {
-      "mode": "wildcard",
-      "wildcard": "git ls-files (every tracked file)",
-      "invoked_as": "python scripts/check-sterility.py"
-    },
-    "check-voice.py": {
-      "mode": "wildcard",
-      "wildcard": "git ls-files *.md (published markdown only)",
-      "invoked_as": "python scripts/check-voice.py"
-    },
-    "ruff": {
-      "mode": "wildcard",
-      "wildcard": "ruff check . (the whole tree)",
-      "invoked_as": "ruff check ."
-    }
-  },
-
-  "_gates_note": [
-    "A WILDCARD GATE CANNOT DRIFT IN THE ROSTER DIRECTION AT ALL - its coverage follows from its",
-    "mechanism, so every tracked file is scanned by construction. Its honest failure mode is the",
-    "OPPOSITE one: a reader over-reading a green build. check-voice.py already states this in",
-    "prose ('a boundary the script states rather than implies, so a green build is never read as",
-    "\"no first-person-plural anywhere\"'). Recording the mode here promotes that convention from",
-    "a docstring to data, so the claim is checkable rather than merely written down."
-  ],
-
   "layout_excluded": {
     ".github": {
       "reason": "CI configuration, not part of the reader-facing repository layout the README describes",
@@ -113,10 +76,31 @@
     "added it with its first entry, the process gate's own workflow."
   ],
 
+  "overclaim_suppressions": {
+    "gate/acceptance.py :: proven safe": {
+      "reason": "NEGATED honest disclaimer: a PASS resists the current corpus, never \"proven safe\".",
+      "remove_when": "the disclaimer no longer uses the phrase (the overclaim gate reds this entry as stale on that state)"
+    },
+    "ARCHITECTURE.md :: proven secure": {
+      "reason": "NEGATED honest disclaimer: proven through the deployed path, NOT proven secure in every deployment.",
+      "remove_when": "the disclaimer no longer uses the phrase (the overclaim gate reds this entry as stale on that state)"
+    }
+  },
+
+  "_suppressions_note": [
+    "SUPPRESSIONS FOR THE OVERCLAIM AND VOICE GATES. Key: \"<relpath> :: <phrase>\" - a TRACKED posix relpath and",
+    "a phrase in NORMAL FORM (lowercase, straight apostrophes), exactly one separator. Each entry carries",
+    "reason + remove_when like every exemption. An entry the full scan never CONSULTS is RED as stale (the",
+    "phrase is gone, or sits where the scan never looks - a .py comment, a blockquote); an entry whose file",
+    "was NOT SCANNED says so instead. voice_suppressions is ABSENT while it has no entries: an empty table",
+    "satisfies every entry check vacuously, and its absence is declared to mean 'none' in gate_coverage.py.",
+    "A GROWING TABLE IS A SMELL - fix the vocabulary or the claim."
+  ],
+
   "_non_exemption_keys": [
-    "_", "_gates_note", "_exemptions_note", "_display_only_note", "_non_exemption_keys_note",
-    "_workflows_note",
-    "packages", "markdown", "gates", "_non_exemption_keys"
+    "_", "_exemptions_note", "_display_only_note", "_non_exemption_keys_note",
+    "_workflows_note", "_suppressions_note",
+    "packages", "markdown", "_non_exemption_keys"
   ],
 
   "_non_exemption_keys_note": [
