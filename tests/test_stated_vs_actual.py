@@ -609,8 +609,13 @@ class ReadmeCiClaimsArePinnedBOTHWays(unittest.TestCase):
         """Mutant (vii): a second reader of ci.yml's jobs block reintroduced. The literal that opens
         the jobs block appears once in the module, the accessors call the one reader, and this file
         no longer parses `run:` lines itself."""
+        # ⚠ MOVED IN P10d PR-1, AND IT PINS ALL THREE FILES. The parse now lives in workflow_steps.py; retargeting the pin
+        # there alone would leave gate_coverage.py unpinned at zero, free to regrow a second parse with the pin green.
+        counts = {f: (_ROOT / "scripts" / f).read_text(encoding="utf-8").count('re.match(r"^jobs:')
+                  for f in ("workflow_steps.py", "gate_coverage.py", "dissent_gate.py")}
+        self.assertEqual(counts, {"workflow_steps.py": 1, "gate_coverage.py": 0, "dissent_gate.py": 0},
+                         f"the jobs-block parse must exist exactly once, in workflow_steps.py: {counts}")
         src = (_ROOT / "scripts" / "gate_coverage.py").read_text(encoding="utf-8")
-        self.assertEqual(src.count('re.match(r"^jobs:'), 1, "a second jobs-block parse exists")
         tree = ast.parse(src)
         calls = {fn.name: {n.func.id for n in ast.walk(fn)
                            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
