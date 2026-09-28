@@ -612,8 +612,8 @@ class ReadmeCiClaimsArePinnedBOTHWays(unittest.TestCase):
         # ⚠ MOVED IN P10d PR-1, AND IT PINS ALL THREE FILES. The parse now lives in workflow_steps.py; retargeting the pin
         # there alone would leave gate_coverage.py unpinned at zero, free to regrow a second parse with the pin green.
         counts = {f: (_ROOT / "scripts" / f).read_text(encoding="utf-8").count('re.match(r"^jobs:')
-                  for f in ("workflow_steps.py", "gate_coverage.py", "dissent_gate.py")}
-        self.assertEqual(counts, {"workflow_steps.py": 1, "gate_coverage.py": 0, "dissent_gate.py": 0},
+                  for f in ("judge/workflow_steps.py", "gate_coverage.py", "judge/dissent_gate.py")}
+        self.assertEqual(counts, {"judge/workflow_steps.py": 1, "gate_coverage.py": 0, "judge/dissent_gate.py": 0},
                          f"the jobs-block parse must exist exactly once, in workflow_steps.py: {counts}")
         src = (_ROOT / "scripts" / "gate_coverage.py").read_text(encoding="utf-8")
         tree = ast.parse(src)

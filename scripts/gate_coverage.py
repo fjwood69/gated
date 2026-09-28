@@ -40,7 +40,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from workflow_steps import parse_jobs
+from judge.workflow_steps import parse_jobs
 
 _ROOT = Path(__file__).resolve().parent.parent
 ROSTER_PATH = _ROOT / "scripts" / "gate_coverage.json"
@@ -249,8 +249,8 @@ def _ci_jobs(ci_path: Path | None = None) -> dict[str, list[tuple[str, str]]]:
     policy only: which workflow the README <-> CI claims read.
 
     ⚠ ONE PARSE, AND THE SENTENCE THAT SAYS SO IS TRUE BECAUSE OF THAT FUNCTION. Before P10a, ``ci_job_names`` and
-    ``ci_jobs_with_commands`` each walked the jobs block with the SAME TWO REGEX LITERALS; since P10d the grammar is in one
-    module that the dissent gate will share, rather than a second copy inside the gate.
+    ``ci_jobs_with_commands`` each walked the jobs block with the SAME TWO REGEX LITERALS; the grammar is now in one
+    module that the dissent gate shares, rather than a second copy inside the gate.
     """
     return parse_jobs(ci_path or _CI_PATH)
 
