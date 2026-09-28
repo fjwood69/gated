@@ -1,23 +1,40 @@
 name: Dissent gate
 
 # ⚠ pull_request_target, AND THAT IS THE WHOLE POINT. This event runs the workflow and the script FROM
-# THE BASE BRANCH, so a PR that edits this file or scripts/dissent_gate.py changes code this run never
-# executes. The PR's code is NEVER checked out: the gate needs only the PR body and head SHA, both in
-# the event payload. Do not add `ref: ${{ github.event.pull_request.head.sha }}` to the checkout below —
-# that single line would let every PR rewrite the gate that judges it.
+# THE BASE BRANCH, so a PR that edits this file or a script the job executes changes code this run never
+# executes. The PR's code is NEVER checked out: the gate needs only the head SHA (from the event) and the
+# PR body and changed files (read from the API). Do not add `ref: ${{ github.event.pull_request.head.sha }}`
+# to the checkout below — that single line would let every PR rewrite the gate that judges it.
+#
+# ⚠ THIS JOB'S LOG IS PUBLIC. The runner echoes each step's `env:` block into it; the PR body is not among
+# those variables — the script fetches it from the API rather than receive it here. The script prints the
+# board key, the head and a verdict, never the board URL, an entry, or a secret. The safety comes from WHAT
+# IS PRINTED, not from any privacy of the log.
 #
 # INVARIANTS, each of which a future edit could silently break:
 #   - no checkout of the PR head, ever;
 #   - no cache, ever (a cache scope shared with PR-side runs is a poisoning path into a base-side job);
-#   - attacker-controlled fields (body, title, branch names) reach the script ONLY through `env:`,
-#     never `${{ }}`-interpolated into a `run:` line;
+#   - no event field is `${{ }}`-interpolated into a `run:` line; the few the script needs reach it
+#     only through `env:`, and every name there is one the script reads (a test pins both directions);
 #   - the board secret is read only by the script, which never prints it, the URL, or an entry's content;
 #   - fork PRs never query the board (FORK_UNVERIFIED), so the secret is only ever used for branches of
 #     this repository.
 #
+# WHAT "THE JUDGE" IS, IS DERIVED FROM THIS JOB, not listed: this file, and EVERY path under the directory
+# its script runs from (scripts/judge/) — a new file there included. The interpreter searches that
+# directory before the standard library, so anything in it can run inside this job; it must hold nothing
+# but the gate's own source files. A PR changing any of it is WORKFLOW_TOUCHED — waivable by an admin
+# ruling only. The job's shape is kept deliberately narrow (`python -E -s -S -B <script>.py` steps, no
+# `shell:`/`working-directory:`/`defaults:`, env names the script reads only): anything else makes the
+# derivation refuse, on every PR, until it is put back. -E ignores PYTHON* variables, -s the user site,
+# -S the system site (no sitecustomize or .pth runs first), and -B writes no bytecode into the judge
+# directory; -s is kept under -S so that each stands alone.
+#
 # WHAT THIS DOES NOT PROMISE: "tamper-proof". It cannot be modified BY THE PR IT GATES. Floating action
-# tags are base-side supply-chain exposure, the same as ci.yml's; a same-named job added by a PR is the
-# spoof path WORKFLOW_TOUCHED exists to route through an admin ruling.
+# tags are base-side supply-chain exposure, the same as ci.yml's. A same-named job in ANOTHER workflow is
+# not a judge file: measured on the probe repository (M3), with this check red, a passing same-named check
+# from another workflow did not unblock the merge (405). Once such a job is on base, the derivation finds
+# two jobs with this name and refuses every PR (the wedge, stated in scripts/judge/dissent_gate.py).
 
 on:
   pull_request_target:
@@ -42,11 +59,10 @@ jobs:
           python-version: "3.13"
       - name: Evaluate the Dissent-Ref line against the board
         env:
-          PR_BODY: ${{ github.event.pull_request.body }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
           GITHUB_TOKEN: ${{ github.token }}
           BOARD_BASE: ${{ secrets.BOARD_BASE }}
-        run: python scripts/dissent_gate.py
+        run: python -E -s -S -B scripts/judge/dissent_gate.py

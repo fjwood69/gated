@@ -346,10 +346,32 @@ check goes red until the review covers it.
 **What it does not prove.** I write both the reference and the record. The
 check turns *forgetting* into *having to state something false*; it closes
 omission, not deception. It verifies that a dissent-typed record names this
-head, not that the review behind it was any good. It runs from the base branch,
-so a pull request cannot edit the check that judges it; a pull request that
-changes anything under `.github/` is red by design and needs an admin ruling.
-Admin bypass remains, and is the honest residual.
+head, not that the review behind it was any good.
+
+**The judge.** The check runs from the base branch, so a pull request cannot
+edit the check that judges it. It can edit it for every later pull request,
+so one that changes the *judge* is red by design and needs an admin ruling,
+which leaves each change to the judge as a logged bypass. The judge is derived
+on every run, not listed: the workflow job named `Dissent gate`, and everything
+under the directory its script runs from, `scripts/judge/`, a new file there
+included. It is bounded by a directory rather than by what the script imports,
+because Python searches that directory before its standard library, so any file
+placed there could run inside the check. The directory must hold only the
+check's own source files, and anything the derivation cannot bound makes the
+check refuse rather than guess. The check runs as
+`python -E -s -S -B scripts/judge/dissent_gate.py`: it ignores Python's
+environment variables and site-packages, and writes no bytecode. Every other change, including to `ci.yml`, is
+reviewed through the ordinary dissent. Admin bypass remains, and is the honest
+residual.
+
+**Two boundaries.** A pull request adding a second `pull_request_target`
+workflow is not part of the judge, so it goes through the ordinary dissent;
+once merged, that workflow receives the repository's secrets, and the review is
+the only thing in front of it. And a job given the name `Dissent gate` in any
+other workflow would make every later check refuse, since the derivation would
+find two. The test suite derives the judge on each pull request's own tree and
+fails on such a job, but a pull request's tests run from its own head and it
+could edit them, so what catches that case is the review of the diff.
 
 ## Deployment
 
