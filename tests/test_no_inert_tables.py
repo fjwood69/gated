@@ -483,5 +483,58 @@ class FullScansOnly(unittest.TestCase):
                 self.assertIsNone(re.search(r"sys\.argv|argparse", src))
 
 
+
+class R_DuplicateKeysAreRefused(unittest.TestCase):
+    """#55, R-DUP: plain ``json.load`` keeps the LAST of two identical keys and drops the first silently, so the
+    validator would never see the entry that was overwritten. ``load()`` now refuses a duplicate key in any object.
+    Tested THROUGH ``load()`` on a temporary roster file — the real roster is only read."""
+
+    def _load_text(self, text: str):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "gate_coverage.json"
+            path.write_text(text, encoding="utf-8")
+            orig = GC.ROSTER_PATH
+            GC.ROSTER_PATH = path                                # type: ignore[misc]
+            try:
+                return GC.load()
+            finally:
+                GC.ROSTER_PATH = orig                            # type: ignore[misc]
+
+    def test_the_REAL_roster_loads(self):
+        """The control: the refusal must not fire on main's roster (measured: no duplicate keys today)."""
+        self.assertTrue(GC.load()["packages"])
+        self.assertEqual(self._load_text(GC.ROSTER_PATH.read_text(encoding="utf-8")), GC.load())
+
+    def test_a_duplicate_key_is_refused_at_EVERY_depth(self):
+        real = GC.ROSTER_PATH.read_text(encoding="utf-8")
+        self.assertIn('"packages":', real, "stimulus control: the anchor exists")
+        cases = {
+            "a second top-level key": real.replace('"packages":', '"packages": [], "packages":', 1),
+            "a second table entry": real.replace('"overclaim_suppressions": {',
+                                                 '"overclaim_suppressions": {"x": {"reason": "r", "remove_when": "w"}, '
+                                                 '"x": {"reason": "r", "remove_when": "w"}, ', 1),
+            "a second field inside one entry": real.replace('"overclaim_suppressions": {',
+                                                            '"overclaim_suppressions": {"y": {"reason": "r", '
+                                                            '"reason": "r2", "remove_when": "w"}, ', 1),
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                self.assertNotEqual(text, real, "stimulus control: the edit applied")
+                with self.assertRaises(ValueError) as cm:
+                    self._load_text(text)
+                self.assertIn("duplicate key", str(cm.exception))
+
+    def test_the_refusal_NAMES_the_key(self):
+        text = '{"packages": ["a"], "zz_dup": {}, "zz_dup": {}}'
+        with self.assertRaises(ValueError) as cm:
+            self._load_text(text)
+        self.assertIn("'zz_dup'", str(cm.exception))
+
+    def test_a_duplicate_STRING_in_a_list_is_NOT_seen_stated_limit(self):
+        """The stated limit, pinned so that closing it is a visible change rather than an accident."""
+        self.assertEqual(self._load_text('{"packages": ["a", "a"]}')["packages"], ["a", "a"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
