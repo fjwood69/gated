@@ -63,6 +63,7 @@ DISPLAY_ONLY_FLAGS = Table("display_only_flags")
 WORKFLOWS_EXCLUDED = Table("workflows_excluded")
 OVERCLAIM_SUPPRESSIONS = Table("overclaim_suppressions")
 VOICE_SUPPRESSIONS = Table("voice_suppressions", absent_means_none=True)
+STERILITY_ALLOW = Table("sterility_allow")
 
 
 def table_constants() -> dict[str, Table]:

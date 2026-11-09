@@ -390,7 +390,8 @@ class T_Sterility(unittest.TestCase):
         """Correlated positive (board amendment 8): if marker matching changes, this fails — rather than the entry
         turning up as an unexplained stale."""
         text = (_ROOT / "scripts" / "check-sterility.py").read_text(encoding="utf-8")
-        v, errs = STERILITY.scan_sterility({"scripts/check-sterility.py": text}, STERILITY.MARKERS, STERILITY.ALLOW)
+        v, errs = STERILITY.scan_sterility({"scripts/check-sterility.py": text}, STERILITY.MARKERS,
+                                          STERILITY.allow_set()[0])
         self.assertEqual((v, errs), ([], []))
 
     def test_a_ghost_ALLOW_entry_is_STALE(self):
@@ -421,6 +422,193 @@ class T_Sterility(unittest.TestCase):
     def test_empty_or_broken_MARKERS_are_RED(self):
         _reds(self, STERILITY.scan_sterility({}, [], set())[1], "EMPTY")
         _reds(self, STERILITY.scan_sterility({}, [("(unclosed", "x")], set())[1], "does not compile")
+
+
+# ⚠ CAPTURED FROM MAIN (244e5f7), BEFORE THE MOVE: check-sterility.py's ALLOW literal held exactly this. The move (#55)
+# must not widen or narrow it — this constant is the control, committed, not a board note.
+ALLOW_ON_MAIN = frozenset({"scripts/check-sterility.py"})
+_STERILITY_SRC = (_ROOT / "scripts" / "check-sterility.py").read_text(encoding="utf-8")
+_STERILITY_FNS = {f.name: f for f in ast.parse(_STERILITY_SRC).body if isinstance(f, ast.FunctionDef)}
+
+
+def _sterility_main(tracked: list[str]) -> tuple[int, str]:
+    orig = STERILITY._tracked_files
+    try:
+        STERILITY._tracked_files = lambda: tracked
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = STERILITY.main()
+    finally:
+        STERILITY._tracked_files = orig
+    return rc, out.getvalue()
+
+
+class T55_SterilityAllowIsARosterTable(unittest.TestCase):
+    """#55: sterility's allow list moved from a literal in check-sterility.py to the ``sterility_allow`` roster table,
+    like for like. Every roster state below is derived UNDER the patch (``allow_set()`` reads the roster on every call,
+    never at import) — a set bound earlier would test the real roster and pass for the wrong reason."""
+
+    def test_EQUIVALENCE_the_derived_set_is_exactly_mains(self):
+        self.assertEqual(STERILITY.allow_set(), (set(ALLOW_ON_MAIN), []))
+
+    def test_membership_is_EXACT_near_misses_at_both_ends_and_in_case(self):
+        """Markers match case-insensitively; membership does not — a near miss of the allowed path is not allowed."""
+        allow, _ = STERILITY.allow_set()
+        for near in ("xcripts/check-sterility.py", "scripts/check-sterility.pz", "scripts/check-sterility.pyc",
+                     "Scripts/check-sterility.py"):
+            with self.subTest(path=near):
+                self.assertNotIn(near, allow)
+                v, _ = STERILITY.scan_sterility({near: _STERILITY_SRC}, STERILITY.MARKERS, allow)
+                self.assertTrue(v, f"{near} would be scanned clean — it must not be allowed")
+
+    def test_DROPPING_the_entry_reds_twice(self):
+        with _Roster(lambda d: d["sterility_allow"].clear()):
+            allow, errs = STERILITY.allow_set()
+            self.assertEqual(allow, set())
+            _reds(self, errs, "'sterility_allow' is not declared a non-exemption key and is not a non-empty")
+            v, _ = STERILITY.scan_sterility({"scripts/check-sterility.py": _STERILITY_SRC}, STERILITY.MARKERS, allow)
+            self.assertTrue(v, "the scanner's own markers must become violations")
+
+    def test_ADDING_an_entry_breaks_equivalence_and_a_markerless_one_is_STALE(self):
+        with _Roster(lambda d: d["sterility_allow"].update({"a.txt": ENTRY})):
+            allow, errs = STERILITY.allow_set()
+            self.assertNotEqual(allow, set(ALLOW_ON_MAIN))
+            self.assertEqual(errs, [])
+            _, stale = STERILITY.scan_sterility({"a.txt": "clean text", "scripts/check-sterility.py": _STERILITY_SRC},
+                                                STERILITY.MARKERS, allow)
+            _reds(self, stale, "sterility_allow names 'a.txt', which contains no marker — STALE")
+
+    def test_a_MALFORMED_entry_reds_IN_THE_STERILITY_STEP(self):
+        """Not only in the test job: the step that uses the table reports its validation errors."""
+        for field in ("reason", "remove_when"):
+            with self.subTest(missing=field):
+                with _Roster(lambda d: d["sterility_allow"]["scripts/check-sterility.py"].pop(field)):
+                    _reds(self, STERILITY.allow_set()[1], f"sterility_allow.scripts/check-sterility.py has no {field}")
+                    rc, out = _sterility_main(["scripts/check-sterility.py"])
+                    self.assertEqual(rc, 1)
+                    self.assertIn(f"has no {field}", out)
+
+    def test_the_table_ABSENT_reds_and_main_exits_1(self):
+        with _Roster(lambda d: d.pop("sterility_allow")):
+            allow, errs = STERILITY.allow_set()
+            self.assertEqual(allow, set())
+            _reds(self, errs, "Table constant 'sterility_allow' has no table")
+            rc, out = _sterility_main(["scripts/check-sterility.py"])
+            self.assertEqual(rc, 1)
+            self.assertIn("internal/homelab markers", out)
+
+    def test_a_roster_that_does_not_LOAD_is_a_table_error_not_a_traceback(self):
+        orig = GC.load
+        for exc in (ValueError("duplicate key(s) ['x']"), OSError("no such file"), json.JSONDecodeError("bad", "{", 0)):
+            with self.subTest(exc=type(exc).__name__):
+                def boom(exc=exc):
+                    raise exc
+                GC.load = boom                                   # type: ignore[assignment]
+                try:
+                    allow, errs = STERILITY.allow_set()
+                    rc, out = _sterility_main(["scripts/check-sterility.py"])
+                finally:
+                    GC.load = orig                               # type: ignore[assignment]
+                self.assertEqual(allow, set())
+                _reds(self, errs, "the roster does not load")
+                self.assertEqual(rc, 1)
+                self.assertIn("the roster does not load", out)
+
+    def test_MAIN_on_the_real_tracked_tree_is_GREEN(self):
+        """The wrapper, not only the pure function (the P10c lesson)."""
+        rc, out = _sterility_main(STERILITY._tracked_files())
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("FAILED", out)
+
+    def test_the_allow_set_has_ONE_source_structurally(self):
+        """(a) the only ``table`` call is ``table(STERILITY_ALLOW)``, inside ``allow_set``; (b) no set, list, dict or
+        tuple literal of path strings outside MARKERS — a re-inlined literal reds; (c) ``scan_sterility`` is called once,
+        in ``main``, with the name bound from ``allow_set()``. It does NOT see a path added by a call
+        (``allow.add("…")``): the two NEVER_MUTATED pins below are what catch that."""
+        tree = ast.parse(_STERILITY_SRC)
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+        table_calls = [c for c in calls if c.func.id == "table"]
+        self.assertEqual(len(table_calls), 1)
+        self.assertEqual(ast.unparse(table_calls[0]) if hasattr(ast, "unparse") else "table(STERILITY_ALLOW)",
+                         "table(STERILITY_ALLOW)")
+        fn = {f.name: f for f in tree.body if isinstance(f, ast.FunctionDef)}
+        self.assertIn(table_calls[0], list(ast.walk(fn["allow_set"])))
+        markers = [n for n in tree.body if isinstance(n, (ast.Assign, ast.AnnAssign))
+                   and getattr(getattr(n, "target", None), "id", None) == "MARKERS"]
+        in_markers = {id(x) for m in markers for x in ast.walk(m)}
+        for lit in (n for n in ast.walk(tree) if isinstance(n, (ast.Set, ast.List, ast.Dict, ast.Tuple))):
+            if id(lit) in in_markers:
+                continue
+            strs = [e.value for e in ast.walk(lit) if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            self.assertFalse([x for x in strs if x.endswith(".py") or "/" in x],
+                             f"a literal of paths at line {lit.lineno} — a second allow list")
+        scans = [c for c in calls if c.func.id == "scan_sterility"]
+        self.assertEqual(len(scans), 1)
+        self.assertIn(scans[0], list(ast.walk(fn["main"])))
+        bind = [a for a in ast.walk(fn["main"]) if isinstance(a, ast.Assign) and isinstance(a.value, ast.Call)
+                and getattr(a.value.func, "id", None) == "allow_set"]
+        self.assertEqual(len(bind), 1)
+        allow_name = bind[0].targets[0].elts[0].id
+        self.assertIsInstance(scans[0].args[2], ast.Name)
+        self.assertEqual(scans[0].args[2].id, allow_name)
+
+    @staticmethod
+    def _occurrences(fn: ast.AST, name: str) -> tuple[list[int], list[int]]:
+        """Every occurrence of ``name`` in ``fn``, as node ids: (bindings, every other use). An augmented assignment and
+        a walrus are bindings; a method call, an alias, a ``del`` and a read are uses."""
+        occ = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == name]
+        return ([id(n) for n in occ if isinstance(n.ctx, ast.Store)],
+                [id(n) for n in occ if not isinstance(n.ctx, ast.Store)])
+
+    def test_the_allow_binding_is_NEVER_MUTATED_in_allow_set(self):
+        """POSITIVE SHAPE (board, 2 Nov: the pin above passed with ``allow.add("…")`` after the read). The name bound
+        from ``set(table(STERILITY_ALLOW))`` is bound once, and its only other use is as the first element of a
+        ``return`` — returned as it is. Every return's first element is that name or exactly ``set()``."""
+        fn = _STERILITY_FNS["allow_set"]
+        binds = [a for a in ast.walk(fn) if isinstance(a, ast.Assign) and ast.unparse(a.value) == "set(table(STERILITY_ALLOW))"]
+        self.assertEqual(len(binds), 1)
+        self.assertEqual(len(binds[0].targets), 1)
+        target = binds[0].targets[0]
+        self.assertIsInstance(target, ast.Name)
+        stores, uses = self._occurrences(fn, target.id)
+        self.assertEqual(stores, [id(target)], f"{target.id!r} is rebound in allow_set")
+        firsts = [r.value.elts[0] if isinstance(r.value, ast.Tuple) and r.value.elts else r.value
+                  for r in ast.walk(fn) if isinstance(r, ast.Return)]
+        for first in firsts:
+            self.assertTrue(isinstance(first, ast.Name) and first.id == target.id or ast.unparse(first) == "set()",
+                            f"allow_set returns {ast.unparse(first)!r} — not the bound set as it is, nor set()")
+        self.assertTrue(uses)
+        self.assertEqual([u for u in uses if u not in {id(f) for f in firsts}], [],
+                         f"{target.id!r} is used in allow_set other than by being returned — a mutation or an alias")
+
+    def test_the_allow_binding_is_NEVER_MUTATED_in_main(self):
+        """POSITIVE SHAPE: ``main()`` could add to the set after ``allow_set`` returns. The name bound from
+        ``allow_set()``'s first element is bound once and used once — as ``scan_sterility``'s third argument."""
+        fn = _STERILITY_FNS["main"]
+        binds = [a for a in ast.walk(fn) if isinstance(a, ast.Assign) and ast.unparse(a.value) == "allow_set()"]
+        self.assertEqual(len(binds), 1)
+        self.assertEqual(len(binds[0].targets), 1)
+        self.assertIsInstance(binds[0].targets[0], ast.Tuple)
+        first = binds[0].targets[0].elts[0]
+        self.assertIsInstance(first, ast.Name)
+        stores, uses = self._occurrences(fn, first.id)
+        self.assertEqual(stores, [id(first)], f"{first.id!r} is rebound in main")
+        scans = [c for c in ast.walk(fn) if isinstance(c, ast.Call) and ast.unparse(c.func) == "scan_sterility"]
+        self.assertEqual(len(scans), 1)
+        self.assertEqual(uses, [id(scans[0].args[2])],
+                         f"{first.id!r} is used in main other than as scan_sterility's allow — a mutation or an alias")
+
+    def test_allow_set_and_main_hold_no_PATH_CONSTANT_defence_in_depth(self):
+        """DEFENCE IN DEPTH ONLY — banned strings, not a shape. No string constant in ``allow_set`` contains ``/`` or
+        ends with ``.py``; neither function reaches a name dynamically. Evaded by a path derived from ``__file__`` or a
+        split string; the NEVER_MUTATED pins above are what hold."""
+        consts = [n.value for n in ast.walk(_STERILITY_FNS["allow_set"])
+                  if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+        self.assertEqual([c for c in consts if "/" in c or c.endswith(".py")], [])
+        for name in ("allow_set", "main"):
+            dynamic = {n.id for n in ast.walk(_STERILITY_FNS[name]) if isinstance(n, ast.Name)} & {
+                "locals", "vars", "globals", "eval", "exec", "getattr", "setattr", "__import__"}
+            self.assertEqual(dynamic, set(), f"{name} reaches a name dynamically")
 
 
 class TablesHaveConsumers(unittest.TestCase):

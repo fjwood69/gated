@@ -645,12 +645,13 @@ class ReadmeCiClaimsArePinnedBOTHWays(unittest.TestCase):
 class ExemptionTablesAreDerivedAndPartitioned(unittest.TestCase):
     """Every top-level roster key is an exemption table or declared not to be — and both directions red."""
 
-    def test_the_real_roster_is_clean_and_finds_ALL_SIX_tables(self):
+    def test_the_real_roster_is_clean_and_finds_ALL_SEVEN_tables(self):
         tables, errs = gate_coverage.exemption_tables()
         self.assertEqual(errs, [])
         self.assertEqual(set(tables), {"packages_excluded", "layout_excluded",
                                        "ci_claim_exemptions", "display_only_flags",
-                                       "workflows_excluded", "overclaim_suppressions"},
+                                       "workflows_excluded", "overclaim_suppressions",
+                                       "sterility_allow"},
                          "control: the derivation must find every table, or its checks are vacuous")
 
     def test_a_MALFORMED_table_is_RED_not_excluded(self):

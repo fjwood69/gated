@@ -5,15 +5,20 @@ Fails (exit 1) if internal / homelab-specific markers leak into TRACKED content.
 Adopted from the mori project's gate, and since extended here (P10c, #52) — a leak
 fails the build instead of shipping. Run locally:  python scripts/check-sterility.py
 
-Allowed exceptions (deliberate references) live in ALLOW, in this script.
+Allowed exceptions (deliberate references) are the `sterility_allow` table in
+scripts/gate_coverage.json (#55), read through `gate_coverage` — the roster's one reader — and
+validated there by `exemption_tables()` like every other exemption table (`reason`, `remove_when`).
 
 WHAT P10c ADDED, AND WHAT A GREEN RUN STILL DOES NOT SAY:
-  * an ALLOW entry must be a tracked file that contains at least one marker, else it is
+  * an allowed entry must be a tracked file that contains at least one marker, else it is
     STALE and reds. The grain is PER FILE: once a file is allowed for one legitimate
     marker, further markers added to it stay green. That is a stated limit, not a check.
-  * ALLOW stays here, not in scripts/gate_coverage.json with the other exemption tables:
-    .github/workflows/ci.yml describes this as "a maintained MARKERS + ALLOW script", and
-    P10c could not touch .github/. The move is issue #55.
+  * that staleness predicate lives HERE, in the consumer, not in the validator: the roster's
+    validator checks shape and consumer only, so "every table has a staleness predicate" is
+    a convention this file keeps, not a rule anything enforces (a pre-existing gap, stated).
+  * the allow list is derived on every run, never bound at import: a roster that does not
+    load reds THIS gate as a table error, not a traceback, and the table's own validation
+    errors red here too — not only in the test job.
   * a tracked path that cannot be read is NOT SCANNED and reds — never reported clean.
   * MARKERS must be non-empty (an empty list would pass vacuously) and every pattern must
     compile. They are matched case-insensitively, so case is not a normal-form question here.
@@ -27,6 +32,10 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gate_coverage import STERILITY_ALLOW, exemption_tables, table  # noqa: E402
 
 # (pattern, human-readable reason). Case-insensitive. High-signal / low-false-positive:
 # specific homelab hostnames, paths, the known prod IP, LAN range, and internal id forms.
@@ -59,10 +68,20 @@ MARKERS: list[tuple[str, str]] = [
     (r"\bjadmin\b", "homelab username"),
 ]
 
-# Files where an internal reference is intentional and reviewed.
-ALLOW = {
-    "scripts/check-sterility.py",  # this file necessarily contains the patterns
-}
+
+def allow_set() -> tuple[set[str], list[str]]:
+    """The allow list — the ``sterility_allow`` roster table — and the errors that make it unknown or invalid.
+
+    Errors: the roster does not load (missing, malformed, no packages, a duplicate key), in which case the set is
+    EMPTY, so nothing is allowed and this file's own markers red too; and every ``exemption_tables()`` error that
+    names this table (a malformed entry, the table absent or empty, no consumer).
+    """
+    try:
+        allow = set(table(STERILITY_ALLOW))
+        _, errs = exemption_tables()
+    except (OSError, ValueError) as exc:
+        return set(), [f"the roster does not load ({exc}) — the allow list is unknown, so nothing is allowed"]
+    return allow, [e for e in errs if STERILITY_ALLOW.name in e]
 
 
 def _tracked_files() -> list[str]:
@@ -101,13 +120,14 @@ def scan_sterility(files: dict[str, str | None], markers: list[tuple[str, str]],
                         violations.append((f, i, why, line.strip()[:100]))
     for a in sorted(allow):
         if a not in files:
-            table_errors.append(f"ALLOW names {a!r}, which is not a tracked file — STALE")
+            table_errors.append(f"sterility_allow names {a!r}, which is not a tracked file — STALE")
         elif files[a] is not None and allowed_hits[a] == 0:
-            table_errors.append(f"ALLOW names {a!r}, which contains no marker — STALE: it exempts nothing")
+            table_errors.append(f"sterility_allow names {a!r}, which contains no marker — STALE: it exempts nothing")
     return violations, table_errors
 
 
 def main() -> int:
+    allow, allow_errors = allow_set()
     files: dict[str, str | None] = {}
     for f in _tracked_files():
         try:
@@ -115,7 +135,8 @@ def main() -> int:
                 files[f] = fh.read()
         except OSError:  # includes IsADirectoryError
             files[f] = None
-    violations, table_errors = scan_sterility(files, MARKERS, ALLOW)
+    violations, table_errors = scan_sterility(files, MARKERS, allow)
+    table_errors = allow_errors + table_errors
 
     # Accumulate, never early-return: a table error must not hide a violation, nor the reverse.
     if table_errors:
@@ -128,7 +149,7 @@ def main() -> int:
             print(f"  {f}:{i}  [{why}]  {txt}")
         print(
             f"\n{len(violations)} violation(s). Sanitise before committing; "
-            "if a reference is intentional, add the file to ALLOW."
+            "if a reference is intentional, add the file to sterility_allow in scripts/gate_coverage.json."
         )
     if table_errors or violations:
         return 1
