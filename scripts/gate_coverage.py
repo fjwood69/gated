@@ -63,6 +63,7 @@ DISPLAY_ONLY_FLAGS = Table("display_only_flags")
 WORKFLOWS_EXCLUDED = Table("workflows_excluded")
 OVERCLAIM_SUPPRESSIONS = Table("overclaim_suppressions")
 VOICE_SUPPRESSIONS = Table("voice_suppressions", absent_means_none=True)
+STERILITY_ALLOW = Table("sterility_allow")
 
 
 def table_constants() -> dict[str, Table]:
@@ -122,6 +123,21 @@ def guard_list_errors(name: str, entries: list[str] | tuple[str, ...]) -> list[s
             for e in entries if e != normal_form(e)]
 
 
+def _refuse_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    """``json``'s ``object_pairs_hook``: build the object, or raise naming every key that occurs twice."""
+    seen: set[str] = set()
+    repeated: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            repeated.add(key)
+        seen.add(key)
+    dupes = sorted(repeated)
+    if dupes:
+        raise ValueError(f"{ROSTER_PATH}: duplicate key(s) {dupes} in one object — JSON would keep only the last, "
+                         f"silently dropping the other")
+    return dict(pairs)
+
+
 def load() -> dict:
     """The roster, read once, in one place.
 
@@ -129,9 +145,16 @@ def load() -> dict:
     empty set would let every consumer pass vacuously — the gate would cover nothing and report
     success, which is the clean-and-wrong this whole file exists to prevent. ``check-overclaim.py``
     already refuses to pass on an empty vocabulary for the same reason.
+
+    ⚠ A DUPLICATE KEY RAISES TOO (#55, R-DUP). Plain ``json.load`` keeps the LAST of two identical keys and drops
+    the first without a word, so a second entry for a table, a second table of one name, or a second ``reason``
+    inside one entry would silently replace the first — the validator never sees what was overwritten. Every
+    object in the file is checked, at any depth. ROSTER-WIDE BY DESIGN: one duplicate anywhere reds every
+    consumer of this function at once. STATED LIMIT: a duplicate STRING inside a list (``packages``,
+    ``_non_exemption_keys``) is not an object key and is not seen here.
     """
     with ROSTER_PATH.open(encoding="utf-8") as fh:
-        data = json.load(fh)
+        data = json.load(fh, object_pairs_hook=_refuse_duplicate_keys)
     if not data.get("packages"):
         raise ValueError(f"{ROSTER_PATH}: no packages declared — refusing to derive vacuously")
     return data

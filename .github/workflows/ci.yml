@@ -24,8 +24,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      # The mori project's sterility gate (adopted): a maintained MARKERS + ALLOW script
-      # over `git ls-files`, replacing the brittle inline grep. Also catches pre-extraction
+      # The mori project's sterility gate (adopted): a maintained MARKERS script over
+      # `git ls-files`, replacing the brittle inline grep; its allow list is the
+      # `sterility_allow` table in scripts/gate_coverage.json. Also catches pre-extraction
       # naming and env prefixes, so a de-baptism miss fails the build.
       - name: Content sterility (scripts/check-sterility.py)
         run: python scripts/check-sterility.py

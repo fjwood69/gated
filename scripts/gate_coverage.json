@@ -87,6 +87,13 @@
     }
   },
 
+  "sterility_allow": {
+    "scripts/check-sterility.py": {
+      "reason": "this file necessarily contains the marker patterns it scans for",
+      "remove_when": "the marker patterns no longer live in this file (the sterility gate reds this entry as stale when the file holds no marker)"
+    }
+  },
+
   "_suppressions_note": [
     "SUPPRESSIONS FOR THE OVERCLAIM AND VOICE GATES. Key: \"<relpath> :: <phrase>\" - a TRACKED posix relpath and",
     "a phrase in NORMAL FORM (lowercase, straight apostrophes), exactly one separator. Each entry carries",
