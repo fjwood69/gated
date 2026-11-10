@@ -56,6 +56,7 @@ Do not "fix" the asymmetry by fetching the head too. THIS SCRIPT prints nothing 
 PR body, not the board URL, not an entry's content; what it prints is built from its own codes, the
 verified key and head (both already public in the PR body), and ``repr()`` of file paths.
 """
+# #68 negative probe: a comment-only change to a judge path. Closed unmerged.
 from __future__ import annotations
 
 import ast
